@@ -1,3 +1,5 @@
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "arg.h"
 #include "common.h"
 #include "sampling.h"
@@ -45,39 +47,40 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
-    // load the draft model
+    // load the draft model (non-eagle3)
     llama_model_ptr model_dft;
+    if (params.speculative.type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
+        // TODO: simplify this logic
+        {
+            const auto & params_spec = params.speculative;
 
-    // TODO: simplify this logic
-    {
-        const auto & params_spec = params.speculative;
+            auto params_dft = params;
 
-        auto params_dft = params;
+            params_dft.n_parallel   = 1;
+            params_dft.n_ctx        = params_spec.n_ctx;
+            params_dft.n_batch      = llama_n_ctx_seq(ctx_tgt);
+            params_dft.devices      = params_spec.devices;
+            params_dft.model        = params_spec.mparams_dft;
+            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
 
-        params_dft.n_parallel   = 1;
-        params_dft.n_ctx        = params_spec.n_ctx;
-        params_dft.n_batch      = llama_n_ctx_seq(ctx_tgt);
-        params_dft.devices      = params_spec.devices;
-        params_dft.model        = params_spec.mparams_dft;
-        params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+            if (params_spec.cpuparams.n_threads > 0) {
+                params_dft.cpuparams.n_threads       = params.speculative.cpuparams.n_threads;
+                params_dft.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+            }
 
-        if (params_spec.cpuparams.n_threads > 0) {
-            params_dft.cpuparams.n_threads       = params.speculative.cpuparams.n_threads;
-            params_dft.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+            params_dft.tensor_buft_overrides = params.speculative.tensor_buft_overrides;
+
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+
+            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+            if (model_dft == nullptr) {
+                LOG_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                return 1;
+            }
+
+            params.speculative.model_dft = model_dft.get();
+            params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
         }
-
-        params_dft.tensor_buft_overrides = params.speculative.tensor_buft_overrides;
-
-        auto mparams_dft = common_model_params_to_llama(params_dft);
-
-        model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
-        if (model_dft == nullptr) {
-            LOG_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-            return 1;
-        }
-
-        params.speculative.model_dft = model_dft.get();
-        params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
     }
 
     // Tokenize the prompt
@@ -118,6 +121,11 @@ int main(int argc, char ** argv) {
     // target model sampling context
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
+    // init the speculator (before prompt eval so EAGLE3 can capture hidden states)
+    const auto & params_spec = params.speculative;
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
+
     // eval the prompt
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
 
@@ -130,12 +138,7 @@ int main(int argc, char ** argv) {
 
     int n_past = inp.size() - 1;
 
-    // init the speculator
-    const auto & params_spec = params.speculative;
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
-
-    common_speculative_begin(spec, prompt_tgt);
+    common_speculative_begin(spec, prompt_tgt, 0);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
@@ -151,7 +154,7 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
-        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last, 0);
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -223,6 +226,9 @@ int main(int argc, char ** argv) {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+            if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                llama_eagle3_trim_seq(ctx_tgt, 0, n_past);
+            }
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {

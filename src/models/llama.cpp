@@ -1,4 +1,6 @@
 #include "models.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 template <bool embed>
 llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
@@ -30,6 +32,14 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
+
+        if (capture_eagle3_layer(il)) {
+            ggml_tensor * captured = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+            captured = ggml_cont(ctx0, captured);
+            cb(captured, "eagle3_hidden", il);
+            res->t_eagle3_hidden[il] = captured;
+            ggml_build_forward_expand(gf, captured);
+        }
 
         // norm
         cur = build_norm(inpL,

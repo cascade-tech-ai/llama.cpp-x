@@ -1,4 +1,6 @@
 # common
+# AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+# DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 find_package(Threads REQUIRED)
 
@@ -104,6 +106,7 @@ add_library(${TARGET} STATIC
     )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PRIVATE ../src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

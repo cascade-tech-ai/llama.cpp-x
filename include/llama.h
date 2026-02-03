@@ -1,5 +1,7 @@
 #ifndef LLAMA_H
 #define LLAMA_H
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -1006,6 +1008,30 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    //
+    // EAGLE3 hidden-state capture [EXPERIMENTAL]
+    //
+
+    // Configure which layer inputs to capture for EAGLE3 (layer ids are stored in the head GGUF).
+    LLAMA_API bool llama_eagle3_set_layers(struct llama_context * ctx, const int32_t * layers, size_t n_layers);
+
+    // Clear all cached EAGLE3 hidden states and layer configuration.
+    LLAMA_API void llama_eagle3_clear(struct llama_context * ctx);
+
+    // Clear cached EAGLE3 hidden states for a specific sequence id.
+    LLAMA_API void llama_eagle3_clear_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Trim cached EAGLE3 hidden states for a sequence to the given length (pos = number of tokens to keep).
+    LLAMA_API void llama_eagle3_trim_seq(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+    // Return cached hidden states for a sequence and layer. n_tokens receives the token count.
+    // The returned pointer is owned by the context and is valid until the next decode or reset.
+    LLAMA_API const float * llama_eagle3_get_hidden_seq(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t layer_id,
+            size_t * n_tokens);
 
     //
     // backend sampling API [EXPERIMENTAL]

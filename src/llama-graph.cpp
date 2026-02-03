@@ -1,4 +1,6 @@
 #include "llama-graph.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -10,6 +12,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -665,6 +668,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_eagle3_hidden.clear();
 
     params = {};
 
@@ -715,6 +719,11 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [layer_id, t] : t_eagle3_hidden) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -803,6 +812,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    eagle3_layer_ids (params.eagle3_layer_ids),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -814,6 +824,13 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+}
+
+bool llm_graph_context::capture_eagle3_layer(int il) const {
+    if (eagle3_layer_ids.empty()) {
+        return false;
+    }
+    return std::find(eagle3_layer_ids.begin(), eagle3_layer_ids.end(), il) != eagle3_layer_ids.end();
 }
 
 ggml_tensor * llm_graph_context::build_cvec(

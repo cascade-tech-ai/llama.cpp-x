@@ -1,3 +1,5 @@
+# AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+# DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 llama_add_compile_flags()
 
 #
@@ -15,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-eagle3.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

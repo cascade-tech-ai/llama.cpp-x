@@ -1,4 +1,6 @@
 // Various helper functions and utilities
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #pragma once
 
@@ -264,6 +266,13 @@ struct common_params_speculative {
     int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+
+    // eagle3 speculative decoding (beam rollout)
+
+    int32_t eagle_max_depth     = 16;    // max draft depth (tokens)
+    int32_t eagle_max_proposals = 16;    // beam width / max proposals
+    int32_t eagle_beam_width    = 0;     // beam width for rollout (0 = use eagle_max_proposals)
+    float   eagle_prob_threshold = 1e-4f; // min draft prob to expand a node
 
     // ngram-based speculative decoding
 

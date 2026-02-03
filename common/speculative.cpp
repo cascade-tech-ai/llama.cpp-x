@@ -1,7 +1,10 @@
 #include "speculative.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "common.h"
 #include "ggml.h"
+#include "llama-eagle3.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -10,9 +13,11 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <numeric>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -132,12 +137,13 @@ struct common_speculative_state {
 
     virtual ~common_speculative_state() = default;
 
-    virtual void begin(const llama_tokens & prompt) = 0;
+    virtual void begin(const llama_tokens & prompt, llama_seq_id seq_id) = 0;
 
     virtual void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
@@ -216,16 +222,19 @@ struct common_speculative_state_draft : public common_speculative_state {
         llama_batch_free(batch);
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
         GGML_UNUSED(prompt);
+        GGML_UNUSED(seq_id);
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) override {
         auto * spec = this;
+        GGML_UNUSED(seq_id);
 
         auto & batch      = spec->batch;
         auto & ctx_tgt    = spec->ctx_tgt;
@@ -437,27 +446,375 @@ struct common_speculative_state_draft : public common_speculative_state {
 };
 
 struct common_speculative_state_eagle3 : public common_speculative_state {
-    common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
+    llama_context * ctx_tgt = nullptr;
+    std::unique_ptr<llama_eagle3_model, void (*)(llama_eagle3_model *)> model;
+    llama_eagle3_runtime rt{};
 
-    void begin(const llama_tokens & prompt) override {
-        GGML_UNUSED(prompt);
+    llama_eagle3_state base_state{};
+    size_t cached_prompt_len = 0;
+    llama_seq_id active_seq_id = -1;
+
+    std::vector<int32_t> layer_ids;
+    int32_t hidden_in_dim = 0;
+    int32_t target_hidden_size = 0;
+    int32_t hidden_size = 0;
+    const llama_vocab * vocab_tgt = nullptr;
+    const bool verbose;
+
+    std::vector<float> hidden_concat_buf;
+    bool enabled = false;
+
+    static std::string escape_token_piece(const std::string & input) {
+        std::string out;
+        out.reserve(input.size());
+        for (char ch : input) {
+            switch (ch) {
+                case '\\\\': out += "\\\\"; break;
+                case '\"': out += "\\\""; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default: out.push_back(ch); break;
+            }
+        }
+        return out;
+    }
+
+    common_speculative_state_eagle3(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            const common_params_speculative & params)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , model(nullptr, llama_eagle3_free)
+        , verbose(std::getenv("CASCADE_EAGLE_VERBOSE") != nullptr) {
+        if (!ctx_tgt) {
+            LOG_ERR("%s: null target context\n", __func__);
+            return;
+        }
+
+        if (params.mparams_dft.path.empty()) {
+            LOG_ERR("%s: eagle3 requires --model-draft pointing to an eagle3 GGUF\n", __func__);
+            return;
+        }
+
+        std::string err;
+        llama_eagle3_model * raw = llama_eagle3_load(params.mparams_dft.path, err);
+        if (!raw) {
+            LOG_ERR("%s: failed to load eagle3 head: %s\n", __func__, err.c_str());
+            return;
+        }
+        model.reset(raw);
+
+        layer_ids = model->hidden_layer_ids;
+        hidden_size = model->hparams.hidden_size;
+        target_hidden_size = model->hparams.target_hidden_size;
+        hidden_in_dim = model->hparams.hidden_concat * model->hparams.target_hidden_size;
+
+        const llama_model * base_model = llama_get_model(ctx_tgt);
+        vocab_tgt = llama_model_get_vocab(base_model);
+        const int32_t base_hidden = llama_model_n_embd(base_model);
+        if (base_hidden != target_hidden_size) {
+            LOG_ERR("%s: eagle3 target_hidden_size=%d does not match base model n_embd=%d\n",
+                    __func__, target_hidden_size, base_hidden);
+            return;
+        }
+
+        if (!llama_eagle3_set_layers(ctx_tgt, layer_ids.data(), layer_ids.size())) {
+            LOG_ERR("%s: failed to enable eagle3 hidden capture\n", __func__);
+            return;
+        }
+
+        const int32_t n_threads = llama_n_threads(ctx_tgt);
+        rt = llama_eagle3_make_runtime(ctx_tgt, model.get(), n_threads);
+
+        enabled = true;
+    }
+
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
+        if (seq_id != active_seq_id) {
+            active_seq_id = seq_id;
+        }
+
+        cached_prompt_len = 0;
+        base_state = {};
+
+        if (!enabled) {
+            return;
+        }
+
+        prefill_to(prompt, seq_id);
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & draft_tokens) override {
-        // TODO: implement
-        GGML_UNUSED(params);
-        GGML_UNUSED(prompt_tgt);
         GGML_UNUSED(id_last);
-        GGML_UNUSED(draft_tokens);
+        draft_tokens.clear();
+
+        if (!enabled) {
+            return;
+        }
+
+        if (seq_id != active_seq_id) {
+            cached_prompt_len = 0;
+            base_state = {};
+            active_seq_id = seq_id;
+        }
+
+        if (params.eagle_max_depth < 1 || params.eagle_max_proposals < 1) {
+            return;
+        }
+
+        if (prompt_tgt.empty()) {
+            return;
+        }
+
+        if (!prefill_to(prompt_tgt, seq_id)) {
+            return;
+        }
+
+        if (base_state.hidden.empty()) {
+            return;
+        }
+
+        const int max_depth = params.eagle_max_depth;
+        const int max_proposals = params.eagle_max_proposals;
+        const int beam_width = params.eagle_beam_width > 0
+            ? std::min(params.eagle_beam_width, max_proposals)
+            : max_proposals;
+        const float prob_threshold = params.eagle_prob_threshold;
+
+        struct beam_state {
+            float logprob = 0.0f;
+            std::vector<llama_token> tokens;
+            llama_eagle3_state state;
+        };
+
+        std::vector<beam_state> beams;
+        beams.push_back({0.0f, {}, base_state});
+
+        std::vector<std::pair<float, llama_tokens>> all_nodes;
+
+        for (int depth = 0; depth < max_depth; ++depth) {
+            std::vector<beam_state> candidates;
+
+            for (size_t beam_idx = 0; beam_idx < beams.size(); ++beam_idx) {
+                auto & beam = beams[beam_idx];
+                if (beam.state.hidden.empty()) {
+                    continue;
+                }
+                std::vector<float> logits;
+                if (!llama_eagle3_logits(*model, rt, beam.state.hidden.data(), logits)) {
+                    continue;
+                }
+
+                if (logits.empty()) {
+                    continue;
+                }
+
+                float max_logit = logits[0];
+                for (float v : logits) {
+                    max_logit = std::max(max_logit, v);
+                }
+
+                std::vector<float> exp_vals(logits.size());
+                float exp_sum = 0.0f;
+                for (size_t i = 0; i < logits.size(); ++i) {
+                    const float ev = std::exp(logits[i] - max_logit);
+                    exp_vals[i] = ev;
+                    exp_sum += ev;
+                }
+                if (exp_sum <= 0.0f) {
+                    continue;
+                }
+
+                const int k = std::min<int>(beam_width, (int) logits.size());
+                if (k <= 0) {
+                    continue;
+                }
+
+                std::vector<int> idxs(logits.size());
+                std::iota(idxs.begin(), idxs.end(), 0);
+                std::partial_sort(idxs.begin(), idxs.begin() + k, idxs.end(),
+                    [&](int a, int b) { return logits[a] > logits[b]; });
+
+                if (verbose) {
+                    for (int j = 0; j < k; ++j) {
+                        const int draft_idx = idxs[j];
+                        const float prob = exp_vals[draft_idx] / exp_sum;
+                        const int32_t base_id = draft_idx + model->d2t[draft_idx];
+                        const bool base_ok = base_id >= 0 && base_id < model->hparams.vocab_size;
+                        const std::string piece = base_ok && vocab_tgt
+                            ? common_token_to_piece(vocab_tgt, base_id)
+                            : std::string("<invalid>");
+                        const std::string escaped = escape_token_piece(piece);
+                        const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
+                        LOG_INF("eagle3 depth=%d beam=%zu rank=%d token=%d piece=\"%s\" p=%.6f%s\n",
+                            depth,
+                            beam_idx,
+                            j,
+                            base_id,
+                            escaped.c_str(),
+                            prob,
+                            filtered ? " (filtered)" : "");
+                    }
+                }
+
+                for (int j = 0; j < k; ++j) {
+                    const int draft_idx = idxs[j];
+                    const float prob = exp_vals[draft_idx] / exp_sum;
+                    if (prob_threshold > 0.0f && prob < prob_threshold) {
+                        continue;
+                    }
+
+                    const int32_t base_id = draft_idx + model->d2t[draft_idx];
+                    if (base_id < 0 || base_id >= model->hparams.vocab_size) {
+                        continue;
+                    }
+
+                    beam_state child;
+                    child.logprob = beam.logprob + std::log(std::max(prob, 1e-12f));
+                    child.tokens = beam.tokens;
+                    child.tokens.push_back(base_id);
+                    child.state = beam.state;
+
+                    if (!llama_eagle3_step(*model, rt, child.state, beam.state.hidden.data(), hidden_size, base_id, nullptr)) {
+                        continue;
+                    }
+
+                    candidates.push_back(std::move(child));
+                }
+            }
+
+            if (candidates.empty()) {
+                break;
+            }
+
+            for (const auto & cand : candidates) {
+                all_nodes.push_back({cand.logprob, cand.tokens});
+            }
+
+            std::sort(candidates.begin(), candidates.end(),
+                [](const beam_state & a, const beam_state & b) {
+                    return a.logprob > b.logprob;
+                });
+
+            if ((int) candidates.size() > beam_width) {
+                candidates.resize(beam_width);
+            }
+
+            beams = candidates;
+        }
+
+        if (all_nodes.empty()) {
+            return;
+        }
+
+        std::sort(all_nodes.begin(), all_nodes.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+
+        draft_tokens = all_nodes.front().second;
     }
 
     void accept(uint16_t n_accepted) override {
         // noop
         GGML_UNUSED(n_accepted);
+    }
+
+private:
+    bool fetch_hidden_ptrs(
+            llama_seq_id seq_id,
+            std::vector<const float *> & ptrs,
+            size_t & n_tokens) const {
+        ptrs.clear();
+        n_tokens = 0;
+
+        for (int32_t layer_id : layer_ids) {
+            size_t n_layer_tokens = 0;
+            const float * data = llama_eagle3_get_hidden_seq(ctx_tgt, seq_id, layer_id, &n_layer_tokens);
+            if (!data || n_layer_tokens == 0) {
+                return false;
+            }
+            if (ptrs.empty()) {
+                n_tokens = n_layer_tokens;
+            } else if (n_layer_tokens != n_tokens) {
+                return false;
+            }
+            ptrs.push_back(data);
+        }
+
+        return !ptrs.empty();
+    }
+
+    bool build_hidden_concat(
+            const std::vector<const float *> & ptrs,
+            size_t token_idx,
+            std::vector<float> & out) const {
+        if (ptrs.empty()) {
+            return false;
+        }
+
+        out.resize((size_t) hidden_in_dim);
+        size_t offset = 0;
+        for (const float * layer_ptr : ptrs) {
+            const float * src = layer_ptr + token_idx * (size_t) target_hidden_size;
+            std::memcpy(out.data() + offset, src, (size_t) target_hidden_size * sizeof(float));
+            offset += (size_t) target_hidden_size;
+        }
+        return true;
+    }
+
+    bool prefill_to(const llama_tokens & prompt_tgt, llama_seq_id seq_id) {
+        if (prompt_tgt.size() < cached_prompt_len) {
+            cached_prompt_len = 0;
+            base_state = {};
+        }
+
+        if (prompt_tgt.size() == cached_prompt_len && cached_prompt_len > 0) {
+            std::vector<const float *> layer_ptrs;
+            size_t n_tokens = 0;
+            if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens) || n_tokens < prompt_tgt.size()) {
+                cached_prompt_len = 0;
+                base_state = {};
+                return false;
+            }
+            return true;
+        }
+
+        if (prompt_tgt.size() < 2) {
+            cached_prompt_len = prompt_tgt.size();
+            return true;
+        }
+
+        std::vector<const float *> layer_ptrs;
+        size_t n_tokens = 0;
+        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens)) {
+            return false;
+        }
+        if (n_tokens < prompt_tgt.size()) {
+            return false;
+        }
+
+        if (cached_prompt_len == 0) {
+            base_state = {};
+        }
+
+        const size_t start = cached_prompt_len > 0 ? cached_prompt_len - 1 : 0;
+        for (size_t i = start; i + 1 < prompt_tgt.size(); ++i) {
+            if (!build_hidden_concat(layer_ptrs, i, hidden_concat_buf)) {
+                return false;
+            }
+            if (!llama_eagle3_step(*model, rt, base_state, hidden_concat_buf.data(), hidden_in_dim, prompt_tgt[i + 1], nullptr)) {
+                return false;
+            }
+        }
+
+        cached_prompt_len = prompt_tgt.size();
+        return true;
     }
 };
 
@@ -470,17 +827,20 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             common_ngram_simple_state state)
         : common_speculative_state(type), state(state) {}
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
         GGML_UNUSED(prompt);
+        GGML_UNUSED(seq_id);
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) override {
         result = common_ngram_simple_draft(state, prompt_tgt, id_last);
         GGML_UNUSED(params);
+        GGML_UNUSED(seq_id);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -498,17 +858,20 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
             common_ngram_map map)
         : common_speculative_state(type), map(std::move(map)) {}
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
         GGML_UNUSED(prompt);
+        GGML_UNUSED(seq_id);
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) override {
         common_ngram_map_draft(map, prompt_tgt, id_last, result);
         GGML_UNUSED(params);
+        GGML_UNUSED(seq_id);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -536,8 +899,9 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
         i_last = 0;
+        GGML_UNUSED(seq_id);
 
         n_draft_last = 0;
 
@@ -568,8 +932,10 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) override {
         GGML_UNUSED(params);
+        GGML_UNUSED(seq_id);
 
         n_draft_last = 0;
 
@@ -684,16 +1050,19 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(const llama_tokens & prompt, llama_seq_id seq_id) override {
         GGML_UNUSED(prompt);
+        GGML_UNUSED(seq_id);
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
+            llama_seq_id seq_id,
             llama_tokens & result) override {
         GGML_UNUSED(params);
+        GGML_UNUSED(seq_id);
 
         if (cache_size < prompt_tgt.size() + 1) {
             llama_tokens tokens_new;
@@ -814,8 +1183,12 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.mparams_dft.path.empty();
-        bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+        const bool has_draft_model = params.has_dft();
+        const bool want_draft = (params.type == COMMON_SPECULATIVE_TYPE_DRAFT || params.type == COMMON_SPECULATIVE_TYPE_NONE);
+        const bool want_eagle3 = (params.type == COMMON_SPECULATIVE_TYPE_EAGLE3);
+
+        bool has_draft = has_draft_model && want_draft;
+        bool has_draft_eagle3 = has_draft_model && want_eagle3;
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -879,7 +1252,7 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
-                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type, ctx_tgt, config.params));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -945,13 +1318,13 @@ void common_speculative_free(common_speculative * spec) {
     delete spec;
 }
 
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return;
     }
 
     for (auto & impl : spec->impls) {
-        impl->begin(prompt);
+        impl->begin(prompt, seq_id);
     }
 }
 
@@ -959,7 +1332,8 @@ llama_tokens common_speculative_draft(
         common_speculative * spec,
         const common_params_speculative & params,
         const llama_tokens & prompt_tgt, // specified in target model vocab
-        llama_token id_last) {
+        llama_token id_last,
+        llama_seq_id seq_id) {
     llama_tokens result;
 
     spec->curr_impl = nullptr; // reset current implementation
@@ -968,7 +1342,7 @@ llama_tokens common_speculative_draft(
         {
             const int64_t t_start_us = impl->gen_perf ? ggml_time_us() : 0;
 
-            impl->draft(params, prompt_tgt, id_last, result);
+            impl->draft(params, prompt_tgt, id_last, seq_id, result);
 
             const int64_t t_now_us = impl->gen_perf ? ggml_time_us() : 0;
 

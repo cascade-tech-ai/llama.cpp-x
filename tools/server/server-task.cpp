@@ -1,4 +1,6 @@
 #include "server-common.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "server-task.h"
 
 #include "common.h"
@@ -77,6 +79,10 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
+            {"speculative.eagle_max_depth", speculative.eagle_max_depth},
+            {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
+            {"speculative.eagle_beam_width", speculative.eagle_beam_width},
+            {"speculative.eagle_prob_threshold", speculative.eagle_prob_threshold},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
             {"speculative.ngram_size_n",  speculative.ngram_size_n},
             {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -141,6 +147,10 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.n_max},
         {"speculative.n_min",         speculative.n_min},
         {"speculative.p_min",         speculative.p_min},
+        {"speculative.eagle_max_depth", speculative.eagle_max_depth},
+        {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
+        {"speculative.eagle_beam_width", speculative.eagle_beam_width},
+        {"speculative.eagle_prob_threshold", speculative.eagle_prob_threshold},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
         {"speculative.ngram_size_n",  speculative.ngram_size_n},
         {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -248,10 +258,23 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.n_min = json_value(data, "speculative.n_min", defaults.speculative.n_min);
     params.speculative.n_max = json_value(data, "speculative.n_max", defaults.speculative.n_max);
     params.speculative.p_min = json_value(data, "speculative.p_min", defaults.speculative.p_min);
+    params.speculative.eagle_max_depth = json_value(data, "speculative.eagle_max_depth", defaults.speculative.eagle_max_depth);
+    params.speculative.eagle_max_proposals = json_value(data, "speculative.eagle_max_proposals", defaults.speculative.eagle_max_proposals);
+    params.speculative.eagle_beam_width = json_value(data, "speculative.eagle_beam_width", defaults.speculative.eagle_beam_width);
+    params.speculative.eagle_prob_threshold = json_value(data, "speculative.eagle_prob_threshold", defaults.speculative.eagle_prob_threshold);
 
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
     params.speculative.n_max = std::max(params.speculative.n_max, 0);
+    params.speculative.eagle_max_depth = std::max(params.speculative.eagle_max_depth, 1);
+    params.speculative.eagle_max_proposals = std::max(params.speculative.eagle_max_proposals, 1);
+    params.speculative.eagle_beam_width = std::max(params.speculative.eagle_beam_width, 0);
+    if (params.speculative.eagle_beam_width > params.speculative.eagle_max_proposals) {
+        params.speculative.eagle_beam_width = params.speculative.eagle_max_proposals;
+    }
+    if (params.speculative.eagle_prob_threshold < 0.0f) {
+        params.speculative.eagle_prob_threshold = 0.0f;
+    }
 
     params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
 

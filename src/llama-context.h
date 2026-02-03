@@ -1,4 +1,6 @@
 #pragma once
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama.h"
 #include "llama-cparams.h"
@@ -9,6 +11,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -16,6 +19,18 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+
+struct llama_rope_params {
+    llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
+    float freq_base   = 10000.0f;
+    float freq_scale  = 1.0f;
+    float ext_factor  = 1.0f;
+    float attn_factor = 1.0f;
+    float beta_fast   = 32.0f;
+    float beta_slow   = 1.0f;
+    int32_t n_ctx_orig = 0;
+    int32_t n_rot      = 0;
+};
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -238,6 +253,15 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    llama_rope_params get_rope_params(int il = 0) const;
+
+    bool eagle3_set_layers(const std::vector<int32_t> & layers);
+    void eagle3_clear();
+    void eagle3_clear_seq(llama_seq_id seq_id);
+    void eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos);
+    const std::vector<float> * eagle3_get_hidden_seq(llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const;
+    const std::vector<int32_t> & eagle3_layers() const { return eagle3_layer_ids; }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -337,6 +361,15 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    struct eagle3_hidden_layer_cache {
+        int32_t layer_id = -1;
+        std::unordered_map<llama_seq_id, std::vector<float>> seq_hidden;
+    };
+
+    std::vector<int32_t> eagle3_layer_ids;
+    std::vector<eagle3_hidden_layer_cache> eagle3_hidden;
+    std::unordered_map<llama_seq_id, llama_pos> eagle3_last_pos;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

@@ -1,4 +1,6 @@
 #include "llama-context.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-arch.h"
 #include "llama-impl.h"
@@ -671,6 +673,95 @@ bool llama_context::memory_update(bool optimize) {
 
 enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
+}
+
+llama_rope_params llama_context::get_rope_params(int il) const {
+    llama_rope_params rp;
+    rp.rope_type   = model.hparams.rope_type;
+    rp.freq_base   = model.get_rope_freq_base(cparams, il);
+    rp.freq_scale  = model.get_rope_freq_scale(cparams, il);
+    rp.ext_factor  = cparams.yarn_ext_factor;
+    rp.attn_factor = cparams.yarn_attn_factor;
+    rp.beta_fast   = cparams.yarn_beta_fast;
+    rp.beta_slow   = cparams.yarn_beta_slow;
+    rp.n_ctx_orig  = cparams.n_ctx_orig_yarn;
+    rp.n_rot       = model.hparams.n_rot;
+    return rp;
+}
+
+bool llama_context::eagle3_set_layers(const std::vector<int32_t> & layers) {
+    eagle3_layer_ids = layers;
+    eagle3_hidden.clear();
+    eagle3_hidden.reserve(layers.size());
+    for (int32_t layer_id : layers) {
+        eagle3_hidden.push_back({layer_id, {}});
+    }
+    eagle3_last_pos.clear();
+    return !eagle3_layer_ids.empty();
+}
+
+void llama_context::eagle3_clear() {
+    eagle3_hidden.clear();
+    eagle3_layer_ids.clear();
+    eagle3_last_pos.clear();
+}
+
+void llama_context::eagle3_clear_seq(llama_seq_id seq_id) {
+    for (auto & layer : eagle3_hidden) {
+        layer.seq_hidden.erase(seq_id);
+    }
+    eagle3_last_pos.erase(seq_id);
+}
+
+void llama_context::eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos) {
+    const int32_t n_embd = model.hparams.n_embd;
+    if (n_embd <= 0) {
+        return;
+    }
+
+    const size_t keep = pos > 0 ? (size_t) pos * n_embd : 0;
+
+    for (auto & layer : eagle3_hidden) {
+        auto it = layer.seq_hidden.find(seq_id);
+        if (it == layer.seq_hidden.end()) {
+            continue;
+        }
+
+        auto & vec = it->second;
+        if (vec.size() > keep) {
+            vec.resize(keep);
+        }
+        if (keep == 0) {
+            layer.seq_hidden.erase(seq_id);
+        }
+    }
+
+    if (pos <= 0) {
+        eagle3_last_pos.erase(seq_id);
+    } else {
+        eagle3_last_pos[seq_id] = pos - 1;
+    }
+}
+
+const std::vector<float> * llama_context::eagle3_get_hidden_seq(
+        llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const {
+    n_tokens = 0;
+    for (const auto & layer : eagle3_hidden) {
+        if (layer.layer_id != layer_id) {
+            continue;
+        }
+        auto it = layer.seq_hidden.find(seq_id);
+        if (it == layer.seq_hidden.end()) {
+            return nullptr;
+        }
+        const auto & vec = it->second;
+        if (model.hparams.n_embd <= 0) {
+            return nullptr;
+        }
+        n_tokens = vec.size() / model.hparams.n_embd;
+        return &vec;
+    }
+    return nullptr;
 }
 
 float * llama_context::get_logits() {
@@ -1744,6 +1835,68 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // capture eagle3 hidden states (if enabled)
+        if (!eagle3_hidden.empty() && !res->t_eagle3_hidden.empty()) {
+            const int64_t n_embd = hparams.n_embd;
+            const uint32_t n_tokens = ubatch.n_tokens;
+
+            std::vector<eagle3_hidden_layer_cache *> layer_caches;
+            std::vector<std::vector<float>> layer_bufs;
+            layer_caches.reserve(eagle3_hidden.size());
+            layer_bufs.reserve(eagle3_hidden.size());
+
+            for (auto & layer_cache : eagle3_hidden) {
+                auto it = res->t_eagle3_hidden.find(layer_cache.layer_id);
+                if (it == res->t_eagle3_hidden.end() || it->second == nullptr) {
+                    continue;
+                }
+
+                ggml_tensor * t_hidden = it->second;
+                if (t_hidden->ne[0] != n_embd || t_hidden->ne[1] != (int64_t) n_tokens) {
+                    LLAMA_LOG_WARN("%s: eagle3 hidden shape mismatch for layer %d\n", __func__, layer_cache.layer_id);
+                    continue;
+                }
+
+                std::vector<float> buf((size_t) n_embd * n_tokens);
+                ggml_backend_t backend_hidden = ggml_backend_sched_get_tensor_backend(sched.get(), t_hidden);
+                GGML_ASSERT(backend_hidden != nullptr);
+                ggml_backend_tensor_get(t_hidden, buf.data(), 0, buf.size() * sizeof(float));
+
+                layer_caches.push_back(&layer_cache);
+                layer_bufs.push_back(std::move(buf));
+            }
+
+            if (!layer_caches.empty()) {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const llama_pos pos = ubatch.pos[i * ubatch.n_pos];
+
+                    for (int s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                        const llama_seq_id seq_id = ubatch.seq_id[i][s];
+
+                        llama_pos last_pos = std::numeric_limits<llama_pos>::min();
+                        auto it_last = eagle3_last_pos.find(seq_id);
+                        if (it_last != eagle3_last_pos.end()) {
+                            last_pos = it_last->second;
+                        }
+                        if (pos <= last_pos) {
+                            continue;
+                        }
+
+                        for (size_t l = 0; l < layer_caches.size(); ++l) {
+                            auto * cache = layer_caches[l];
+                            auto & vec = cache->seq_hidden[seq_id];
+                            const float * src = layer_bufs[l].data() + (size_t) i * n_embd;
+                            const size_t offset = vec.size();
+                            vec.resize(offset + n_embd);
+                            std::memcpy(vec.data() + offset, src, n_embd * sizeof(float));
+                        }
+
+                        eagle3_last_pos[seq_id] = pos;
+                    }
+                }
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2110,6 +2263,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.eagle3_layer_ids =*/ eagle3_layer_ids,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3171,6 +3325,64 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+bool llama_eagle3_set_layers(llama_context * ctx, const int32_t * layers, size_t n_layers) {
+    if (!ctx) {
+        return false;
+    }
+    if (n_layers == 0) {
+        ctx->eagle3_clear();
+        return false;
+    }
+    if (!layers) {
+        return false;
+    }
+    std::vector<int32_t> vec(layers, layers + n_layers);
+    return ctx->eagle3_set_layers(vec);
+}
+
+void llama_eagle3_clear(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_clear();
+}
+
+void llama_eagle3_clear_seq(llama_context * ctx, llama_seq_id seq_id) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_clear_seq(seq_id);
+}
+
+void llama_eagle3_trim_seq(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_trim_seq(seq_id, pos);
+}
+
+const float * llama_eagle3_get_hidden_seq(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        int32_t layer_id,
+        size_t * n_tokens) {
+    if (!ctx || !n_tokens) {
+        return nullptr;
+    }
+
+    ctx->synchronize();
+
+    size_t n = 0;
+    const auto * vec = ctx->eagle3_get_hidden_seq(seq_id, layer_id, n);
+    if (!vec) {
+        *n_tokens = 0;
+        return nullptr;
+    }
+
+    *n_tokens = n;
+    return vec->data();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
