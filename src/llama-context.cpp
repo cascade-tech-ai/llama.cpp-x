@@ -6,7 +6,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 
@@ -762,6 +766,36 @@ const std::vector<float> * llama_context::eagle3_get_hidden_seq(
         return &vec;
     }
     return nullptr;
+}
+
+void llama_context::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    if (!memory) {
+        return;
+    }
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        kv->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+        kv_iswa->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        mem_hybrid->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * mem_hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        mem_hybrid_iswa->set_kq_mask_tree(tree);
+        return;
+    }
+}
+
+void llama_context::clear_kq_mask_tree() {
+    set_kq_mask_tree(nullptr);
 }
 
 float * llama_context::get_logits() {
@@ -3383,6 +3417,20 @@ const float * llama_eagle3_get_hidden_seq(
 
     *n_tokens = n;
     return vec->data();
+}
+
+void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_kq_mask_tree(tree);
+}
+
+void llama_clear_kq_mask_tree(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_kq_mask_tree();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

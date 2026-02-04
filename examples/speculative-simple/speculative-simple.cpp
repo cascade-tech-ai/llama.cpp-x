@@ -155,6 +155,9 @@ int main(int argc, char ** argv) {
         // from a cache or lookup tables.
         //
         llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last, 0);
+        common_speculative_tree tree;
+        const bool has_tree = common_speculative_get_tree(spec, tree);
+        bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -167,15 +170,36 @@ int main(int argc, char ** argv) {
             // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
                 draft.clear();
+                tree.clear();
+                use_tree = false;
             }
 
-            for (size_t i = 0; i < draft.size(); ++i) {
-                common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+            if (use_tree) {
+                const llama_pos base_pos = n_past;
+                for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                    const llama_pos pos = base_pos + tree.depths[i];
+                    common_batch_add(batch_tgt, tree.tokens[i], pos, { 0 }, true);
+                }
+
+                const llama_kq_mask_tree mask = {
+                    /* .n_nodes     = */ tree.tokens.size(),
+                    /* .parent      = */ tree.parents.data(),
+                    /* .batch_start = */ tree.batch_start,
+                };
+                llama_set_kq_mask_tree(ctx_tgt, &mask);
+            } else {
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                }
             }
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
             llama_decode(ctx_tgt, batch_tgt);
+
+            if (use_tree) {
+                llama_clear_kq_mask_tree(ctx_tgt);
+            }
         }
 
         // sample from the full target batch and return the accepted tokens based on the target sampler
@@ -185,7 +209,9 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
-        const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        const auto ids = use_tree
+            ? common_sampler_sample_and_accept_tree(smpl, ctx_tgt, 0, tree)
+            : common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 

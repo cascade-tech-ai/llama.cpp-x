@@ -1,4 +1,6 @@
 #include "llama-memory-hybrid.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -196,6 +198,10 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
+}
+
+void llama_memory_hybrid::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    mem_attn->set_kq_mask_tree(tree);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}

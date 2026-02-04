@@ -1034,6 +1034,24 @@ extern "C" {
             size_t * n_tokens);
 
     //
+    // Speculative tree attention mask [EXPERIMENTAL]
+    //
+
+    // Describes a tree over draft tokens in the current batch.
+    // parent indices refer to entries in [0, n_nodes). Use -1 for roots.
+    struct llama_kq_mask_tree {
+        size_t       n_nodes;
+        const int32_t * parent;
+        uint32_t     batch_start;
+    };
+
+    // Apply a tree mask override for the next decode call.
+    LLAMA_API void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree);
+
+    // Clear any active tree mask override.
+    LLAMA_API void llama_clear_kq_mask_tree(struct llama_context * ctx);
+
+    //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
     //

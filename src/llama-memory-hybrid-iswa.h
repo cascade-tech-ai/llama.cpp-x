@@ -1,4 +1,6 @@
 #pragma once
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -81,6 +83,7 @@ public:
 
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
 
 private:
     const llama_hparams & hparams;

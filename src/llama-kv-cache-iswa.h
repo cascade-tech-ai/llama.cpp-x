@@ -1,4 +1,6 @@
 #pragma once
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-kv-cache.h"
 
@@ -69,6 +71,7 @@ public:
 
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
 
 private:
     const llama_hparams & hparams;

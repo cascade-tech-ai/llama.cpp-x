@@ -1,7 +1,10 @@
 #include "sampling.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cmath>
@@ -555,6 +558,71 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx_last,
+        const common_speculative_tree & tree,
+        bool grammar_first) {
+    std::vector<llama_token> result;
+
+    const size_t n_nodes = tree.tokens.size();
+    if (n_nodes == 0) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idx_last, grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return result;
+    }
+
+    std::vector<int32_t> roots;
+    std::vector<std::vector<int32_t>> children(n_nodes);
+    roots.reserve(n_nodes);
+
+    for (size_t i = 0; i < n_nodes; ++i) {
+        const int32_t parent = tree.parents[i];
+        if (parent < 0) {
+            roots.push_back((int32_t) i);
+        } else if ((size_t) parent < n_nodes) {
+            children[parent].push_back((int32_t) i);
+        }
+    }
+
+    const auto find_token = [&](const std::vector<int32_t> & list, llama_token tok) -> int32_t {
+        for (int32_t idx : list) {
+            if (tree.tokens[idx] == tok) {
+                return idx;
+            }
+        }
+        return -1;
+    };
+
+    llama_token id = common_sampler_sample(gsmpl, ctx, idx_last, grammar_first);
+    common_sampler_accept(gsmpl, id, true);
+    result.push_back(id);
+
+    int32_t node = find_token(roots, id);
+    if (node < 0) {
+        return result;
+    }
+
+    while (true) {
+        const int idx = (int) tree.batch_start + node;
+        id = common_sampler_sample(gsmpl, ctx, idx, grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        const int32_t child = (node >= 0 && (size_t) node < children.size())
+            ? find_token(children[node], id)
+            : -1;
+        if (child < 0) {
+            break;
+        }
+        node = child;
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

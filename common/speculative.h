@@ -5,6 +5,26 @@
 #include "llama.h"
 #include "common.h"
 
+#include <vector>
+
+struct common_speculative_tree {
+    uint32_t batch_start = 1; // index of the first draft token in the target batch
+    std::vector<llama_token> tokens;
+    std::vector<int32_t> parents; // -1 for root nodes
+    std::vector<int32_t> depths;
+
+    void clear() {
+        tokens.clear();
+        parents.clear();
+        depths.clear();
+        batch_start = 1;
+    }
+
+    size_t size() const {
+        return tokens.size();
+    }
+};
+
 struct common_speculative;
 
 // comma separated list of all types
@@ -32,6 +52,9 @@ llama_tokens common_speculative_draft(
                      const llama_tokens & prompt,
                             llama_token   id_last,
                             llama_seq_id  seq_id = 0);
+
+// retrieve the latest speculative tree (if the current implementation supports it)
+bool common_speculative_get_tree(common_speculative * spec, common_speculative_tree & out);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

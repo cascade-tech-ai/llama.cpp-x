@@ -262,6 +262,9 @@ public:
     const std::vector<float> * eagle3_get_hidden_seq(llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const;
     const std::vector<int32_t> & eagle3_layers() const { return eagle3_layer_ids; }
 
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
+    void clear_kq_mask_tree();
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

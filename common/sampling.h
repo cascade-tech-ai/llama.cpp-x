@@ -1,4 +1,6 @@
 #pragma once
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama.h"
 
@@ -33,6 +35,7 @@
 //
 
 struct common_sampler;
+struct common_speculative_tree;
 
 // llama_sampler API overloads
 
@@ -84,6 +87,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+std::vector<llama_token> common_sampler_sample_and_accept_tree(struct common_sampler * gsmpl, struct llama_context * ctx, int idx_last, const common_speculative_tree & tree, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

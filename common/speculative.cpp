@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <map>
 #include <numeric>
+#include <vector>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -147,6 +148,11 @@ struct common_speculative_state {
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    virtual bool get_tree(common_speculative_tree & out) const {
+        out.clear();
+        return false;
+    }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -463,13 +469,14 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
+    common_speculative_tree last_tree;
 
     static std::string escape_token_piece(const std::string & input) {
         std::string out;
         out.reserve(input.size());
         for (char ch : input) {
             switch (ch) {
-                case '\\\\': out += "\\\\"; break;
+                case '\\': out += "\\\\"; break;
                 case '\"': out += "\\\""; break;
                 case '\n': out += "\\n"; break;
                 case '\r': out += "\\r"; break;
@@ -554,6 +561,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_tokens & draft_tokens) override {
         GGML_UNUSED(id_last);
         draft_tokens.clear();
+        last_tree.clear();
 
         if (!enabled) {
             return;
@@ -694,10 +702,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 break;
             }
 
-            for (const auto & cand : candidates) {
-                all_nodes.push_back({cand.logprob, cand.tokens});
-            }
-
             std::sort(candidates.begin(), candidates.end(),
                 [](const beam_state & a, const beam_state & b) {
                     return a.logprob > b.logprob;
@@ -708,6 +712,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 
             beams = candidates;
+
+            for (const auto & cand : beams) {
+                all_nodes.push_back({cand.logprob, cand.tokens});
+            }
         }
 
         if (all_nodes.empty()) {
@@ -717,12 +725,64 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         std::sort(all_nodes.begin(), all_nodes.end(),
             [](const auto & a, const auto & b) { return a.first > b.first; });
 
-        draft_tokens = all_nodes.front().second;
+        if ((int) all_nodes.size() > max_proposals) {
+            all_nodes.resize(max_proposals);
+        }
+
+        std::vector<int32_t> roots;
+        std::vector<std::vector<int32_t>> children;
+
+        for (const auto & entry : all_nodes) {
+            const auto & seq = entry.second;
+            int32_t parent = -1;
+            for (size_t depth = 0; depth < seq.size(); ++depth) {
+                const llama_token tok = seq[depth];
+                int32_t node_idx = -1;
+                if (parent < 0) {
+                    for (int32_t idx : roots) {
+                        if (last_tree.tokens[idx] == tok) {
+                            node_idx = idx;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int32_t idx : children[parent]) {
+                        if (last_tree.tokens[idx] == tok) {
+                            node_idx = idx;
+                            break;
+                        }
+                    }
+                }
+
+                if (node_idx < 0) {
+                    node_idx = (int32_t) last_tree.tokens.size();
+                    last_tree.tokens.push_back(tok);
+                    last_tree.parents.push_back(parent);
+                    last_tree.depths.push_back((int32_t) depth);
+                    children.emplace_back();
+
+                    if (parent < 0) {
+                        roots.push_back(node_idx);
+                    } else {
+                        children[parent].push_back(node_idx);
+                    }
+                }
+
+                parent = node_idx;
+            }
+        }
+
+        draft_tokens = last_tree.tokens;
     }
 
     void accept(uint16_t n_accepted) override {
         // noop
         GGML_UNUSED(n_accepted);
+    }
+
+    bool get_tree(common_speculative_tree & out) const override {
+        out = last_tree;
+        return true;
     }
 
 private:
@@ -1364,6 +1424,15 @@ llama_tokens common_speculative_draft(
     }
 
     return result;
+}
+
+bool common_speculative_get_tree(common_speculative * spec, common_speculative_tree & out) {
+    out.clear();
+    if (spec == nullptr || spec->curr_impl == nullptr) {
+        return false;
+    }
+
+    return spec->curr_impl->get_tree(out);
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
