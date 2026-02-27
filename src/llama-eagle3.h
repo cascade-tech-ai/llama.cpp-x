@@ -71,12 +71,38 @@ struct llama_eagle3_state {
     int32_t past_len = 0;
 };
 
+// Optional debugging outputs for llama_eagle3_step().
+//
+// When a pointer is non-null, the implementation appends the current step's tensor values
+// (as contiguous f32) to the referenced vector.
+struct llama_eagle3_step_debug {
+    std::vector<float> * embd       = nullptr; // token embedding (pre-norm), shape: [hidden_size]
+    std::vector<float> * embd_norm  = nullptr; // token embedding after RMSNorm*input_norm_w, shape: [hidden_size]
+
+    std::vector<float> * hidden_proj = nullptr; // teacher hidden after optional fc projection, shape: [hidden_size]
+    std::vector<float> * hidden_norm = nullptr; // teacher hidden after RMSNorm*hidden_norm_w, shape: [hidden_size]
+
+    std::vector<float> * cat        = nullptr; // concat([embd_norm, hidden_norm]), shape: [hidden_size*2]
+
+    // Attention projections (after reshape + RoPE for q/k, no RoPE for v).
+    // Layout matches ggml's contiguous [head_dim, n_head, 1] (q) and [head_dim, n_kv, 1] (k/v).
+    std::vector<float> * q = nullptr; // [head_dim * n_head]
+    std::vector<float> * k = nullptr; // [head_dim * n_kv_heads]
+    std::vector<float> * v = nullptr; // [head_dim * n_kv_heads]
+};
+
 struct llama_eagle3_runtime {
     const llama_model * base_model = nullptr;
 
     llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
+    // Optional rope factors tensor (e.g. Llama 3 scaling). For safety, we copy it to a small
+    // CPU ggml context so it can be used from the CPU-only EAGLE3 head path even when the base
+    // model is offloaded to GPU.
+    ggml_context_ptr        rope_factors_ctx;
+    std::vector<uint8_t>    rope_factors_buf;
+    ggml_tensor *           rope_factors = nullptr;
 
     float yarn_ext_factor  = 1.0f;
     float yarn_attn_factor = 1.0f;
@@ -102,7 +128,8 @@ bool llama_eagle3_step(
         const float * hidden_in,
         int32_t hidden_in_dim,
         llama_token input_id,
-        std::vector<float> * logits_out);
+        std::vector<float> * logits_out,
+        llama_eagle3_step_debug * dbg = nullptr);
 
 bool llama_eagle3_logits(
         const llama_eagle3_model & model,

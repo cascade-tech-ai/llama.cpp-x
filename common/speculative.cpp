@@ -15,9 +15,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <sstream>
 #include <vector>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -451,6 +455,89 @@ struct common_speculative_state_draft : public common_speculative_state {
     }
 };
 
+namespace {
+
+static std::string npy_shape_string(const std::vector<size_t> & shape) {
+    std::ostringstream oss;
+    oss << "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        oss << shape[i];
+        if (shape.size() == 1) {
+            oss << ",";
+        } else if (i + 1 < shape.size()) {
+            oss << ", ";
+        }
+    }
+    oss << ")";
+    return oss.str();
+}
+
+static bool write_npy(
+        const std::filesystem::path & path,
+        const void * data,
+        size_t n_bytes,
+        const char * descr,
+        const std::vector<size_t> & shape) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: failed to open '%s'\n", __func__, path.string().c_str());
+        return false;
+    }
+
+    // NumPy .npy v1.0
+    const char magic[] = "\x93NUMPY";
+    out.write(magic, 6);
+    const unsigned char ver[2] = {1, 0};
+    out.write(reinterpret_cast<const char *>(ver), 2);
+
+    std::string header = "{'descr': '";
+    header += descr;
+    header += "', 'fortran_order': False, 'shape': ";
+    header += npy_shape_string(shape);
+    header += ", }";
+
+    // Pad header to 16-byte alignment including the trailing newline.
+    const size_t base_len = header.size() + 1;
+    const size_t pad = (16 - ((10 + base_len) % 16)) % 16;
+    header.append(pad, ' ');
+    header.push_back('\n');
+
+    if (header.size() > std::numeric_limits<uint16_t>::max()) {
+        LOG_ERR("%s: header too large for v1.0\n", __func__);
+        return false;
+    }
+
+    const uint16_t hlen = (uint16_t) header.size();
+    out.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
+    out.write(header.data(), header.size());
+    out.write(reinterpret_cast<const char *>(data), (std::streamsize) n_bytes);
+    return (bool) out;
+}
+
+static bool write_npy_f32(
+        const std::filesystem::path & path,
+        const float * data,
+        const std::vector<size_t> & shape) {
+    size_t count = 1;
+    for (size_t d : shape) {
+        count *= d;
+    }
+    return write_npy(path, data, count * sizeof(float), "<f4", shape);
+}
+
+static bool write_npy_i32(
+        const std::filesystem::path & path,
+        const int32_t * data,
+        const std::vector<size_t> & shape) {
+    size_t count = 1;
+    for (size_t d : shape) {
+        count *= d;
+    }
+    return write_npy(path, data, count * sizeof(int32_t), "<i4", shape);
+}
+
+} // namespace
+
 struct common_speculative_state_eagle3 : public common_speculative_state {
     llama_context * ctx_tgt = nullptr;
     std::unique_ptr<llama_eagle3_model, void (*)(llama_eagle3_model *)> model;
@@ -466,10 +553,28 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     int32_t hidden_size = 0;
     const llama_vocab * vocab_tgt = nullptr;
     const bool verbose;
+    const std::string dump_dir;
 
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
     common_speculative_tree last_tree;
+
+    // Dump buffers (CASCADE_EAGLE_DUMP_DIR)
+    bool dump_pending = false;
+    llama_tokens dump_prompt_tgt;
+    llama_token dump_id_last = -1;
+    std::vector<int32_t> dump_head_input_ids; // [n_steps]
+    std::vector<float> dump_teacher_hidden_by_step; // [n_steps, hidden_in_dim]
+    std::vector<float> dump_head_embd_by_step; // [n_steps, hidden_size]
+    std::vector<float> dump_head_embd_norm_by_step; // [n_steps, hidden_size]
+    std::vector<float> dump_head_hidden_proj_by_step; // [n_steps, hidden_size]
+    std::vector<float> dump_head_hidden_norm_by_step; // [n_steps, hidden_size]
+    std::vector<float> dump_head_cat_by_step; // [n_steps, hidden_size*2]
+    std::vector<float> dump_head_q_by_step; // [n_steps, head_dim * n_heads]
+    std::vector<float> dump_head_k_by_step; // [n_steps, head_dim * n_kv_heads]
+    std::vector<float> dump_head_v_by_step; // [n_steps, head_dim * n_kv_heads]
+    std::vector<float> dump_head_hidden_after_step; // [n_steps, hidden_size]
+    std::vector<float> dump_root_logits_draft; // [draft_vocab_size]
 
     static std::string escape_token_piece(const std::string & input) {
         std::string out;
@@ -494,7 +599,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , model(nullptr, llama_eagle3_free)
-        , verbose(std::getenv("CASCADE_EAGLE_VERBOSE") != nullptr) {
+        , verbose(std::getenv("CASCADE_EAGLE_VERBOSE") != nullptr)
+        , dump_dir(std::getenv("CASCADE_EAGLE_DUMP_DIR") ? std::getenv("CASCADE_EAGLE_DUMP_DIR") : "") {
         if (!ctx_tgt) {
             LOG_ERR("%s: null target context\n", __func__);
             return;
@@ -550,6 +656,24 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return;
         }
 
+        if (!dump_dir.empty()) {
+            dump_pending = true;
+            dump_prompt_tgt = prompt;
+            dump_id_last = -1;
+            dump_head_input_ids.clear();
+            dump_teacher_hidden_by_step.clear();
+            dump_head_embd_by_step.clear();
+            dump_head_embd_norm_by_step.clear();
+            dump_head_hidden_proj_by_step.clear();
+            dump_head_hidden_norm_by_step.clear();
+            dump_head_cat_by_step.clear();
+            dump_head_q_by_step.clear();
+            dump_head_k_by_step.clear();
+            dump_head_v_by_step.clear();
+            dump_head_hidden_after_step.clear();
+            dump_root_logits_draft.clear();
+        }
+
         prefill_to(prompt, seq_id);
     }
 
@@ -559,7 +683,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_token id_last,
             llama_seq_id seq_id,
             llama_tokens & draft_tokens) override {
-        GGML_UNUSED(id_last);
         draft_tokens.clear();
         last_tree.clear();
 
@@ -585,8 +708,63 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return;
         }
 
-        if (base_state.hidden.empty()) {
+        // The speculative-simple example keeps the last token separate (id_last) and only decodes
+        // prompt_tgt up to the token before it. For EAGLE alignment, we must advance the head one
+        // more step using the teacher hidden at the last prompt token and input_id = id_last.
+        std::vector<const float *> layer_ptrs;
+        size_t n_tokens = 0;
+        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens) || n_tokens < prompt_tgt.size()) {
             return;
+        }
+
+        llama_eagle3_state root_state = base_state;
+        if (!build_hidden_concat(layer_ptrs, prompt_tgt.size() - 1, hidden_concat_buf)) {
+            return;
+        }
+
+        const bool dump_root = dump_pending && !dump_dir.empty();
+        llama_eagle3_step_debug dbg_root;
+        if (dump_root) {
+            dbg_root.embd        = &dump_head_embd_by_step;
+            dbg_root.embd_norm   = &dump_head_embd_norm_by_step;
+            dbg_root.hidden_proj = &dump_head_hidden_proj_by_step;
+            dbg_root.hidden_norm = &dump_head_hidden_norm_by_step;
+            dbg_root.cat         = &dump_head_cat_by_step;
+            dbg_root.q           = &dump_head_q_by_step;
+            dbg_root.k           = &dump_head_k_by_step;
+            dbg_root.v           = &dump_head_v_by_step;
+
+            dump_id_last = id_last;
+            dump_head_input_ids.push_back((int32_t) id_last);
+            dump_teacher_hidden_by_step.insert(
+                dump_teacher_hidden_by_step.end(),
+                hidden_concat_buf.begin(),
+                hidden_concat_buf.end());
+        }
+
+        if (!llama_eagle3_step(*model, rt, root_state, hidden_concat_buf.data(), hidden_in_dim, id_last, nullptr, dump_root ? &dbg_root : nullptr)) {
+            return;
+        }
+        if (root_state.hidden.empty()) {
+            return;
+        }
+
+        if (dump_root) {
+            dump_head_hidden_after_step.insert(
+                dump_head_hidden_after_step.end(),
+                root_state.hidden.begin(),
+                root_state.hidden.end());
+
+            std::vector<float> root_logits;
+            if (!llama_eagle3_logits(*model, rt, root_state.hidden.data(), root_logits)) {
+                return;
+            }
+            dump_root_logits_draft = std::move(root_logits);
+
+            if (!write_dump(seq_id)) {
+                return;
+            }
+            dump_pending = false;
         }
 
         const int max_depth = params.eagle_max_depth;
@@ -603,7 +781,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         };
 
         std::vector<beam_state> beams;
-        beams.push_back({0.0f, {}, base_state});
+        beams.push_back({0.0f, {}, root_state});
 
         std::vector<std::pair<float, llama_tokens>> all_nodes;
 
@@ -828,6 +1006,197 @@ private:
         return true;
     }
 
+    bool write_dump(llama_seq_id seq_id) {
+        if (dump_dir.empty()) {
+            return true;
+        }
+        if (!dump_pending) {
+            return true;
+        }
+
+        namespace fs = std::filesystem;
+
+        std::error_code ec;
+        fs::create_directories(dump_dir, ec);
+        if (ec) {
+            LOG_ERR("%s: failed to create CASCADE_EAGLE_DUMP_DIR='%s': %s\n",
+                    __func__, dump_dir.c_str(), ec.message().c_str());
+            return false;
+        }
+
+        const fs::path dir = fs::path(dump_dir);
+
+        // Core metadata
+        const int32_t draft_vocab_size = model ? model->hparams.draft_vocab_size : 0;
+        const size_t n_prompt = dump_prompt_tgt.size();
+        const size_t n_steps  = dump_head_input_ids.size();
+
+        if (n_prompt == 0 || dump_id_last < 0) {
+            LOG_ERR("%s: dump missing prompt/id_last (n_prompt=%zu id_last=%d)\n",
+                    __func__, n_prompt, (int) dump_id_last);
+            return false;
+        }
+        if (n_steps != n_prompt) {
+            LOG_WRN("%s: unexpected dump sizes (n_steps=%zu n_prompt=%zu)\n", __func__, n_steps, n_prompt);
+        }
+
+        // prompt + id_last
+        std::vector<int32_t> prompt_i32(n_prompt);
+        for (size_t i = 0; i < n_prompt; ++i) {
+            prompt_i32[i] = (int32_t) dump_prompt_tgt[i];
+        }
+        const int32_t id_last_i32 = (int32_t) dump_id_last;
+
+        std::vector<int32_t> layer_ids_i32(layer_ids.begin(), layer_ids.end());
+
+        // Dump per-layer teacher hiddens (prompt_tgt only).
+        std::vector<const float *> layer_ptrs;
+        size_t n_layer_tokens = 0;
+        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_layer_tokens) || n_layer_tokens < n_prompt) {
+            LOG_ERR("%s: failed to fetch teacher hidden ptrs for dump\n", __func__);
+            return false;
+        }
+
+        if (!write_npy_i32(dir / "prompt_tgt.npy", prompt_i32.data(), {n_prompt})) {
+            return false;
+        }
+        if (!write_npy_i32(dir / "id_last.npy", &id_last_i32, {1})) {
+            return false;
+        }
+        if (!write_npy_i32(dir / "layer_ids.npy", layer_ids_i32.data(), {layer_ids_i32.size()})) {
+            return false;
+        }
+
+        for (size_t li = 0; li < layer_ptrs.size(); ++li) {
+            const int32_t layer_id = layer_ids[li];
+            const float * data = layer_ptrs[li];
+            const fs::path p = dir / ("teacher_hidden_layer_" + std::to_string(layer_id) + ".npy");
+            if (!write_npy_f32(p, data, {n_prompt, (size_t) target_hidden_size})) {
+                return false;
+            }
+        }
+
+        // Dump head inputs/outputs for the token-by-token run (prompt_tgt[1:] + id_last).
+        if (!dump_teacher_hidden_by_step.empty()) {
+            if (!write_npy_f32(dir / "teacher_hidden_concat_by_step.npy", dump_teacher_hidden_by_step.data(), {n_steps, (size_t) hidden_in_dim})) {
+                return false;
+            }
+        }
+        if (!dump_head_input_ids.empty()) {
+            if (!write_npy_i32(dir / "head_input_ids.npy", dump_head_input_ids.data(), {n_steps})) {
+                return false;
+            }
+        }
+        if (!dump_head_embd_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_embd_by_step.npy", dump_head_embd_by_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+        if (!dump_head_embd_norm_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_embd_norm_by_step.npy", dump_head_embd_norm_by_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+        if (!dump_head_hidden_proj_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_hidden_proj_by_step.npy", dump_head_hidden_proj_by_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+        if (!dump_head_hidden_norm_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_hidden_norm_by_step.npy", dump_head_hidden_norm_by_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+        if (!dump_head_cat_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_cat_by_step.npy", dump_head_cat_by_step.data(), {n_steps, (size_t) hidden_size * 2})) {
+                return false;
+            }
+        }
+        if (!dump_head_q_by_step.empty()) {
+            if (!write_npy_f32(dir / "head_q_by_step.npy", dump_head_q_by_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+        if (!dump_head_k_by_step.empty()) {
+            const size_t kv_dim = (size_t) model->hparams.head_dim * model->hparams.num_kv_heads;
+            if (!write_npy_f32(dir / "head_k_by_step.npy", dump_head_k_by_step.data(), {n_steps, kv_dim})) {
+                return false;
+            }
+        }
+        if (!dump_head_v_by_step.empty()) {
+            const size_t kv_dim = (size_t) model->hparams.head_dim * model->hparams.num_kv_heads;
+            if (!write_npy_f32(dir / "head_v_by_step.npy", dump_head_v_by_step.data(), {n_steps, kv_dim})) {
+                return false;
+            }
+        }
+        if (!dump_head_hidden_after_step.empty()) {
+            if (!write_npy_f32(dir / "head_hidden_after_step.npy", dump_head_hidden_after_step.data(), {n_steps, (size_t) hidden_size})) {
+                return false;
+            }
+        }
+
+        if (!dump_root_logits_draft.empty()) {
+            if ((int32_t) dump_root_logits_draft.size() != draft_vocab_size) {
+                LOG_WRN("%s: root logits size mismatch: got=%zu expected=%d\n",
+                        __func__, dump_root_logits_draft.size(), draft_vocab_size);
+            }
+            if (!write_npy_f32(dir / "head_root_logits_draft.npy", dump_root_logits_draft.data(), {(size_t) dump_root_logits_draft.size()})) {
+                return false;
+            }
+        }
+
+        // Meta file for convenience.
+        {
+            std::ofstream meta(dir / "meta.json", std::ios::binary);
+            if (!meta) {
+                LOG_ERR("%s: failed to write meta.json\n", __func__);
+                return false;
+            }
+
+            meta
+                << "{\n"
+                << "  \"format\": \"cascade_eagle3_dump_v1\",\n"
+                << "  \"seq_id\": " << (int) seq_id << ",\n"
+                << "  \"prompt_tgt_len\": " << n_prompt << ",\n"
+                << "  \"head_steps\": " << n_steps << ",\n"
+                << "  \"hidden_in_dim\": " << hidden_in_dim << ",\n"
+                << "  \"hidden_size\": " << hidden_size << ",\n"
+                << "  \"target_hidden_size\": " << target_hidden_size << ",\n"
+                << "  \"head_dim\": " << model->hparams.head_dim << ",\n"
+                << "  \"num_heads\": " << model->hparams.num_heads << ",\n"
+                << "  \"num_kv_heads\": " << model->hparams.num_kv_heads << ",\n"
+                << "  \"draft_vocab_size\": " << draft_vocab_size << ",\n"
+                << "  \"layer_ids\": [";
+            for (size_t i = 0; i < layer_ids.size(); ++i) {
+                meta << layer_ids[i];
+                if (i + 1 < layer_ids.size()) {
+                    meta << ", ";
+                }
+            }
+            meta << "],\n";
+
+            meta
+                << "  \"files\": {\n"
+                << "    \"prompt_tgt\": \"prompt_tgt.npy\",\n"
+                << "    \"id_last\": \"id_last.npy\",\n"
+                << "    \"layer_ids\": \"layer_ids.npy\",\n"
+                << "    \"teacher_hidden_layer_*\": \"teacher_hidden_layer_*.npy\",\n"
+                << "    \"teacher_hidden_concat_by_step\": \"teacher_hidden_concat_by_step.npy\",\n"
+                << "    \"head_input_ids\": \"head_input_ids.npy\",\n"
+                << "    \"head_embd_by_step\": \"head_embd_by_step.npy\",\n"
+                << "    \"head_q_by_step\": \"head_q_by_step.npy\",\n"
+                << "    \"head_k_by_step\": \"head_k_by_step.npy\",\n"
+                << "    \"head_v_by_step\": \"head_v_by_step.npy\",\n"
+                << "    \"head_hidden_after_step\": \"head_hidden_after_step.npy\",\n"
+                << "    \"head_root_logits_draft\": \"head_root_logits_draft.npy\"\n"
+                << "  }\n"
+                << "}\n";
+        }
+
+        LOG_INF("%s: wrote EAGLE3 dump to '%s'\n", __func__, dump_dir.c_str());
+        return true;
+    }
+
     bool prefill_to(const llama_tokens & prompt_tgt, llama_seq_id seq_id) {
         if (prompt_tgt.size() < cached_prompt_len) {
             cached_prompt_len = 0;
@@ -860,7 +1229,71 @@ private:
         }
 
         if (cached_prompt_len == 0) {
+            if (const char * dump_path = std::getenv("CASCADE_EAGLE_DUMP")) {
+                // Dump tokens + concatenated teacher hidden stream for external parity checks
+                // (e.g., compare against the PyTorch reference implementation).
+                std::vector<float> all_hidden;
+                all_hidden.resize(prompt_tgt.size() * (size_t) hidden_in_dim);
+                for (size_t i = 0; i < prompt_tgt.size(); ++i) {
+                    if (!build_hidden_concat(layer_ptrs, i, hidden_concat_buf)) {
+                        return false;
+                    }
+                    std::memcpy(
+                        all_hidden.data() + i * (size_t) hidden_in_dim,
+                        hidden_concat_buf.data(),
+                        (size_t) hidden_in_dim * sizeof(float));
+                }
+
+                std::ofstream out(dump_path, std::ios::binary);
+                if (!out) {
+                    LOG_ERR("%s: failed to open CASCADE_EAGLE_DUMP='%s'\n", __func__, dump_path);
+                    return false;
+                }
+
+                const uint32_t n_tokens_u32 = (uint32_t) prompt_tgt.size();
+                const uint32_t dim_u32      = (uint32_t) hidden_in_dim;
+
+                out.write(reinterpret_cast<const char *>(&n_tokens_u32), sizeof(n_tokens_u32));
+                out.write(reinterpret_cast<const char *>(&dim_u32),      sizeof(dim_u32));
+                out.write(reinterpret_cast<const char *>(prompt_tgt.data()), prompt_tgt.size() * sizeof(prompt_tgt[0]));
+                out.write(reinterpret_cast<const char *>(all_hidden.data()), all_hidden.size() * sizeof(all_hidden[0]));
+
+                LOG_INF("%s: wrote CASCADE_EAGLE_DUMP='%s' (%u tokens, dim=%u)\n",
+                        __func__, dump_path, n_tokens_u32, dim_u32);
+            }
+        }
+
+        if (cached_prompt_len == 0) {
             base_state = {};
+        }
+
+        const bool dump_steps = dump_pending && cached_prompt_len == 0 && !dump_dir.empty();
+        if (dump_steps) {
+            dump_prompt_tgt = prompt_tgt;
+            dump_head_input_ids.clear();
+            dump_teacher_hidden_by_step.clear();
+            dump_head_embd_by_step.clear();
+            dump_head_embd_norm_by_step.clear();
+            dump_head_hidden_proj_by_step.clear();
+            dump_head_hidden_norm_by_step.clear();
+            dump_head_cat_by_step.clear();
+            dump_head_q_by_step.clear();
+            dump_head_k_by_step.clear();
+            dump_head_v_by_step.clear();
+            dump_head_hidden_after_step.clear();
+
+            const size_t n_steps_total = prompt_tgt.size(); // prompt_tgt[1:] + id_last (recorded later in draft())
+            dump_head_input_ids.reserve(n_steps_total);
+            dump_teacher_hidden_by_step.reserve(n_steps_total * (size_t) hidden_in_dim);
+            dump_head_embd_by_step.reserve(n_steps_total * (size_t) hidden_size);
+            dump_head_embd_norm_by_step.reserve(n_steps_total * (size_t) hidden_size);
+            dump_head_hidden_proj_by_step.reserve(n_steps_total * (size_t) hidden_size);
+            dump_head_hidden_norm_by_step.reserve(n_steps_total * (size_t) hidden_size);
+            dump_head_cat_by_step.reserve(n_steps_total * (size_t) hidden_size * 2);
+            dump_head_q_by_step.reserve(n_steps_total * (size_t) hidden_size);
+            dump_head_k_by_step.reserve(n_steps_total * (size_t) model->hparams.head_dim * model->hparams.num_kv_heads);
+            dump_head_v_by_step.reserve(n_steps_total * (size_t) model->hparams.head_dim * model->hparams.num_kv_heads);
+            dump_head_hidden_after_step.reserve(n_steps_total * (size_t) hidden_size);
         }
 
         const size_t start = cached_prompt_len > 0 ? cached_prompt_len - 1 : 0;
@@ -868,8 +1301,34 @@ private:
             if (!build_hidden_concat(layer_ptrs, i, hidden_concat_buf)) {
                 return false;
             }
-            if (!llama_eagle3_step(*model, rt, base_state, hidden_concat_buf.data(), hidden_in_dim, prompt_tgt[i + 1], nullptr)) {
+
+            llama_eagle3_step_debug dbg;
+            if (dump_steps) {
+                dbg.embd        = &dump_head_embd_by_step;
+                dbg.embd_norm   = &dump_head_embd_norm_by_step;
+                dbg.hidden_proj = &dump_head_hidden_proj_by_step;
+                dbg.hidden_norm = &dump_head_hidden_norm_by_step;
+                dbg.cat         = &dump_head_cat_by_step;
+                dbg.q           = &dump_head_q_by_step;
+                dbg.k           = &dump_head_k_by_step;
+                dbg.v           = &dump_head_v_by_step;
+
+                dump_head_input_ids.push_back((int32_t) prompt_tgt[i + 1]);
+                dump_teacher_hidden_by_step.insert(
+                    dump_teacher_hidden_by_step.end(),
+                    hidden_concat_buf.begin(),
+                    hidden_concat_buf.end());
+            }
+
+            if (!llama_eagle3_step(*model, rt, base_state, hidden_concat_buf.data(), hidden_in_dim, prompt_tgt[i + 1], nullptr, dump_steps ? &dbg : nullptr)) {
                 return false;
+            }
+
+            if (dump_steps) {
+                dump_head_hidden_after_step.insert(
+                    dump_head_hidden_after_step.end(),
+                    base_state.hidden.begin(),
+                    base_state.hidden.end());
             }
         }
 

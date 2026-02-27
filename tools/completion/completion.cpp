@@ -3,6 +3,7 @@
 #include "console.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative.h"
 #include "llama.h"
 #include "chat.h"
 
@@ -574,6 +575,209 @@ int main(int argc, char ** argv) {
 
         embd_inp.clear();
         embd_inp.push_back(decoder_start_token_id);
+    }
+
+    if (params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        if (params.interactive || params.conversation_mode || llama_model_has_encoder(model)) {
+            LOG_WRN("%s: speculative decoding in llama-completion currently supports non-interactive decoder-only mode only; falling back to regular decoding\n", __func__);
+        } else if (params.speculative.mparams_dft.path.empty()) {
+            LOG_ERR("%s: --model-draft is required when --spec-type != none\n", __func__);
+            return 1;
+        } else {
+            llama_model_ptr model_dft;
+
+            if (params.speculative.type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                const auto & params_spec = params.speculative;
+
+                auto params_dft = params;
+                params_dft.n_parallel   = 1;
+                params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                params_dft.devices      = params_spec.devices;
+                params_dft.model        = params_spec.mparams_dft;
+                params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+                params_dft.cache_type_k = params_spec.cache_type_k;
+                params_dft.cache_type_v = params_spec.cache_type_v;
+
+                if (params_spec.cpuparams.n_threads > 0) {
+                    params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                    params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                }
+
+                params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+                auto mparams_dft = common_model_params_to_llama(params_dft);
+                model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                if (model_dft == nullptr) {
+                    LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, params_dft.model.path.c_str());
+                    return 1;
+                }
+
+                params.speculative.model_dft   = model_dft.get();
+                params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+            }
+
+            common_speculative * spec = common_speculative_init(params.speculative, ctx);
+            if (spec == nullptr) {
+                LOG_ERR("%s: failed to initialize speculative decoding context\n", __func__);
+                return 1;
+            }
+
+            llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+
+            if (embd_inp.empty()) {
+                common_speculative_free(spec);
+                llama_batch_free(batch_tgt);
+                LOG_ERR("%s: input is empty\n", __func__);
+                return 1;
+            }
+
+            llama_tokens prompt_tgt;
+            prompt_tgt.reserve(llama_n_ctx(ctx));
+
+            if (params.display_prompt) {
+                console::set_display(DISPLAY_TYPE_PROMPT);
+                for (const auto token : embd_inp) {
+                    LOG("%s", common_token_to_piece(ctx, token, params.special).c_str());
+                }
+                console::set_display(DISPLAY_TYPE_RESET);
+            }
+
+            // Keep the last token separate for speculative decoding.
+            if (embd_inp.size() > 1) {
+                if (llama_decode(ctx, llama_batch_get_one(embd_inp.data(), embd_inp.size() - 1))) {
+                    common_speculative_free(spec);
+                    llama_batch_free(batch_tgt);
+                    LOG_ERR("%s: failed to eval initial prompt\n", __func__);
+                    return 1;
+                }
+                n_past = embd_inp.size() - 1;
+                prompt_tgt.assign(embd_inp.begin(), embd_inp.end() - 1);
+            } else {
+                n_past = 0;
+            }
+
+            // Keep prompt tokens in sampler history so penalties match regular completion behavior.
+            for (const auto token : embd_inp) {
+                common_sampler_accept(smpl, token, /* accept_grammar = */ false);
+                input_tokens.push_back(token);
+            }
+
+            llama_token id_last = embd_inp.back();
+            common_speculative_begin(spec, prompt_tgt, 0);
+
+            bool has_eos = false;
+            int n_remain_spec = params.n_predict;
+
+            while (n_remain_spec != 0 && !has_eos) {
+                if (n_past + 1 >= n_ctx) {
+                    LOG_WRN("\n\n%s: context full while running speculative decoding => stopping\n", __func__);
+                    break;
+                }
+
+                llama_tokens draft = common_speculative_draft(spec, params.speculative, prompt_tgt, id_last, 0);
+                common_speculative_tree tree;
+                const bool has_tree = common_speculative_get_tree(spec, tree);
+                bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
+
+                if ((int) draft.size() < params.speculative.n_min) {
+                    draft.clear();
+                    tree.clear();
+                    use_tree = false;
+                }
+
+                common_batch_clear(batch_tgt);
+                common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
+
+                if (use_tree) {
+                    const llama_pos base_pos = n_past;
+                    for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                        const llama_pos pos = base_pos + tree.depths[i];
+                        common_batch_add(batch_tgt, tree.tokens[i], pos, { 0 }, true);
+                    }
+
+                    const llama_kq_mask_tree mask = {
+                        /* .n_nodes     = */ tree.tokens.size(),
+                        /* .parent      = */ tree.parents.data(),
+                        /* .batch_start = */ tree.batch_start,
+                    };
+                    llama_set_kq_mask_tree(ctx, &mask);
+                } else {
+                    for (size_t i = 0; i < draft.size(); ++i) {
+                        common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                    }
+                }
+
+                if (llama_decode(ctx, batch_tgt)) {
+                    if (use_tree) {
+                        llama_clear_kq_mask_tree(ctx);
+                    }
+                    common_speculative_free(spec);
+                    llama_batch_free(batch_tgt);
+                    LOG_ERR("%s: failed to eval speculative batch\n", __func__);
+                    return 1;
+                }
+
+                if (use_tree) {
+                    llama_clear_kq_mask_tree(ctx);
+                }
+
+                const auto ids = use_tree
+                    ? common_sampler_sample_and_accept_tree(smpl, ctx, 0, tree)
+                    : common_sampler_sample_and_accept_n(smpl, ctx, draft);
+
+                GGML_ASSERT(ids.size() > 0);
+                n_past += ids.size() - 1;
+
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    prompt_tgt.push_back(id_last);
+                    id_last = ids[i];
+
+                    if (llama_vocab_is_eog(vocab, id_last)) {
+                        has_eos = true;
+                        break;
+                    }
+
+                    const std::string token_str = common_token_to_piece(ctx, id_last, params.special);
+                    LOG("%s", token_str.c_str());
+                    output_tokens.push_back(id_last);
+                    output_ss << token_str;
+
+                    if (n_remain_spec > 0) {
+                        --n_remain_spec;
+                        if (n_remain_spec == 0) {
+                            break;
+                        }
+                    }
+                }
+
+                llama_memory_seq_rm(mem, 0, n_past, -1);
+                if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                    llama_eagle3_trim_seq(ctx, 0, n_past);
+                }
+            }
+
+            if (has_eos) {
+                LOG(" [end of text]\n");
+            }
+
+            common_speculative_free(spec);
+            llama_batch_free(batch_tgt);
+
+            if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
+                LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
+                llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+            }
+
+            LOG("\n\n");
+            common_perf_print(ctx, smpl);
+
+            llama_backend_free();
+            ggml_threadpool_free_fn(threadpool);
+            ggml_threadpool_free_fn(threadpool_batch);
+
+            return 0;
+        }
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {

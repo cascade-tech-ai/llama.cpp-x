@@ -3221,7 +3221,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"-tbd", "--threads-batch-draft"}, "N",
         "number of threads to use during batch and prompt processing (default: same as --threads-draft)",
@@ -3231,7 +3231,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"-Cd", "--cpu-mask-draft"}, "M",
         "Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask)",
@@ -3326,28 +3326,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.speculative.n_max = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
         [](common_params & params, int value) {
             params.speculative.n_min = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
         {"--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.p_split),
         [](common_params & params, const std::string & value) {
             params.speculative.p_split = std::stof(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_P_SPLIT"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         {"--draft-p-min"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.p_min = std::stof(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_P_MIN"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_DRAFT_P_MIN"));
     add_opt(common_arg(
         {"--eagle-max-depth"}, "N",
         string_format("EAGLE3 max draft depth (default: %d)", params.speculative.eagle_max_depth),
@@ -3357,7 +3357,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.speculative.eagle_max_depth = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--eagle-max-proposals"}, "N",
         string_format("EAGLE3 max proposals / beam width (default: %d)", params.speculative.eagle_max_proposals),
@@ -3367,7 +3367,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.speculative.eagle_max_proposals = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--eagle-beam-width"}, "N",
         string_format("EAGLE3 beam width (default: 0 = use --eagle-max-proposals)"),
@@ -3377,21 +3377,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.speculative.eagle_beam_width = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--eagle-prob-threshold"}, "P",
         string_format("EAGLE3 min draft prob to expand a node (default: %.4g)", (double)params.speculative.eagle_prob_threshold),
         [](common_params & params, const std::string & value) {
             params.speculative.eagle_prob_threshold = std::stof(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"-cd", "--ctx-size-draft"}, "N",
         string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.n_ctx),
         [](common_params & params, int value) {
             params.speculative.n_ctx = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CTX_SIZE_DRAFT"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_CTX_SIZE_DRAFT"));
     add_opt(common_arg(
         {"-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
@@ -3399,7 +3399,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.speculative.devices = parse_device_list(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     GGML_ASSERT(params.speculative.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
@@ -3419,21 +3419,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg(
         {"-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
         [](common_params & params, const std::string & value) {
             params.speculative.mparams_dft.path = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MODEL_DRAFT"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODEL_DRAFT"));
     add_opt(common_arg(
         {"--spec-replace"}, "TARGET", "DRAFT",
         "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
         [](common_params & params, const std::string & tgt, const std::string & dft) {
             params.speculative.replacements.push_back({ tgt, dft });
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--spec-type"}, "[none|draft|eagle3|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
         string_format("speculative decoding type (default: %s)\n",
@@ -3459,7 +3459,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("unknown speculative decoding type");
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--spec-ngram-size-n"}, "N",
         string_format("ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_size_n),

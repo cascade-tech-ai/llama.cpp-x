@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -375,17 +376,49 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
     llama_eagle3_runtime rt;
     const auto * ctx_impl = static_cast<const llama_context *>(ctx_tgt);
     const auto rope = ctx_impl->get_rope_params(0);
+    const auto & cparams = ctx_impl->get_cparams();
 
     rt.base_model     = llama_get_model(const_cast<llama_context *>(ctx_tgt));
-    rt.rope_type      = rope.rope_type;
+    // The EAGLE head is exported from HF Transformers and uses the same RoPE convention as
+    // transformers' LlamaRotaryEmbedding/apply_rotary_pos_emb, which corresponds to GGML_ROPE_TYPE_NEOX
+    // (pair first-half with second-half). The base model in llama.cpp may use a different internal
+    // convention due to weight permutations, so do not inherit rope.rope_type here.
+    rt.rope_type      = LLAMA_ROPE_TYPE_NEOX;
     rt.rope_freq_base = rope.freq_base;
     rt.rope_freq_scale = rope.freq_scale;
+    rt.rope_factors    = nullptr;
     rt.yarn_ext_factor  = rope.ext_factor;
     rt.yarn_attn_factor = rope.attn_factor;
     rt.yarn_beta_fast   = rope.beta_fast;
     rt.yarn_beta_slow   = rope.beta_slow;
     rt.n_ctx_orig       = rope.n_ctx_orig;
     rt.n_threads        = n_threads;
+
+    // For Llama 3 and similar, RoPE uses per-dimension scaling factors stored as model tensors.
+    // The head runs on CPU-only ggml contexts, so ensure these factors are available in CPU memory
+    // even when the base model is offloaded to GPU.
+    if (rt.base_model) {
+        ggml_tensor * src = rt.base_model->get_rope_factors(cparams, /* il */ 0);
+        if (src) {
+            const size_t n_bytes = ggml_nbytes(src);
+            const size_t mem_size = ggml_tensor_overhead() * 4 + n_bytes + 1024;
+            rt.rope_factors_buf.resize(mem_size);
+
+            ggml_init_params params = {
+                /* .mem_size   = */ mem_size,
+                /* .mem_buffer = */ rt.rope_factors_buf.data(),
+                /* .no_alloc   = */ false,
+            };
+            rt.rope_factors_ctx.reset(ggml_init(params));
+            if (rt.rope_factors_ctx) {
+                ggml_tensor * dst = ggml_new_tensor(rt.rope_factors_ctx.get(), src->type, ggml_n_dims(src), src->ne);
+                std::vector<uint8_t> tmp(n_bytes);
+                ggml_backend_tensor_get(src, tmp.data(), 0, n_bytes);
+                std::memcpy(dst->data, tmp.data(), n_bytes);
+                rt.rope_factors = dst;
+            }
+        }
+    }
 
     GGML_UNUSED(model);
     return rt;
@@ -434,7 +467,8 @@ bool llama_eagle3_step(
         const float * hidden_in,
         int32_t hidden_in_dim,
         llama_token input_id,
-        std::vector<float> * logits_out) {
+        std::vector<float> * logits_out,
+        llama_eagle3_step_debug * dbg) {
     if (!hidden_in) {
         return false;
     }
@@ -498,14 +532,14 @@ bool llama_eagle3_step(
     reinterpret_cast<int32_t *>(t_pos->data)[0] = state.past_len;
 
     t_q = ggml_rope_ext(
-            ctx.get(), t_q, t_pos, nullptr,
+            ctx.get(), t_q, t_pos, rt.rope_factors,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
-            ctx.get(), t_k, t_pos, nullptr,
+            ctx.get(), t_k, t_pos, rt.rope_factors,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
@@ -527,8 +561,34 @@ bool llama_eagle3_step(
     }
 
     if (hp.num_kv_heads != hp.num_heads) {
-        t_k_total = ggml_repeat_4d(ctx.get(), t_k_total, hp.head_dim, hp.num_heads, t_k_total->ne[2], 1);
-        t_v_total = ggml_repeat_4d(ctx.get(), t_v_total, hp.head_dim, hp.num_heads, t_v_total->ne[2], 1);
+        const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
+
+        // Match HF `repeat_kv` semantics: repeat each KV head `n_rep` times consecutively.
+        // Our tensors are [head_dim, n_kv, seq]. We reshape/permute to make the repeat dimension
+        // "inner" before merging back to [head_dim, n_head, seq].
+        ggml_tensor * k4 = ggml_reshape_4d(ctx.get(), t_k_total, hp.head_dim, hp.num_kv_heads, t_k_total->ne[2], 1);
+        ggml_tensor * v4 = ggml_reshape_4d(ctx.get(), t_v_total, hp.head_dim, hp.num_kv_heads, t_v_total->ne[2], 1);
+
+        // Note: ggml_permute uses "destination axis for each source axis" (see ggml_permute impl).
+        // We want [head_dim, 1, n_kv, seq] from [head_dim, n_kv, seq, 1].
+        k4 = ggml_permute(ctx.get(), k4, 0, 2, 3, 1); // [head_dim, 1, n_kv, seq]
+        v4 = ggml_permute(ctx.get(), v4, 0, 2, 3, 1); // [head_dim, 1, n_kv, seq]
+
+        if (std::getenv("CASCADE_EAGLE_DEBUG")) {
+            fprintf(stderr,
+                    "eagle3 repeat_kv: k4 ne=[%lld,%lld,%lld,%lld] -> [%d,%d,%d,%lld]\n",
+                    (long long) k4->ne[0], (long long) k4->ne[1], (long long) k4->ne[2], (long long) k4->ne[3],
+                    hp.head_dim, n_rep, hp.num_kv_heads, (long long) t_k_total->ne[2]);
+        }
+
+        k4 = ggml_repeat_4d(ctx.get(), k4, hp.head_dim, n_rep, hp.num_kv_heads, t_k_total->ne[2]); // [head_dim, n_rep, n_kv, seq]
+        v4 = ggml_repeat_4d(ctx.get(), v4, hp.head_dim, n_rep, hp.num_kv_heads, t_v_total->ne[2]); // [head_dim, n_rep, n_kv, seq]
+
+        k4 = ggml_cont(ctx.get(), k4);
+        v4 = ggml_cont(ctx.get(), v4);
+
+        t_k_total = ggml_reshape_3d(ctx.get(), k4, hp.head_dim, hp.num_heads, t_k_total->ne[2]);
+        t_v_total = ggml_reshape_3d(ctx.get(), v4, hp.head_dim, hp.num_heads, t_v_total->ne[2]);
     }
 
     ggml_tensor * qv = ggml_view_4d(ctx.get(), t_q, t_q->ne[0], t_q->ne[1], t_q->ne[2], 1, t_q->nb[1], t_q->nb[2], t_q->nb[3], 0);
@@ -593,12 +653,39 @@ bool llama_eagle3_step(
         t_logits = ggml_mul_mat(ctx.get(), model.tensors.lm_head_w, t_norm);
     }
 
+    ggml_tensor * t_embd_cont       = nullptr;
+    ggml_tensor * t_embd_norm_cont  = nullptr;
+    ggml_tensor * t_hidden_cont     = nullptr;
+    ggml_tensor * t_hidden_norm_cont = nullptr;
+    ggml_tensor * t_cat_cont        = nullptr;
+    ggml_tensor * t_q_cont          = nullptr;
+    ggml_tensor * t_k_cont          = nullptr;
+    ggml_tensor * t_v_cont          = nullptr;
+    if (dbg) {
+        if (dbg->embd)        { t_embd_cont        = ggml_cont(ctx.get(), t_embd); }
+        if (dbg->embd_norm)   { t_embd_norm_cont   = ggml_cont(ctx.get(), t_embd_norm); }
+        if (dbg->hidden_proj) { t_hidden_cont      = ggml_cont(ctx.get(), t_hidden); }
+        if (dbg->hidden_norm) { t_hidden_norm_cont = ggml_cont(ctx.get(), t_hidden_norm); }
+        if (dbg->cat)         { t_cat_cont         = ggml_cont(ctx.get(), t_cat); }
+        if (dbg->q)           { t_q_cont           = ggml_cont(ctx.get(), t_q); }
+        if (dbg->k)           { t_k_cont           = ggml_cont(ctx.get(), t_k); }
+        if (dbg->v)           { t_v_cont           = ggml_cont(ctx.get(), t_v); }
+    }
+
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     if (t_logits) {
         ggml_build_forward_expand(gf, t_logits);
     } else {
         ggml_build_forward_expand(gf, t_hidden_out);
     }
+    if (t_embd_cont)        { ggml_build_forward_expand(gf, t_embd_cont); }
+    if (t_embd_norm_cont)   { ggml_build_forward_expand(gf, t_embd_norm_cont); }
+    if (t_hidden_cont)      { ggml_build_forward_expand(gf, t_hidden_cont); }
+    if (t_hidden_norm_cont) { ggml_build_forward_expand(gf, t_hidden_norm_cont); }
+    if (t_cat_cont)         { ggml_build_forward_expand(gf, t_cat_cont); }
+    if (t_q_cont)           { ggml_build_forward_expand(gf, t_q_cont); }
+    if (t_k_cont)           { ggml_build_forward_expand(gf, t_k_cont); }
+    if (t_v_cont)           { ggml_build_forward_expand(gf, t_v_cont); }
     ggml_graph_compute_with_ctx(ctx.get(), gf, std::max(1, rt.n_threads));
 
     state.hidden.resize(hp.hidden_size);
@@ -618,6 +705,41 @@ bool llama_eagle3_step(
     if (logits_out) {
         logits_out->resize(hp.draft_vocab_size);
         std::memcpy(logits_out->data(), t_logits->data, hp.draft_vocab_size * sizeof(float));
+    }
+
+    if (dbg) {
+        if (dbg->embd && t_embd_cont) {
+            const float * src = reinterpret_cast<const float *>(t_embd_cont->data);
+            dbg->embd->insert(dbg->embd->end(), src, src + hp.hidden_size);
+        }
+        if (dbg->embd_norm && t_embd_norm_cont) {
+            const float * src = reinterpret_cast<const float *>(t_embd_norm_cont->data);
+            dbg->embd_norm->insert(dbg->embd_norm->end(), src, src + hp.hidden_size);
+        }
+        if (dbg->hidden_proj && t_hidden_cont) {
+            const float * src = reinterpret_cast<const float *>(t_hidden_cont->data);
+            dbg->hidden_proj->insert(dbg->hidden_proj->end(), src, src + hp.hidden_size);
+        }
+        if (dbg->hidden_norm && t_hidden_norm_cont) {
+            const float * src = reinterpret_cast<const float *>(t_hidden_norm_cont->data);
+            dbg->hidden_norm->insert(dbg->hidden_norm->end(), src, src + hp.hidden_size);
+        }
+        if (dbg->cat && t_cat_cont) {
+            const float * src = reinterpret_cast<const float *>(t_cat_cont->data);
+            dbg->cat->insert(dbg->cat->end(), src, src + (size_t) hp.hidden_size * 2);
+        }
+        if (dbg->q && t_q_cont) {
+            const float * src = reinterpret_cast<const float *>(t_q_cont->data);
+            dbg->q->insert(dbg->q->end(), src, src + (size_t) hp.head_dim * hp.num_heads);
+        }
+        if (dbg->k && t_k_cont) {
+            const float * src = reinterpret_cast<const float *>(t_k_cont->data);
+            dbg->k->insert(dbg->k->end(), src, src + (size_t) hp.head_dim * hp.num_kv_heads);
+        }
+        if (dbg->v && t_v_cont) {
+            const float * src = reinterpret_cast<const float *>(t_v_cont->data);
+            dbg->v->insert(dbg->v->end(), src, src + (size_t) hp.head_dim * hp.num_kv_heads);
+        }
     }
 
     return true;
