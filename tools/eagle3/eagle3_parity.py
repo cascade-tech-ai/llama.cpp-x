@@ -40,6 +40,27 @@ def _rms(a: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(a))))
 
 
+def _align_for_compare(name: str, llama_arr: np.ndarray, torch_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if llama_arr.shape == torch_arr.shape:
+        return llama_arr, torch_arr
+
+    # Some heads (e.g. Qwen3) can have q_proj width != hidden_size.
+    # Keep parity checks running by comparing the shared prefix.
+    if (
+        llama_arr.ndim == 2
+        and torch_arr.ndim == 2
+        and llama_arr.shape[0] == torch_arr.shape[0]
+    ):
+        w = min(llama_arr.shape[1], torch_arr.shape[1])
+        print(
+            f"{name}: shape mismatch llama={llama_arr.shape} torch={torch_arr.shape}; "
+            f"comparing first {w} columns"
+        )
+        return llama_arr[:, :w], torch_arr[:, :w]
+
+    raise SystemExit(f"{name} shape mismatch: llama={llama_arr.shape} torch={torch_arr.shape}")
+
+
 def _topk_from_logits(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (idx, logits, probs) sorted by prob desc."""
     if logits.ndim != 1:
@@ -223,8 +244,7 @@ def main() -> int:
     torch_logits_np = torch_logits.cpu().numpy().astype(np.float32)
 
     def _print_stage(name: str, llama_arr: np.ndarray, torch_arr: np.ndarray) -> None:
-        if llama_arr.shape != torch_arr.shape:
-            raise SystemExit(f"{name} shape mismatch: llama={llama_arr.shape} torch={torch_arr.shape}")
+        llama_arr, torch_arr = _align_for_compare(name, llama_arr, torch_arr)
         d = torch_arr - llama_arr
         per_step = np.max(np.abs(d).reshape(d.shape[0], -1), axis=1)
         worst = int(np.argmax(per_step))
