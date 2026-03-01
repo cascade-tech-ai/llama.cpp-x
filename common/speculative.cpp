@@ -762,18 +762,22 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
             t_step_us += ggml_time_us() - t_step_start;
         }
-        if (root_state.hidden.empty()) {
+        if (!llama_eagle3_state_has_hidden(root_state)) {
             return;
         }
 
         if (dump_root) {
+            std::vector<float> root_hidden;
+            if (!llama_eagle3_state_get_hidden(*model, rt, root_state, root_hidden)) {
+                return;
+            }
             dump_head_hidden_after_step.insert(
                 dump_head_hidden_after_step.end(),
-                root_state.hidden.begin(),
-                root_state.hidden.end());
+                root_hidden.begin(),
+                root_hidden.end());
 
             std::vector<float> root_logits;
-            if (!llama_eagle3_logits(*model, rt, root_state.hidden.data(), root_logits)) {
+            if (!llama_eagle3_logits(*model, rt, root_hidden.data(), root_logits)) {
                 return;
             }
             dump_root_logits_draft = std::move(root_logits);
@@ -812,82 +816,70 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             std::vector<beam_expansion> expansions;
             expansions.reserve(beams.size() * (size_t) beam_width);
 
+            const int k = std::min<int>(beam_width, model->hparams.draft_vocab_size);
+            if (k <= 0) {
+                break;
+            }
+
+            std::vector<size_t> active_beam_idx;
+            std::vector<const llama_eagle3_state *> active_states;
+            active_beam_idx.reserve(beams.size());
+            active_states.reserve(beams.size());
             for (size_t beam_idx = 0; beam_idx < beams.size(); ++beam_idx) {
-                auto & beam = beams[beam_idx];
-                if (beam.state.hidden.empty()) {
+                if (!llama_eagle3_state_has_hidden(beams[beam_idx].state)) {
                     continue;
                 }
-                std::vector<float> logits;
-                {
-                    const int64_t t_logits_start = ggml_time_us();
-                    ++n_logits_calls;
-                    if (!llama_eagle3_logits(*model, rt, beam.state.hidden.data(), logits)) {
+                active_beam_idx.push_back(beam_idx);
+                active_states.push_back(&beams[beam_idx].state);
+            }
+            if (active_states.empty()) {
+                break;
+            }
+
+            std::vector<int32_t> topk_idx;
+            std::vector<float> topk_prob;
+            {
+                const int64_t t_logits_start = ggml_time_us();
+                ++n_logits_calls;
+                if (!llama_eagle3_topk_state_batch(*model, rt, active_states, k, topk_idx, topk_prob)) {
+                    break;
+                }
+                t_logits_us += ggml_time_us() - t_logits_start;
+            }
+
+            const int64_t t_scoring_start = ggml_time_us();
+            for (size_t ai = 0; ai < active_beam_idx.size(); ++ai) {
+                const size_t beam_idx = active_beam_idx[ai];
+                auto & beam = beams[beam_idx];
+                const size_t off = ai * (size_t) k;
+                for (int j = 0; j < k; ++j) {
+                    const int draft_idx = topk_idx[off + (size_t) j];
+                    const float prob = topk_prob[off + (size_t) j];
+                    if (draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
                         continue;
                     }
-                    t_logits_us += ggml_time_us() - t_logits_start;
-                }
 
-                if (logits.empty()) {
-                    continue;
-                }
-
-                const int64_t t_scoring_start = ggml_time_us();
-                float max_logit = logits[0];
-                for (float v : logits) {
-                    max_logit = std::max(max_logit, v);
-                }
-
-                std::vector<float> exp_vals(logits.size());
-                float exp_sum = 0.0f;
-                for (size_t i = 0; i < logits.size(); ++i) {
-                    const float ev = std::exp(logits[i] - max_logit);
-                    exp_vals[i] = ev;
-                    exp_sum += ev;
-                }
-                if (exp_sum <= 0.0f) {
-                    continue;
-                }
-
-                const int k = std::min<int>(beam_width, (int) logits.size());
-                if (k <= 0) {
-                    continue;
-                }
-
-                std::vector<int> idxs(logits.size());
-                std::iota(idxs.begin(), idxs.end(), 0);
-                std::partial_sort(idxs.begin(), idxs.begin() + k, idxs.end(),
-                    [&](int a, int b) { return logits[a] > logits[b]; });
-
-                if (verbose) {
-                    for (int j = 0; j < k; ++j) {
-                        const int draft_idx = idxs[j];
-                        const float prob = exp_vals[draft_idx] / exp_sum;
-                        const int32_t base_id = draft_idx + model->d2t[draft_idx];
+                    const int32_t base_id = draft_idx + model->d2t[draft_idx];
+                    const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
+                    if (verbose) {
                         const bool base_ok = base_id >= 0 && base_id < model->hparams.vocab_size;
                         const std::string piece = base_ok && vocab_tgt
                             ? common_token_to_piece(vocab_tgt, base_id)
                             : std::string("<invalid>");
                         const std::string escaped = escape_token_piece(piece);
-                        const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
                         LOG_INF("eagle3 depth=%d beam=%zu rank=%d token=%d piece=\"%s\" p=%.6f%s\n",
-                            depth,
-                            beam_idx,
-                            j,
-                            base_id,
-                            escaped.c_str(),
-                            prob,
-                            filtered ? " (filtered)" : "");
+                                depth,
+                                beam_idx,
+                                j,
+                                base_id,
+                                escaped.c_str(),
+                                prob,
+                                filtered ? " (filtered)" : "");
                     }
-                }
 
-                for (int j = 0; j < k; ++j) {
-                    const int draft_idx = idxs[j];
-                    const float prob = exp_vals[draft_idx] / exp_sum;
-                    if (prob_threshold > 0.0f && prob < prob_threshold) {
+                    if (filtered) {
                         continue;
                     }
-
-                    const int32_t base_id = draft_idx + model->d2t[draft_idx];
                     if (base_id < 0 || base_id >= model->hparams.vocab_size) {
                         continue;
                     }
@@ -898,8 +890,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         /* token    = */ base_id,
                     });
                 }
-                t_scoring_us += ggml_time_us() - t_scoring_start;
             }
+            t_scoring_us += ggml_time_us() - t_scoring_start;
 
             if (expansions.empty()) {
                 break;
@@ -929,7 +921,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 {
                     const int64_t t_step_start = ggml_time_us();
                     ++n_step_calls;
-                    if (!llama_eagle3_step(*model, rt, child.state, child.state.hidden.data(), hidden_size, expansion.token, nullptr)) {
+                    const float * hidden_step = child.state.hidden.empty() ? nullptr : child.state.hidden.data();
+                    if (!llama_eagle3_step(*model, rt, child.state, hidden_step, hidden_size, expansion.token, nullptr)) {
                         continue;
                     }
                     t_step_us += ggml_time_us() - t_step_start;

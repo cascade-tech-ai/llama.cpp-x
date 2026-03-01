@@ -6,6 +6,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,9 @@ struct llama_eagle3_state {
     std::vector<float> k;      // [head_dim, n_kv_heads, past_len]
     std::vector<float> v;      // [head_dim, n_kv_heads, past_len]
     int32_t past_len = 0;
+
+    struct device_state;
+    std::shared_ptr<device_state> dev;
 };
 
 // Optional debugging outputs for llama_eagle3_step().
@@ -91,15 +95,65 @@ struct llama_eagle3_step_debug {
     std::vector<float> * v = nullptr; // [head_dim * n_kv_heads]
 };
 
+struct llama_eagle3_logits_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+
+    ggml_tensor * t_hidden = nullptr;
+    ggml_tensor * t_logits = nullptr;
+};
+
+struct llama_eagle3_step_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+
+    ggml_tensor * t_hidden_in = nullptr;
+    ggml_tensor * t_tok       = nullptr;
+    ggml_tensor * t_pos       = nullptr;
+    ggml_tensor * t_k_past_input = nullptr;
+    ggml_tensor * t_v_past_input = nullptr;
+
+    ggml_tensor * t_hidden_out = nullptr;
+    ggml_tensor * t_k_curr     = nullptr;
+    ggml_tensor * t_v_curr     = nullptr;
+    ggml_tensor * t_k_total    = nullptr;
+    ggml_tensor * t_v_total    = nullptr;
+    ggml_tensor * t_logits     = nullptr;
+};
+
+struct llama_eagle3_topk_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+    int32_t                 k = 0;
+
+    ggml_tensor * t_hidden    = nullptr;
+    ggml_tensor * t_probs     = nullptr;
+    ggml_tensor * t_topk_idx  = nullptr;
+    ggml_tensor * t_topk_prob = nullptr;
+};
+
+struct llama_eagle3_topk_batch_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+    int32_t                 k = 0;
+    int32_t                 n_beams = 0;
+
+    ggml_tensor * t_hidden    = nullptr; // [hidden_size, n_beams]
+    ggml_tensor * t_probs     = nullptr; // [draft_vocab_size, n_beams]
+    ggml_tensor * t_topk_idx  = nullptr; // [k, n_beams]
+};
+
 struct llama_eagle3_runtime {
     const llama_model * base_model = nullptr;
+    ggml_tensor * tok_embd = nullptr;
 
     llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
-    // Optional rope factors tensor (e.g. Llama 3 scaling). For safety, we copy it to a small
-    // CPU ggml context so it can be used from the CPU-only EAGLE3 head path even when the base
-    // model is offloaded to GPU.
     ggml_context_ptr        rope_factors_ctx;
     std::vector<uint8_t>    rope_factors_buf;
     ggml_tensor *           rope_factors = nullptr;
@@ -111,6 +165,22 @@ struct llama_eagle3_runtime {
     int32_t n_ctx_orig     = 0;
 
     int32_t n_threads = 0;
+
+    // Preferred backend for EAGLE head execution. Falls back to CPU path if unavailable.
+    ggml_backend_ptr backend_compute;
+    ggml_backend_buffer_type_t buft_compute = nullptr;
+
+    // Backend-local copies of EAGLE head weights (same layout as llama_eagle3_model::tensors).
+    ggml_context_ptr        ctx_weights_compute;
+    ggml_backend_buffer_ptr buf_weights_compute;
+    llama_eagle3_tensors    tensors_compute;
+
+    // Reusable compute graphs for backend execution.
+    mutable llama_eagle3_logits_graph logits_graph;
+    mutable llama_eagle3_topk_graph topk_graph;
+    mutable llama_eagle3_topk_batch_graph topk_batch_graph;
+    mutable uint64_t step_graph_key = ~uint64_t(0);
+    mutable llama_eagle3_step_graph step_graph;
 };
 
 llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & err);
@@ -136,3 +206,34 @@ bool llama_eagle3_logits(
         const llama_eagle3_runtime & rt,
         const float * hidden,
         std::vector<float> & logits_out);
+
+bool llama_eagle3_topk(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const float * hidden,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out);
+
+bool llama_eagle3_topk_state(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & state,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out);
+
+bool llama_eagle3_topk_state_batch(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out);
+
+bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state);
+bool llama_eagle3_state_get_hidden(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        llama_eagle3_state & state,
+        std::vector<float> & hidden_out);

@@ -12,7 +12,17 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+
+struct llama_eagle3_state::device_state {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+    ggml_tensor *           t_hidden = nullptr;
+    ggml_tensor *           t_k = nullptr;
+    ggml_tensor *           t_v = nullptr;
+    int32_t                 past_len = 0;
+};
 
 namespace {
 
@@ -185,6 +195,548 @@ ggml_context_ptr make_ctx_with_buf(std::vector<uint8_t> & buf, size_t bytes) {
         /* .no_alloc   = */ false,
     };
     return ggml_context_ptr(ggml_init(params));
+}
+
+ggml_context_ptr make_ctx_no_alloc(size_t max_nodes) {
+    const size_t mem_size =
+            ggml_tensor_overhead() * max_nodes +
+            ggml_graph_overhead_custom(max_nodes, /* grads = */ false);
+    ggml_init_params params = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    return ggml_context_ptr(ggml_init(params));
+}
+
+uint64_t make_step_graph_key(int32_t past_len, int32_t hidden_in_dim, bool with_logits) {
+    return (uint64_t(uint32_t(past_len)) << 32) |
+           (uint64_t(uint32_t(hidden_in_dim)) << 1) |
+           (with_logits ? 1ull : 0ull);
+}
+
+void maybe_set_backend_threads(ggml_backend_t backend, int32_t n_threads) {
+    if (!backend || n_threads <= 0) {
+        return;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return;
+    }
+
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_n_threads) {
+        set_n_threads(backend, n_threads);
+    }
+}
+
+template<typename T>
+void set_name_same(T * dst, const T * src) {
+    if (dst && src && src->name) {
+        ggml_set_name(dst, src->name);
+    }
+}
+
+const llama_eagle3_tensors & get_runtime_tensors(const llama_eagle3_model & model, const llama_eagle3_runtime & rt) {
+    if (rt.tensors_compute.fc_w) {
+        return rt.tensors_compute;
+    }
+    return model.tensors;
+}
+
+bool alloc_state_device(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t past_len,
+        std::shared_ptr<llama_eagle3_state::device_state> & out) {
+    if (!rt.buft_compute || past_len < 0) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 32);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, 1);
+    ggml_tensor * t_k = nullptr;
+    ggml_tensor * t_v = nullptr;
+    if (past_len > 0) {
+        t_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+        t_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+    }
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    if (!buf) {
+        return false;
+    }
+
+    auto dev = std::make_shared<llama_eagle3_state::device_state>();
+    dev->ctx = std::move(ctx);
+    dev->buf = std::move(buf);
+    dev->t_hidden = t_hidden;
+    dev->t_k = t_k;
+    dev->t_v = t_v;
+    dev->past_len = past_len;
+    out = std::move(dev);
+    return true;
+}
+
+bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagle3_runtime & rt) {
+    if (!rt.backend_compute || !rt.buft_compute) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 64 + 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    rt.ctx_weights_compute.reset(ggml_init(params));
+    if (!rt.ctx_weights_compute) {
+        return false;
+    }
+
+    auto dup = [&](ggml_tensor * src) -> ggml_tensor * {
+        if (!src) {
+            return nullptr;
+        }
+        ggml_tensor * dst = ggml_dup_tensor(rt.ctx_weights_compute.get(), src);
+        set_name_same(dst, src);
+        return dst;
+    };
+
+    rt.tensors_compute.fc_w          = dup(model.tensors.fc_w);
+    rt.tensors_compute.norm_w        = dup(model.tensors.norm_w);
+    rt.tensors_compute.lm_head_w     = dup(model.tensors.lm_head_w);
+    rt.tensors_compute.hidden_norm_w = dup(model.tensors.hidden_norm_w);
+    rt.tensors_compute.input_norm_w  = dup(model.tensors.input_norm_w);
+    rt.tensors_compute.post_norm_w   = dup(model.tensors.post_norm_w);
+    rt.tensors_compute.attn_q_w      = dup(model.tensors.attn_q_w);
+    rt.tensors_compute.attn_k_w      = dup(model.tensors.attn_k_w);
+    rt.tensors_compute.attn_v_w      = dup(model.tensors.attn_v_w);
+    rt.tensors_compute.attn_o_w      = dup(model.tensors.attn_o_w);
+    rt.tensors_compute.ffn_gate_w    = dup(model.tensors.ffn_gate_w);
+    rt.tensors_compute.ffn_up_w      = dup(model.tensors.ffn_up_w);
+    rt.tensors_compute.ffn_down_w    = dup(model.tensors.ffn_down_w);
+
+    rt.tensors_compute.attn_q_b      = dup(model.tensors.attn_q_b);
+    rt.tensors_compute.attn_k_b      = dup(model.tensors.attn_k_b);
+    rt.tensors_compute.attn_v_b      = dup(model.tensors.attn_v_b);
+    rt.tensors_compute.attn_o_b      = dup(model.tensors.attn_o_b);
+    rt.tensors_compute.ffn_gate_b    = dup(model.tensors.ffn_gate_b);
+    rt.tensors_compute.ffn_up_b      = dup(model.tensors.ffn_up_b);
+    rt.tensors_compute.ffn_down_b    = dup(model.tensors.ffn_down_b);
+
+    rt.buf_weights_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.ctx_weights_compute.get(), rt.buft_compute));
+    if (!rt.buf_weights_compute) {
+        return false;
+    }
+
+    auto copy = [&](ggml_tensor * src, ggml_tensor * dst) {
+        if (src && dst) {
+            ggml_backend_tensor_copy(src, dst);
+        }
+    };
+
+    copy(model.tensors.fc_w,          rt.tensors_compute.fc_w);
+    copy(model.tensors.norm_w,        rt.tensors_compute.norm_w);
+    copy(model.tensors.lm_head_w,     rt.tensors_compute.lm_head_w);
+    copy(model.tensors.hidden_norm_w, rt.tensors_compute.hidden_norm_w);
+    copy(model.tensors.input_norm_w,  rt.tensors_compute.input_norm_w);
+    copy(model.tensors.post_norm_w,   rt.tensors_compute.post_norm_w);
+    copy(model.tensors.attn_q_w,      rt.tensors_compute.attn_q_w);
+    copy(model.tensors.attn_k_w,      rt.tensors_compute.attn_k_w);
+    copy(model.tensors.attn_v_w,      rt.tensors_compute.attn_v_w);
+    copy(model.tensors.attn_o_w,      rt.tensors_compute.attn_o_w);
+    copy(model.tensors.ffn_gate_w,    rt.tensors_compute.ffn_gate_w);
+    copy(model.tensors.ffn_up_w,      rt.tensors_compute.ffn_up_w);
+    copy(model.tensors.ffn_down_w,    rt.tensors_compute.ffn_down_w);
+
+    copy(model.tensors.attn_q_b,      rt.tensors_compute.attn_q_b);
+    copy(model.tensors.attn_k_b,      rt.tensors_compute.attn_k_b);
+    copy(model.tensors.attn_v_b,      rt.tensors_compute.attn_v_b);
+    copy(model.tensors.attn_o_b,      rt.tensors_compute.attn_o_b);
+    copy(model.tensors.ffn_gate_b,    rt.tensors_compute.ffn_gate_b);
+    copy(model.tensors.ffn_up_b,      rt.tensors_compute.ffn_up_b);
+    copy(model.tensors.ffn_down_b,    rt.tensors_compute.ffn_down_b);
+
+    return true;
+}
+
+bool build_logits_graph(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        llama_eagle3_logits_graph & graph) {
+    if (graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden && graph.t_logits) {
+        return true;
+    }
+
+    const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 256);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, 1);
+    ggml_set_input(t_hidden);
+
+    ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
+    ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
+    t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
+
+    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, t_logits);
+
+    ggml_backend_buffer_ptr buf_compute;
+    if (rt.buft_compute) {
+        buf_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    }
+
+    if (!buf_compute) {
+        return false;
+    }
+
+    graph.ctx = std::move(ctx);
+    graph.buf_compute = std::move(buf_compute);
+    graph.gf = gf;
+    graph.t_hidden = t_hidden;
+    graph.t_logits = t_logits;
+    return true;
+}
+
+bool build_topk_graph(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t k,
+        llama_eagle3_topk_graph & graph) {
+    if (graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden && graph.t_probs && graph.t_topk_idx && graph.k == k) {
+        return true;
+    }
+
+    const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 320);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, 1);
+    ggml_set_input(t_hidden);
+
+    ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
+    ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
+    t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
+
+    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
+    ggml_tensor * t_probs = ggml_soft_max(ctx.get(), t_logits);
+    t_probs = ggml_cont(ctx.get(), t_probs);
+    ggml_tensor * t_topk_idx = ggml_top_k(ctx.get(), t_probs, k);
+    t_topk_idx = ggml_cont(ctx.get(), t_topk_idx);
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, t_topk_idx);
+
+    ggml_backend_buffer_ptr buf_compute;
+    if (rt.buft_compute) {
+        buf_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    }
+
+    if (!buf_compute) {
+        return false;
+    }
+
+    graph.ctx = std::move(ctx);
+    graph.buf_compute = std::move(buf_compute);
+    graph.gf = gf;
+    graph.k = k;
+    graph.t_hidden = t_hidden;
+    graph.t_probs = t_probs;
+    graph.t_topk_idx = t_topk_idx;
+    graph.t_topk_prob = nullptr;
+    return true;
+}
+
+bool build_topk_batch_graph(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_beams,
+        int32_t k,
+        llama_eagle3_topk_batch_graph & graph) {
+    if (graph.ctx && graph.buf_compute && graph.gf &&
+        graph.t_hidden && graph.t_probs && graph.t_topk_idx &&
+        graph.n_beams == n_beams && graph.k == k) {
+        return true;
+    }
+
+    const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 384);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, n_beams);
+    ggml_set_input(t_hidden);
+
+    ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
+    ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
+    t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
+
+    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
+    ggml_tensor * t_probs = ggml_soft_max(ctx.get(), t_logits);
+    t_probs = ggml_cont(ctx.get(), t_probs);
+    ggml_tensor * t_topk_idx = ggml_top_k(ctx.get(), t_probs, k);
+    t_topk_idx = ggml_cont(ctx.get(), t_topk_idx);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, t_topk_idx);
+
+    ggml_backend_buffer_ptr buf_compute;
+    if (rt.buft_compute) {
+        buf_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    }
+    if (!buf_compute) {
+        return false;
+    }
+
+    graph.ctx = std::move(ctx);
+    graph.buf_compute = std::move(buf_compute);
+    graph.gf = gf;
+    graph.k = k;
+    graph.n_beams = n_beams;
+    graph.t_hidden = t_hidden;
+    graph.t_probs = t_probs;
+    graph.t_topk_idx = t_topk_idx;
+    return true;
+}
+
+bool build_step_graph(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t past_len,
+        int32_t hidden_in_dim,
+        bool with_logits,
+        llama_eagle3_step_graph & graph) {
+    if (graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden_in && graph.t_hidden_out && graph.t_k_total && graph.t_v_total) {
+        return true;
+    }
+
+    if (!rt.tok_embd) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 2048);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden_in = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden_in_dim, 1);
+    ggml_set_input(t_hidden_in);
+
+    ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_tok);
+
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
+    t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
+
+    ggml_tensor * t_hidden = t_hidden_in;
+    if (hidden_in_dim != hp.hidden_size) {
+        t_hidden = ggml_mul_mat(ctx.get(), tensors.fc_w, t_hidden_in);
+    }
+
+    ggml_tensor * t_hidden_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
+    ggml_tensor * t_hidden_norm_w = ggml_cast(ctx.get(), tensors.hidden_norm_w, GGML_TYPE_F32);
+    t_hidden_norm = ggml_mul(ctx.get(), t_hidden_norm, t_hidden_norm_w);
+
+    ggml_tensor * t_embd_norm = ggml_rms_norm(ctx.get(), t_embd, hp.rms_norm_eps);
+    ggml_tensor * t_input_norm_w = ggml_cast(ctx.get(), tensors.input_norm_w, GGML_TYPE_F32);
+    t_embd_norm = ggml_mul(ctx.get(), t_embd_norm, t_input_norm_w);
+
+    ggml_tensor * t_cat = ggml_concat(ctx.get(), t_embd_norm, t_hidden_norm, 0);
+
+    ggml_tensor * t_q = ggml_mul_mat(ctx.get(), tensors.attn_q_w, t_cat);
+    if (tensors.attn_q_b) {
+        ggml_tensor * t_q_b = ggml_cast(ctx.get(), tensors.attn_q_b, GGML_TYPE_F32);
+        t_q = ggml_add(ctx.get(), t_q, t_q_b);
+    }
+    ggml_tensor * t_k = ggml_mul_mat(ctx.get(), tensors.attn_k_w, t_cat);
+    if (tensors.attn_k_b) {
+        ggml_tensor * t_k_b = ggml_cast(ctx.get(), tensors.attn_k_b, GGML_TYPE_F32);
+        t_k = ggml_add(ctx.get(), t_k, t_k_b);
+    }
+    ggml_tensor * t_v = ggml_mul_mat(ctx.get(), tensors.attn_v_w, t_cat);
+    if (tensors.attn_v_b) {
+        ggml_tensor * t_v_b = ggml_cast(ctx.get(), tensors.attn_v_b, GGML_TYPE_F32);
+        t_v = ggml_add(ctx.get(), t_v, t_v_b);
+    }
+
+    t_q = ggml_reshape_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, 1);
+    t_k = ggml_reshape_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1);
+    t_v = ggml_reshape_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1);
+
+    ggml_tensor * t_pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_pos);
+
+    t_q = ggml_rope_ext(
+            ctx.get(), t_q, t_pos, rt.rope_factors,
+            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            rt.rope_freq_base, rt.rope_freq_scale,
+            rt.yarn_ext_factor, rt.yarn_attn_factor,
+            rt.yarn_beta_fast, rt.yarn_beta_slow);
+
+    t_k = ggml_rope_ext(
+            ctx.get(), t_k, t_pos, rt.rope_factors,
+            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            rt.rope_freq_base, rt.rope_freq_scale,
+            rt.yarn_ext_factor, rt.yarn_attn_factor,
+            rt.yarn_beta_fast, rt.yarn_beta_slow);
+
+    ggml_tensor * t_k_total = t_k;
+    ggml_tensor * t_v_total = t_v;
+    ggml_tensor * t_k_past_input = nullptr;
+    ggml_tensor * t_v_past_input = nullptr;
+
+    if (past_len > 0) {
+        t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+        t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+        ggml_set_input(t_k_past_input);
+        ggml_set_input(t_v_past_input);
+
+        t_k_total = ggml_concat(ctx.get(), t_k_past_input, t_k, 2);
+        t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
+    }
+
+    ggml_tensor * t_k_attn = t_k_total;
+    ggml_tensor * t_v_attn = t_v_total;
+
+    if (hp.num_kv_heads != hp.num_heads) {
+        const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
+
+        ggml_tensor * k4 = ggml_reshape_4d(ctx.get(), t_k_attn, hp.head_dim, hp.num_kv_heads, t_k_attn->ne[2], 1);
+        ggml_tensor * v4 = ggml_reshape_4d(ctx.get(), t_v_attn, hp.head_dim, hp.num_kv_heads, t_v_attn->ne[2], 1);
+
+        k4 = ggml_permute(ctx.get(), k4, 0, 2, 3, 1);
+        v4 = ggml_permute(ctx.get(), v4, 0, 2, 3, 1);
+
+        k4 = ggml_repeat_4d(ctx.get(), k4, hp.head_dim, n_rep, hp.num_kv_heads, t_k_attn->ne[2]);
+        v4 = ggml_repeat_4d(ctx.get(), v4, hp.head_dim, n_rep, hp.num_kv_heads, t_v_attn->ne[2]);
+
+        k4 = ggml_cont(ctx.get(), k4);
+        v4 = ggml_cont(ctx.get(), v4);
+
+        t_k_attn = ggml_reshape_3d(ctx.get(), k4, hp.head_dim, hp.num_heads, t_k_attn->ne[2]);
+        t_v_attn = ggml_reshape_3d(ctx.get(), v4, hp.head_dim, hp.num_heads, t_v_attn->ne[2]);
+    }
+
+    ggml_tensor * qv = ggml_view_4d(ctx.get(), t_q, t_q->ne[0], t_q->ne[1], t_q->ne[2], 1, t_q->nb[1], t_q->nb[2], t_q->nb[3], 0);
+    ggml_tensor * kv = ggml_view_4d(ctx.get(), t_k_attn, t_k_attn->ne[0], t_k_attn->ne[1], t_k_attn->ne[2], 1,
+                                    t_k_attn->nb[1], t_k_attn->nb[2], t_k_attn->nb[3], 0);
+    ggml_tensor * vv = ggml_view_4d(ctx.get(), t_v_attn, t_v_attn->ne[0], t_v_attn->ne[1], t_v_attn->ne[2], 1,
+                                    t_v_attn->nb[1], t_v_attn->nb[2], t_v_attn->nb[3], 0);
+
+    qv = ggml_permute(ctx.get(), qv, 0, 2, 1, 3);
+    kv = ggml_permute(ctx.get(), kv, 0, 2, 1, 3);
+    vv = ggml_permute(ctx.get(), vv, 0, 2, 1, 3);
+
+    ggml_tensor * kq = ggml_mul_mat(ctx.get(), kv, qv);
+    const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
+    kq = ggml_scale(ctx.get(), kq, kq_scale);
+    kq = ggml_cont(ctx.get(), kq);
+    kq = ggml_soft_max(ctx.get(), kq);
+
+    ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
+    ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
+    ggml_tensor * attn_out = ggml_permute(ctx.get(), kqv, 0, 2, 1, 3);
+    attn_out = ggml_cont_2d(ctx.get(), attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]);
+
+    ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), tensors.attn_o_w, attn_out);
+    if (tensors.attn_o_b) {
+        ggml_tensor * t_attn_b = ggml_cast(ctx.get(), tensors.attn_o_b, GGML_TYPE_F32);
+        t_attn = ggml_add(ctx.get(), t_attn, t_attn_b);
+    }
+
+    ggml_tensor * t_resid = hp.norm_before_residual ? t_hidden_norm : t_hidden;
+    ggml_tensor * t_hidden_attn = ggml_add(ctx.get(), t_attn, t_resid);
+
+    ggml_tensor * t_post = ggml_rms_norm(ctx.get(), t_hidden_attn, hp.rms_norm_eps);
+    ggml_tensor * t_post_norm_w = ggml_cast(ctx.get(), tensors.post_norm_w, GGML_TYPE_F32);
+    t_post = ggml_mul(ctx.get(), t_post, t_post_norm_w);
+
+    ggml_tensor * t_gate = ggml_mul_mat(ctx.get(), tensors.ffn_gate_w, t_post);
+    if (tensors.ffn_gate_b) {
+        ggml_tensor * t_gate_b = ggml_cast(ctx.get(), tensors.ffn_gate_b, GGML_TYPE_F32);
+        t_gate = ggml_add(ctx.get(), t_gate, t_gate_b);
+    }
+    ggml_tensor * t_up = ggml_mul_mat(ctx.get(), tensors.ffn_up_w, t_post);
+    if (tensors.ffn_up_b) {
+        ggml_tensor * t_up_b = ggml_cast(ctx.get(), tensors.ffn_up_b, GGML_TYPE_F32);
+        t_up = ggml_add(ctx.get(), t_up, t_up_b);
+    }
+    ggml_tensor * t_act = ggml_mul(ctx.get(), ggml_silu(ctx.get(), t_gate), t_up);
+    ggml_tensor * t_ffn = ggml_mul_mat(ctx.get(), tensors.ffn_down_w, t_act);
+    if (tensors.ffn_down_b) {
+        ggml_tensor * t_down_b = ggml_cast(ctx.get(), tensors.ffn_down_b, GGML_TYPE_F32);
+        t_ffn = ggml_add(ctx.get(), t_ffn, t_down_b);
+    }
+
+    ggml_tensor * t_hidden_out = ggml_add(ctx.get(), t_hidden_attn, t_ffn);
+    t_hidden_out = ggml_cont(ctx.get(), t_hidden_out);
+    ggml_tensor * t_k_total_out = ggml_cont(ctx.get(), t_k_total);
+    ggml_tensor * t_v_total_out = ggml_cont(ctx.get(), t_v_total);
+
+    ggml_tensor * t_logits = nullptr;
+    if (with_logits) {
+        ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden_out, hp.rms_norm_eps);
+        ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
+        t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
+        t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, t_hidden_out);
+    ggml_build_forward_expand(gf, t_k_total_out);
+    ggml_build_forward_expand(gf, t_v_total_out);
+    if (t_logits) {
+        ggml_build_forward_expand(gf, t_logits);
+    }
+
+    ggml_backend_buffer_ptr buf_compute;
+    if (rt.buft_compute) {
+        buf_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    }
+
+    if (!buf_compute) {
+        return false;
+    }
+
+    graph.ctx = std::move(ctx);
+    graph.buf_compute = std::move(buf_compute);
+    graph.gf = gf;
+    graph.t_hidden_in = t_hidden_in;
+    graph.t_tok = t_tok;
+    graph.t_pos = t_pos;
+    graph.t_k_past_input = t_k_past_input;
+    graph.t_v_past_input = t_v_past_input;
+    graph.t_hidden_out = t_hidden_out;
+    graph.t_k_curr = t_k;
+    graph.t_v_curr = t_v;
+    graph.t_k_total = t_k_total_out;
+    graph.t_v_total = t_v_total_out;
+    graph.t_logits = t_logits;
+    return true;
 }
 
 } // namespace
@@ -379,6 +931,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
     const auto & cparams = ctx_impl->get_cparams();
 
     rt.base_model     = llama_get_model(const_cast<llama_context *>(ctx_tgt));
+    rt.tok_embd       = rt.base_model ? rt.base_model->tok_embd : nullptr;
     // The EAGLE head is exported from HF Transformers and uses the same RoPE convention as
     // transformers' LlamaRotaryEmbedding/apply_rotary_pos_emb, which corresponds to GGML_ROPE_TYPE_NEOX
     // (pair first-half with second-half). The base model in llama.cpp may use a different internal
@@ -394,9 +947,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
     rt.n_ctx_orig       = rope.n_ctx_orig;
     rt.n_threads        = n_threads;
 
-    // For Llama 3 and similar, RoPE uses per-dimension scaling factors stored as model tensors.
-    // The head runs on CPU-only ggml contexts, so ensure these factors are available in CPU memory
-    // even when the base model is offloaded to GPU.
+    // Keep rope factors in host memory so fallback CPU execution stays valid.
     if (rt.base_model) {
         ggml_tensor * src = rt.base_model->get_rope_factors(cparams, /* il */ 0);
         if (src) {
@@ -420,7 +971,32 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
         }
     }
 
-    GGML_UNUSED(model);
+    // Prefer GPU backend for EAGLE head execution.
+    rt.backend_compute.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr));
+    if (!rt.backend_compute) {
+        rt.backend_compute.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr));
+    }
+    if (rt.backend_compute) {
+        rt.buft_compute = ggml_backend_get_default_buffer_type(rt.backend_compute.get());
+        maybe_set_backend_threads(rt.backend_compute.get(), n_threads);
+        if (!copy_weight_tensors_to_backend(*model, rt)) {
+            rt.backend_compute.reset();
+            rt.buft_compute = nullptr;
+            rt.ctx_weights_compute.reset();
+            rt.buf_weights_compute.reset();
+            rt.tensors_compute = {};
+        }
+    }
+
+    // Fallback backend for environments without a GPU backend.
+    if (!rt.backend_compute) {
+        rt.backend_compute.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        if (rt.backend_compute) {
+            rt.buft_compute = ggml_backend_get_default_buffer_type(rt.backend_compute.get());
+            maybe_set_backend_threads(rt.backend_compute.get(), n_threads);
+        }
+    }
+
     return rt;
 }
 
@@ -434,6 +1010,20 @@ bool llama_eagle3_logits(
     }
 
     const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    if (rt.backend_compute && rt.buft_compute) {
+        if (build_logits_graph(model, rt, rt.logits_graph)) {
+            ggml_backend_tensor_set(rt.logits_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
+            const ggml_status status = ggml_backend_graph_compute(rt.backend_compute.get(), rt.logits_graph.gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                logits_out.resize(hp.draft_vocab_size);
+                ggml_backend_tensor_get(rt.logits_graph.t_logits, logits_out.data(), 0, hp.draft_vocab_size * sizeof(float));
+                return true;
+            }
+        }
+    }
+
     const size_t mem_size = 8ull * 1024ull * 1024ull;
     std::vector<uint8_t> buf(mem_size);
     auto ctx = make_ctx_with_buf(buf, mem_size);
@@ -443,21 +1033,263 @@ bool llama_eagle3_logits(
 
     ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, 1);
     ggml_set_input(t_hidden);
-    std::memcpy(t_hidden->data, hidden, hp.hidden_size * sizeof(float));
 
     ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
-    ggml_tensor * t_norm_w = ggml_cast(ctx.get(), model.tensors.norm_w, GGML_TYPE_F32);
+    ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
     t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
 
-    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), model.tensors.lm_head_w, t_norm);
+    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_logits);
+
+    std::memcpy(t_hidden->data, hidden, hp.hidden_size * sizeof(float));
     ggml_graph_compute_with_ctx(ctx.get(), gf, std::max(1, rt.n_threads));
 
     logits_out.resize(hp.draft_vocab_size);
     std::memcpy(logits_out.data(), t_logits->data, hp.draft_vocab_size * sizeof(float));
     return true;
+}
+
+bool llama_eagle3_topk(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const float * hidden,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out) {
+    if (!hidden || k <= 0) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    if (rt.backend_compute && rt.buft_compute) {
+        if (build_topk_graph(model, rt, k, rt.topk_graph)) {
+            ggml_backend_tensor_set(rt.topk_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
+            const ggml_status status = ggml_backend_graph_compute(rt.backend_compute.get(), rt.topk_graph.gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                topk_idx_out.resize(k);
+                topk_prob_out.resize(k);
+                ggml_backend_tensor_get(rt.topk_graph.t_topk_idx, topk_idx_out.data(), 0, (size_t) k * sizeof(int32_t));
+
+                const size_t n_probs = (size_t) hp.draft_vocab_size;
+                for (int i = 0; i < k; ++i) {
+                    int32_t idx = topk_idx_out[i];
+                    if (idx < 0 || (size_t) idx >= n_probs) {
+                        topk_prob_out[i] = 0.0f;
+                        continue;
+                    }
+                    float p = 0.0f;
+                    ggml_backend_tensor_get(rt.topk_graph.t_probs, &p, (size_t) idx * sizeof(float), sizeof(float));
+                    topk_prob_out[i] = p;
+                }
+                return true;
+            }
+        }
+    }
+
+    std::vector<float> logits;
+    if (!llama_eagle3_logits(model, rt, hidden, logits) || logits.empty()) {
+        return false;
+    }
+
+    float max_logit = logits[0];
+    for (float v : logits) {
+        max_logit = std::max(max_logit, v);
+    }
+
+    std::vector<float> probs(logits.size());
+    float sum = 0.0f;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        probs[i] = std::exp(logits[i] - max_logit);
+        sum += probs[i];
+    }
+    if (sum <= 0.0f) {
+        return false;
+    }
+    for (float & p : probs) {
+        p /= sum;
+    }
+
+    std::vector<int32_t> idx(probs.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+            [&](int32_t a, int32_t b) { return probs[a] > probs[b]; });
+
+    topk_idx_out.resize(k);
+    topk_prob_out.resize(k);
+    for (int i = 0; i < k; ++i) {
+        topk_idx_out[i] = idx[i];
+        topk_prob_out[i] = probs[idx[i]];
+    }
+    return true;
+}
+
+bool llama_eagle3_topk_state(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & state,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out) {
+    const auto & hp = model.hparams;
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    if (rt.backend_compute && rt.buft_compute && state.dev && state.dev->t_hidden) {
+        if (build_topk_graph(model, rt, k, rt.topk_graph)) {
+            ggml_backend_tensor_copy(state.dev->t_hidden, rt.topk_graph.t_hidden);
+            const ggml_status status = ggml_backend_graph_compute(rt.backend_compute.get(), rt.topk_graph.gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                topk_idx_out.resize(k);
+                topk_prob_out.resize(k);
+                ggml_backend_tensor_get(rt.topk_graph.t_topk_idx, topk_idx_out.data(), 0, (size_t) k * sizeof(int32_t));
+
+                const size_t n_probs = (size_t) hp.draft_vocab_size;
+                for (int i = 0; i < k; ++i) {
+                    int32_t idx = topk_idx_out[i];
+                    if (idx < 0 || (size_t) idx >= n_probs) {
+                        topk_prob_out[i] = 0.0f;
+                        continue;
+                    }
+                    float p = 0.0f;
+                    ggml_backend_tensor_get(rt.topk_graph.t_probs, &p, (size_t) idx * sizeof(float), sizeof(float));
+                    topk_prob_out[i] = p;
+                }
+                return true;
+            }
+        }
+    }
+
+    if (!state.hidden.empty()) {
+        return llama_eagle3_topk(model, rt, state.hidden.data(), k, topk_idx_out, topk_prob_out);
+    }
+
+    return false;
+}
+
+bool llama_eagle3_topk_state_batch(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        int32_t k,
+        std::vector<int32_t> & topk_idx_out,
+        std::vector<float> & topk_prob_out) {
+    const auto & hp = model.hparams;
+    const int32_t n_beams = (int32_t) states.size();
+    if (n_beams <= 0) {
+        return false;
+    }
+
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    if (rt.backend_compute && rt.buft_compute) {
+        if (build_topk_batch_graph(model, rt, n_beams, k, rt.topk_batch_graph)) {
+            std::vector<float> hidden_in((size_t) hp.hidden_size * n_beams);
+            for (int32_t ib = 0; ib < n_beams; ++ib) {
+                const llama_eagle3_state * st = states[ib];
+                if (st == nullptr) {
+                    return false;
+                }
+                float * dst = hidden_in.data() + (size_t) ib * hp.hidden_size;
+                if (!st->hidden.empty()) {
+                    std::memcpy(dst, st->hidden.data(), (size_t) hp.hidden_size * sizeof(float));
+                } else if (st->dev && st->dev->t_hidden) {
+                    ggml_backend_tensor_get(st->dev->t_hidden, dst, 0, (size_t) hp.hidden_size * sizeof(float));
+                } else {
+                    return false;
+                }
+            }
+
+            ggml_backend_tensor_set(rt.topk_batch_graph.t_hidden, hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+            const ggml_status status = ggml_backend_graph_compute(rt.backend_compute.get(), rt.topk_batch_graph.gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                topk_idx_out.resize((size_t) n_beams * k);
+                topk_prob_out.resize((size_t) n_beams * k);
+
+                ggml_backend_tensor_get(
+                        rt.topk_batch_graph.t_topk_idx,
+                        topk_idx_out.data(),
+                        0,
+                        topk_idx_out.size() * sizeof(int32_t));
+
+                std::vector<float> probs((size_t) hp.draft_vocab_size * n_beams);
+                ggml_backend_tensor_get(
+                        rt.topk_batch_graph.t_probs,
+                        probs.data(),
+                        0,
+                        probs.size() * sizeof(float));
+
+                for (int32_t ib = 0; ib < n_beams; ++ib) {
+                    const size_t probs_off = (size_t) ib * hp.draft_vocab_size;
+                    const size_t topk_off = (size_t) ib * k;
+                    for (int32_t j = 0; j < k; ++j) {
+                        const int32_t idx = topk_idx_out[topk_off + j];
+                        if (idx < 0 || idx >= hp.draft_vocab_size) {
+                            topk_prob_out[topk_off + j] = 0.0f;
+                        } else {
+                            topk_prob_out[topk_off + j] = probs[probs_off + (size_t) idx];
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    topk_idx_out.resize((size_t) n_beams * k);
+    topk_prob_out.resize((size_t) n_beams * k);
+    for (int32_t ib = 0; ib < n_beams; ++ib) {
+        const llama_eagle3_state * st = states[ib];
+        if (st == nullptr) {
+            return false;
+        }
+
+        std::vector<int32_t> idx;
+        std::vector<float> prob;
+        if (!llama_eagle3_topk_state(model, rt, *st, k, idx, prob) || (int32_t) idx.size() != k || (int32_t) prob.size() != k) {
+            return false;
+        }
+        std::memcpy(topk_idx_out.data() + (size_t) ib * k, idx.data(), (size_t) k * sizeof(int32_t));
+        std::memcpy(topk_prob_out.data() + (size_t) ib * k, prob.data(), (size_t) k * sizeof(float));
+    }
+    return true;
+}
+
+bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state) {
+    return !state.hidden.empty() || (state.dev && state.dev->t_hidden != nullptr);
+}
+
+bool llama_eagle3_state_get_hidden(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        llama_eagle3_state & state,
+        std::vector<float> & hidden_out) {
+    GGML_UNUSED(rt);
+    const auto & hp = model.hparams;
+    if (!state.hidden.empty()) {
+        hidden_out = state.hidden;
+        return hidden_out.size() == (size_t) hp.hidden_size;
+    }
+
+    if (state.dev && state.dev->t_hidden) {
+        hidden_out.resize(hp.hidden_size);
+        ggml_backend_tensor_get(state.dev->t_hidden, hidden_out.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+        state.hidden = hidden_out;
+        return true;
+    }
+
+    return false;
 }
 
 bool llama_eagle3_step(
@@ -469,11 +1301,93 @@ bool llama_eagle3_step(
         llama_token input_id,
         std::vector<float> * logits_out,
         llama_eagle3_step_debug * dbg) {
-    if (!hidden_in) {
+    if (!rt.tok_embd) {
         return false;
     }
 
     const auto & hp = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+    const bool hidden_from_state = hidden_in == nullptr;
+    if (hidden_from_state && hidden_in_dim != hp.hidden_size) {
+        return false;
+    }
+    if (hidden_from_state && state.hidden.empty() && (!state.dev || !state.dev->t_hidden)) {
+        return false;
+    }
+
+    const bool with_logits = logits_out != nullptr;
+    if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
+        const uint64_t key = make_step_graph_key(state.past_len, hidden_in_dim, with_logits);
+        if (rt.step_graph_key != key) {
+            rt.step_graph = {};
+            if (build_step_graph(model, rt, state.past_len, hidden_in_dim, with_logits, rt.step_graph)) {
+                rt.step_graph_key = key;
+            }
+        }
+
+        if (rt.step_graph_key == key && rt.step_graph.gf) {
+            auto & graph = rt.step_graph;
+            const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
+            const size_t past_bytes = (size_t) state.past_len * block * sizeof(float);
+
+            if (hidden_in) {
+                ggml_backend_tensor_set(graph.t_hidden_in, hidden_in, 0, hidden_in_dim * sizeof(float));
+            } else if (state.dev && state.dev->t_hidden) {
+                ggml_backend_tensor_copy(state.dev->t_hidden, graph.t_hidden_in);
+            } else {
+                ggml_backend_tensor_set(graph.t_hidden_in, state.hidden.data(), 0, hidden_in_dim * sizeof(float));
+            }
+            ggml_backend_tensor_set(graph.t_tok, &input_id, 0, sizeof(input_id));
+            ggml_backend_tensor_set(graph.t_pos, &state.past_len, 0, sizeof(state.past_len));
+
+            if (graph.t_k_past_input && state.past_len > 0) {
+                if (state.dev && state.dev->t_k && state.dev->past_len == state.past_len) {
+                    ggml_backend_tensor_copy(state.dev->t_k, graph.t_k_past_input);
+                } else if (state.k.size() * sizeof(float) >= past_bytes) {
+                    ggml_backend_tensor_set(graph.t_k_past_input, state.k.data(), 0, past_bytes);
+                } else {
+                    return false;
+                }
+            }
+            if (graph.t_v_past_input && state.past_len > 0) {
+                if (state.dev && state.dev->t_v && state.dev->past_len == state.past_len) {
+                    ggml_backend_tensor_copy(state.dev->t_v, graph.t_v_past_input);
+                } else if (state.v.size() * sizeof(float) >= past_bytes) {
+                    ggml_backend_tensor_set(graph.t_v_past_input, state.v.data(), 0, past_bytes);
+                } else {
+                    return false;
+                }
+            }
+
+            const ggml_status status = ggml_backend_graph_compute(rt.backend_compute.get(), graph.gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                std::shared_ptr<llama_eagle3_state::device_state> next_dev;
+                if (alloc_state_device(model, rt, state.past_len + 1, next_dev)) {
+                    ggml_backend_tensor_copy(graph.t_hidden_out, next_dev->t_hidden);
+                    if (next_dev->t_k && next_dev->t_v && graph.t_k_total && graph.t_v_total) {
+                        ggml_backend_tensor_copy(graph.t_k_total, next_dev->t_k);
+                        ggml_backend_tensor_copy(graph.t_v_total, next_dev->t_v);
+                    }
+                    state.dev = std::move(next_dev);
+                } else {
+                    state.dev.reset();
+                }
+
+                state.hidden.clear();
+                state.k.clear();
+                state.v.clear();
+
+                if (with_logits && graph.t_logits) {
+                    logits_out->resize(hp.draft_vocab_size);
+                    ggml_backend_tensor_get(graph.t_logits, logits_out->data(), 0, hp.draft_vocab_size * sizeof(float));
+                }
+
+                state.past_len += 1;
+                return true;
+            }
+        }
+    }
+
     const size_t mem_size = estimate_step_mem(hp, state.past_len);
     std::vector<uint8_t> buf(mem_size);
     auto ctx = make_ctx_with_buf(buf, mem_size);
@@ -483,43 +1397,41 @@ bool llama_eagle3_step(
 
     ggml_tensor * t_hidden_in = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden_in_dim, 1);
     ggml_set_input(t_hidden_in);
-    std::memcpy(t_hidden_in->data, hidden_in, hidden_in_dim * sizeof(float));
 
     ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_tok);
-    reinterpret_cast<int32_t *>(t_tok->data)[0] = input_id;
 
-    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.base_model->tok_embd, t_tok);
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
     t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
 
     ggml_tensor * t_hidden = t_hidden_in;
     if (hidden_in_dim != hp.hidden_size) {
-        t_hidden = ggml_mul_mat(ctx.get(), model.tensors.fc_w, t_hidden_in);
+        t_hidden = ggml_mul_mat(ctx.get(), tensors.fc_w, t_hidden_in);
     }
 
     ggml_tensor * t_hidden_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
-    ggml_tensor * t_hidden_norm_w = ggml_cast(ctx.get(), model.tensors.hidden_norm_w, GGML_TYPE_F32);
+    ggml_tensor * t_hidden_norm_w = ggml_cast(ctx.get(), tensors.hidden_norm_w, GGML_TYPE_F32);
     t_hidden_norm = ggml_mul(ctx.get(), t_hidden_norm, t_hidden_norm_w);
 
     ggml_tensor * t_embd_norm = ggml_rms_norm(ctx.get(), t_embd, hp.rms_norm_eps);
-    ggml_tensor * t_input_norm_w = ggml_cast(ctx.get(), model.tensors.input_norm_w, GGML_TYPE_F32);
+    ggml_tensor * t_input_norm_w = ggml_cast(ctx.get(), tensors.input_norm_w, GGML_TYPE_F32);
     t_embd_norm = ggml_mul(ctx.get(), t_embd_norm, t_input_norm_w);
 
     ggml_tensor * t_cat = ggml_concat(ctx.get(), t_embd_norm, t_hidden_norm, 0);
 
-    ggml_tensor * t_q = ggml_mul_mat(ctx.get(), model.tensors.attn_q_w, t_cat);
-    if (model.tensors.attn_q_b) {
-        ggml_tensor * t_q_b = ggml_cast(ctx.get(), model.tensors.attn_q_b, GGML_TYPE_F32);
+    ggml_tensor * t_q = ggml_mul_mat(ctx.get(), tensors.attn_q_w, t_cat);
+    if (tensors.attn_q_b) {
+        ggml_tensor * t_q_b = ggml_cast(ctx.get(), tensors.attn_q_b, GGML_TYPE_F32);
         t_q = ggml_add(ctx.get(), t_q, t_q_b);
     }
-    ggml_tensor * t_k = ggml_mul_mat(ctx.get(), model.tensors.attn_k_w, t_cat);
-    if (model.tensors.attn_k_b) {
-        ggml_tensor * t_k_b = ggml_cast(ctx.get(), model.tensors.attn_k_b, GGML_TYPE_F32);
+    ggml_tensor * t_k = ggml_mul_mat(ctx.get(), tensors.attn_k_w, t_cat);
+    if (tensors.attn_k_b) {
+        ggml_tensor * t_k_b = ggml_cast(ctx.get(), tensors.attn_k_b, GGML_TYPE_F32);
         t_k = ggml_add(ctx.get(), t_k, t_k_b);
     }
-    ggml_tensor * t_v = ggml_mul_mat(ctx.get(), model.tensors.attn_v_w, t_cat);
-    if (model.tensors.attn_v_b) {
-        ggml_tensor * t_v_b = ggml_cast(ctx.get(), model.tensors.attn_v_b, GGML_TYPE_F32);
+    ggml_tensor * t_v = ggml_mul_mat(ctx.get(), tensors.attn_v_w, t_cat);
+    if (tensors.attn_v_b) {
+        ggml_tensor * t_v_b = ggml_cast(ctx.get(), tensors.attn_v_b, GGML_TYPE_F32);
         t_v = ggml_add(ctx.get(), t_v, t_v_b);
     }
 
@@ -529,7 +1441,6 @@ bool llama_eagle3_step(
 
     ggml_tensor * t_pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_pos);
-    reinterpret_cast<int32_t *>(t_pos->data)[0] = state.past_len;
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos, rt.rope_factors,
@@ -547,17 +1458,17 @@ bool llama_eagle3_step(
 
     ggml_tensor * t_k_total = t_k;
     ggml_tensor * t_v_total = t_v;
+    ggml_tensor * t_k_past_input = nullptr;
+    ggml_tensor * t_v_past_input = nullptr;
 
     if (state.past_len > 0) {
-        ggml_tensor * t_k_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, state.past_len);
-        ggml_tensor * t_v_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, state.past_len);
-        ggml_set_input(t_k_past);
-        ggml_set_input(t_v_past);
-        std::memcpy(t_k_past->data, state.k.data(), state.k.size() * sizeof(float));
-        std::memcpy(t_v_past->data, state.v.data(), state.v.size() * sizeof(float));
+        t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, state.past_len);
+        t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, state.past_len);
+        ggml_set_input(t_k_past_input);
+        ggml_set_input(t_v_past_input);
 
-        t_k_total = ggml_concat(ctx.get(), t_k_past, t_k, 2);
-        t_v_total = ggml_concat(ctx.get(), t_v_past, t_v, 2);
+        t_k_total = ggml_concat(ctx.get(), t_k_past_input, t_k, 2);
+        t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
     }
 
     if (hp.num_kv_heads != hp.num_heads) {
@@ -612,9 +1523,9 @@ bool llama_eagle3_step(
     ggml_tensor * attn_out = ggml_permute(ctx.get(), kqv, 0, 2, 1, 3);
     attn_out = ggml_cont_2d(ctx.get(), attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]);
 
-    ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), model.tensors.attn_o_w, attn_out);
-    if (model.tensors.attn_o_b) {
-        ggml_tensor * t_attn_b = ggml_cast(ctx.get(), model.tensors.attn_o_b, GGML_TYPE_F32);
+    ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), tensors.attn_o_w, attn_out);
+    if (tensors.attn_o_b) {
+        ggml_tensor * t_attn_b = ggml_cast(ctx.get(), tensors.attn_o_b, GGML_TYPE_F32);
         t_attn = ggml_add(ctx.get(), t_attn, t_attn_b);
     }
 
@@ -622,23 +1533,23 @@ bool llama_eagle3_step(
     ggml_tensor * t_hidden_attn = ggml_add(ctx.get(), t_attn, t_resid);
 
     ggml_tensor * t_post = ggml_rms_norm(ctx.get(), t_hidden_attn, hp.rms_norm_eps);
-    ggml_tensor * t_post_norm_w = ggml_cast(ctx.get(), model.tensors.post_norm_w, GGML_TYPE_F32);
+    ggml_tensor * t_post_norm_w = ggml_cast(ctx.get(), tensors.post_norm_w, GGML_TYPE_F32);
     t_post = ggml_mul(ctx.get(), t_post, t_post_norm_w);
 
-    ggml_tensor * t_gate = ggml_mul_mat(ctx.get(), model.tensors.ffn_gate_w, t_post);
-    if (model.tensors.ffn_gate_b) {
-        ggml_tensor * t_gate_b = ggml_cast(ctx.get(), model.tensors.ffn_gate_b, GGML_TYPE_F32);
+    ggml_tensor * t_gate = ggml_mul_mat(ctx.get(), tensors.ffn_gate_w, t_post);
+    if (tensors.ffn_gate_b) {
+        ggml_tensor * t_gate_b = ggml_cast(ctx.get(), tensors.ffn_gate_b, GGML_TYPE_F32);
         t_gate = ggml_add(ctx.get(), t_gate, t_gate_b);
     }
-    ggml_tensor * t_up = ggml_mul_mat(ctx.get(), model.tensors.ffn_up_w, t_post);
-    if (model.tensors.ffn_up_b) {
-        ggml_tensor * t_up_b = ggml_cast(ctx.get(), model.tensors.ffn_up_b, GGML_TYPE_F32);
+    ggml_tensor * t_up = ggml_mul_mat(ctx.get(), tensors.ffn_up_w, t_post);
+    if (tensors.ffn_up_b) {
+        ggml_tensor * t_up_b = ggml_cast(ctx.get(), tensors.ffn_up_b, GGML_TYPE_F32);
         t_up = ggml_add(ctx.get(), t_up, t_up_b);
     }
     ggml_tensor * t_act = ggml_mul(ctx.get(), ggml_silu(ctx.get(), t_gate), t_up);
-    ggml_tensor * t_ffn = ggml_mul_mat(ctx.get(), model.tensors.ffn_down_w, t_act);
-    if (model.tensors.ffn_down_b) {
-        ggml_tensor * t_down_b = ggml_cast(ctx.get(), model.tensors.ffn_down_b, GGML_TYPE_F32);
+    ggml_tensor * t_ffn = ggml_mul_mat(ctx.get(), tensors.ffn_down_w, t_act);
+    if (tensors.ffn_down_b) {
+        ggml_tensor * t_down_b = ggml_cast(ctx.get(), tensors.ffn_down_b, GGML_TYPE_F32);
         t_ffn = ggml_add(ctx.get(), t_ffn, t_down_b);
     }
 
@@ -648,9 +1559,9 @@ bool llama_eagle3_step(
     ggml_tensor * t_logits = nullptr;
     if (logits_out) {
         ggml_tensor * t_norm = ggml_rms_norm(ctx.get(), t_hidden_out, hp.rms_norm_eps);
-        ggml_tensor * t_norm_w = ggml_cast(ctx.get(), model.tensors.norm_w, GGML_TYPE_F32);
+        ggml_tensor * t_norm_w = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
         t_norm = ggml_mul(ctx.get(), t_norm, t_norm_w);
-        t_logits = ggml_mul_mat(ctx.get(), model.tensors.lm_head_w, t_norm);
+        t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm);
     }
 
     ggml_tensor * t_embd_cont       = nullptr;
@@ -686,6 +1597,20 @@ bool llama_eagle3_step(
     if (t_q_cont)           { ggml_build_forward_expand(gf, t_q_cont); }
     if (t_k_cont)           { ggml_build_forward_expand(gf, t_k_cont); }
     if (t_v_cont)           { ggml_build_forward_expand(gf, t_v_cont); }
+    const float * hidden_src = hidden_in ? hidden_in : (state.hidden.empty() ? nullptr : state.hidden.data());
+    if (!hidden_src) {
+        return false;
+    }
+    std::memcpy(t_hidden_in->data, hidden_src, hidden_in_dim * sizeof(float));
+    reinterpret_cast<int32_t *>(t_tok->data)[0] = input_id;
+    reinterpret_cast<int32_t *>(t_pos->data)[0] = state.past_len;
+    if (t_k_past_input) {
+        std::memcpy(t_k_past_input->data, state.k.data(), state.k.size() * sizeof(float));
+    }
+    if (t_v_past_input) {
+        std::memcpy(t_v_past_input->data, state.v.data(), state.v.size() * sizeof(float));
+    }
+
     ggml_graph_compute_with_ctx(ctx.get(), gf, std::max(1, rt.n_threads));
 
     state.hidden.resize(hp.hidden_size);
@@ -700,12 +1625,14 @@ bool llama_eagle3_step(
         std::memcpy(state.k.data() + state.past_len * block, k_src, block * sizeof(float));
         std::memcpy(state.v.data() + state.past_len * block, v_src, block * sizeof(float));
     }
-    state.past_len += 1;
 
-    if (logits_out) {
+    if (logits_out && t_logits) {
         logits_out->resize(hp.draft_vocab_size);
         std::memcpy(logits_out->data(), t_logits->data, hp.draft_vocab_size * sizeof(float));
     }
+
+    state.dev.reset();
+    state.past_len += 1;
 
     if (dbg) {
         if (dbg->embd && t_embd_cont) {
