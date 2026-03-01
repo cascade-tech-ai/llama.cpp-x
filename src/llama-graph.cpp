@@ -824,6 +824,31 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+
+    // Generic EAGLE3 hidden capture: grab selected layer outputs from the common "l_out" callback.
+    // This avoids requiring per-model capture blocks in individual model builders.
+    if (!res || !gf || il < 0 || !capture_eagle3_layer(il)) {
+        return;
+    }
+    if (strcmp(name, "l_out") != 0) {
+        return;
+    }
+    if (res->t_eagle3_hidden.find(il) != res->t_eagle3_hidden.end()) {
+        return;
+    }
+
+    ggml_tensor * captured = cur;
+    if (captured->type != GGML_TYPE_F32) {
+        captured = ggml_cast(ctx0, captured, GGML_TYPE_F32);
+    }
+    if (!ggml_is_contiguous(captured)) {
+        captured = ggml_cont(ctx0, captured);
+    }
+    if (cb_func) {
+        cb_func(ubatch, captured, "eagle3_hidden", il);
+    }
+    res->t_eagle3_hidden[il] = captured;
+    ggml_build_forward_expand(gf, captured);
 }
 
 bool llm_graph_context::capture_eagle3_layer(int il) const {

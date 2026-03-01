@@ -2057,7 +2057,16 @@ private:
 
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
 
-                const auto & params_spec = slot.task->params.speculative;
+                auto params_spec = slot.task->params.speculative;
+                params_spec.n_max = n_draft_max;
+
+                if (params_spec.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                    params_spec.eagle_max_depth = std::min(params_spec.eagle_max_depth, n_draft_max);
+                    params_spec.eagle_max_proposals = std::min(params_spec.eagle_max_proposals, n_draft_max);
+                    if (params_spec.eagle_beam_width > 0) {
+                        params_spec.eagle_beam_width = std::min(params_spec.eagle_beam_width, n_draft_max);
+                    }
+                }
 
                 llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled, slot.id);
 
@@ -2807,8 +2816,15 @@ private:
                 slot.drafted.clear();
 
                 const int64_t t_current = ggml_time_us();
+                const int32_t n_decoded_prev = slot.n_decoded;
 
                 slot.n_decoded += ids.size();
+
+                if (n_decoded_prev == 0 && !ids.empty()) {
+                    slot.t_start_generation = t_current;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    metrics.on_prompt_eval(slot);
+                }
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
