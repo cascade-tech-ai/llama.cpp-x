@@ -640,6 +640,20 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
     return bytes;
 }
 
+static json get_oai_completion_tokens_details(const result_timings & timings) {
+    if (timings.draft_n <= 0) {
+        return json::object();
+    }
+
+    const int32_t accepted = std::max(0, timings.draft_n_accepted);
+    const int32_t rejected = std::max(0, timings.draft_n - accepted);
+
+    return json {
+        {"accepted_prediction_tokens", accepted},
+        {"rejected_prediction_tokens", rejected},
+    };
+}
+
 //
 // server_task_result_cmpl_final
 //
@@ -698,6 +712,17 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = "stop";
     }
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"completion_tokens", n_decoded},
+        {"prompt_tokens",     n_prompt_tokens},
+        {"total_tokens",      n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["completion_tokens_details"] = completion_tokens_details;
+    }
+
     json res = json {
         {"choices",            json::array({
             json{
@@ -711,11 +736,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"model",              oaicompat_model},
         {"system_fingerprint", build_info},
         {"object",             "text_completion"},
-        {"usage", json {
-            {"completion_tokens", n_decoded},
-            {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
-        }},
+        {"usage", usage},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -756,6 +777,16 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"completion_tokens", n_decoded},
+        {"prompt_tokens",     n_prompt_tokens},
+        {"total_tokens",      n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["completion_tokens_details"] = completion_tokens_details;
+    }
 
     json res = json {
         {"choices",            json::array({choice})},
@@ -763,11 +794,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"model",              oaicompat_model},
         {"system_fingerprint", build_info},
         {"object",             "chat.completion"},
-        {"usage", json {
-            {"completion_tokens", n_decoded},
-            {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
-        }},
+        {"usage", usage},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -825,6 +852,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (include_usage) {
         // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage
         // https://platform.openai.com/docs/api-reference/chat_streaming/streaming#chat_streaming/streaming-choices
+        const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+        json usage = json {
+            {"completion_tokens", n_decoded},
+            {"prompt_tokens",     n_prompt_tokens},
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+        };
+        if (!completion_tokens_details.empty()) {
+            usage["completion_tokens_details"] = completion_tokens_details;
+        }
+
         deltas.push_back({
             {"choices", json::array()},
             {"created",            t},
@@ -832,11 +870,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
             {"model",              oaicompat_model},
             {"system_fingerprint", build_info},
             {"object",             "chat.completion.chunk"},
-            {"usage", json {
-                {"completion_tokens", n_decoded},
-                {"prompt_tokens",     n_prompt_tokens},
-                {"total_tokens",      n_decoded + n_prompt_tokens},
-            }},
+            {"usage", usage},
         });
     }
 
@@ -903,6 +937,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"input_tokens",  n_prompt_tokens},
+        {"output_tokens", n_decoded},
+        {"total_tokens",  n_decoded + n_prompt_tokens},
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["output_tokens_details"] = completion_tokens_details;
+    }
+
     json res = {
         {"completed_at", t},
         {"created_at",   t},
@@ -911,11 +956,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         {"object",       "response"},
         {"output",       output},
         {"status",       "completed"},
-        {"usage",        json {
-            {"input_tokens",  n_prompt_tokens},
-            {"output_tokens", n_decoded},
-            {"total_tokens",  n_decoded + n_prompt_tokens},
-        }},
+        {"usage",        usage},
     };
 
     return res;
@@ -1009,6 +1050,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"input_tokens",  n_prompt_tokens},
+        {"output_tokens", n_decoded},
+        {"total_tokens",  n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["output_tokens_details"] = completion_tokens_details;
+    }
+
     server_sent_events.push_back(json {
         {"event", "response.completed"},
         {"data", json {
@@ -1020,11 +1072,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"status",     "completed"},
                 {"model",      oaicompat_model},
                 {"output",     output},
-                {"usage",      json {
-                    {"input_tokens",  n_prompt_tokens},
-                    {"output_tokens", n_decoded},
-                    {"total_tokens",  n_decoded + n_prompt_tokens}
-                }}
+                {"usage",      usage}
             }},
         }}
     });
