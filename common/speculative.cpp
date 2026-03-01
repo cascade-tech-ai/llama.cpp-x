@@ -553,6 +553,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     int32_t hidden_size = 0;
     const llama_vocab * vocab_tgt = nullptr;
     const bool verbose;
+    const bool profile;
     const std::string dump_dir;
 
     std::vector<float> hidden_concat_buf;
@@ -600,6 +601,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         , ctx_tgt(ctx_tgt)
         , model(nullptr, llama_eagle3_free)
         , verbose(std::getenv("CASCADE_EAGLE_VERBOSE") != nullptr)
+        , profile(std::getenv("CASCADE_EAGLE_PROFILE") != nullptr)
         , dump_dir(std::getenv("CASCADE_EAGLE_DUMP_DIR") ? std::getenv("CASCADE_EAGLE_DUMP_DIR") : "") {
         if (!ctx_tgt) {
             LOG_ERR("%s: null target context\n", __func__);
@@ -704,9 +706,19 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return;
         }
 
+        const int64_t t_draft_start = ggml_time_us();
+        int64_t t_prefill_us = 0;
+        int64_t t_scoring_us = 0;
+        int64_t t_logits_us = 0;
+        int64_t t_step_us = 0;
+        int32_t n_logits_calls = 0;
+        int32_t n_step_calls = 0;
+
+        const int64_t t_prefill_start = ggml_time_us();
         if (!prefill_to(prompt_tgt, seq_id)) {
             return;
         }
+        t_prefill_us += ggml_time_us() - t_prefill_start;
 
         // The speculative-simple example keeps the last token separate (id_last) and only decodes
         // prompt_tgt up to the token before it. For EAGLE alignment, we must advance the head one
@@ -742,8 +754,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 hidden_concat_buf.end());
         }
 
-        if (!llama_eagle3_step(*model, rt, root_state, hidden_concat_buf.data(), hidden_in_dim, id_last, nullptr, dump_root ? &dbg_root : nullptr)) {
-            return;
+        {
+            const int64_t t_step_start = ggml_time_us();
+            ++n_step_calls;
+            if (!llama_eagle3_step(*model, rt, root_state, hidden_concat_buf.data(), hidden_in_dim, id_last, nullptr, dump_root ? &dbg_root : nullptr)) {
+                return;
+            }
+            t_step_us += ggml_time_us() - t_step_start;
         }
         if (root_state.hidden.empty()) {
             return;
@@ -780,13 +797,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_eagle3_state state;
         };
 
+        struct beam_expansion {
+            float logprob = 0.0f;
+            size_t beam_idx = 0;
+            llama_token token = LLAMA_TOKEN_NULL;
+        };
+
         std::vector<beam_state> beams;
         beams.push_back({0.0f, {}, root_state});
 
         std::vector<std::pair<float, llama_tokens>> all_nodes;
 
         for (int depth = 0; depth < max_depth; ++depth) {
-            std::vector<beam_state> candidates;
+            std::vector<beam_expansion> expansions;
+            expansions.reserve(beams.size() * (size_t) beam_width);
 
             for (size_t beam_idx = 0; beam_idx < beams.size(); ++beam_idx) {
                 auto & beam = beams[beam_idx];
@@ -794,14 +818,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     continue;
                 }
                 std::vector<float> logits;
-                if (!llama_eagle3_logits(*model, rt, beam.state.hidden.data(), logits)) {
-                    continue;
+                {
+                    const int64_t t_logits_start = ggml_time_us();
+                    ++n_logits_calls;
+                    if (!llama_eagle3_logits(*model, rt, beam.state.hidden.data(), logits)) {
+                        continue;
+                    }
+                    t_logits_us += ggml_time_us() - t_logits_start;
                 }
 
                 if (logits.empty()) {
                     continue;
                 }
 
+                const int64_t t_scoring_start = ggml_time_us();
                 float max_logit = logits[0];
                 for (float v : logits) {
                     max_logit = std::max(max_logit, v);
@@ -862,18 +892,50 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         continue;
                     }
 
-                    beam_state child;
-                    child.logprob = beam.logprob + std::log(std::max(prob, 1e-12f));
-                    child.tokens = beam.tokens;
-                    child.tokens.push_back(base_id);
-                    child.state = beam.state;
+                    expansions.push_back({
+                        /* logprob  = */ beam.logprob + std::log(std::max(prob, 1e-12f)),
+                        /* beam_idx = */ beam_idx,
+                        /* token    = */ base_id,
+                    });
+                }
+                t_scoring_us += ggml_time_us() - t_scoring_start;
+            }
 
-                    if (!llama_eagle3_step(*model, rt, child.state, beam.state.hidden.data(), hidden_size, base_id, nullptr)) {
+            if (expansions.empty()) {
+                break;
+            }
+
+            std::sort(expansions.begin(), expansions.end(),
+                [](const beam_expansion & a, const beam_expansion & b) {
+                    return a.logprob > b.logprob;
+                });
+
+            if ((int) expansions.size() > beam_width) {
+                expansions.resize(beam_width);
+            }
+
+            std::vector<beam_state> candidates;
+            candidates.reserve(expansions.size());
+
+            for (const auto & expansion : expansions) {
+                const auto & parent = beams[expansion.beam_idx];
+
+                beam_state child;
+                child.logprob = expansion.logprob;
+                child.tokens = parent.tokens;
+                child.tokens.push_back(expansion.token);
+                child.state = parent.state;
+
+                {
+                    const int64_t t_step_start = ggml_time_us();
+                    ++n_step_calls;
+                    if (!llama_eagle3_step(*model, rt, child.state, child.state.hidden.data(), hidden_size, expansion.token, nullptr)) {
                         continue;
                     }
-
-                    candidates.push_back(std::move(child));
+                    t_step_us += ggml_time_us() - t_step_start;
                 }
+
+                candidates.push_back(std::move(child));
             }
 
             if (candidates.empty()) {
@@ -885,11 +947,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     return a.logprob > b.logprob;
                 });
 
-            if ((int) candidates.size() > beam_width) {
-                candidates.resize(beam_width);
-            }
-
-            beams = candidates;
+            beams = std::move(candidates);
 
             for (const auto & cand : beams) {
                 all_nodes.push_back({cand.logprob, cand.tokens});
@@ -905,6 +963,23 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         if ((int) all_nodes.size() > max_proposals) {
             all_nodes.resize(max_proposals);
+        }
+
+        if (profile) {
+            const int64_t t_total_us = ggml_time_us() - t_draft_start;
+            LOG_INF("eagle3 profile: prompt=%zu depth=%d beam=%d props=%d out=%zu total=%.3fms prefill=%.3fms logits=%.3fms score=%.3fms step=%.3fms calls(logits=%d,step=%d)\n",
+                    prompt_tgt.size(),
+                    max_depth,
+                    beam_width,
+                    max_proposals,
+                    all_nodes.size(),
+                    t_total_us / 1000.0,
+                    t_prefill_us / 1000.0,
+                    t_logits_us / 1000.0,
+                    t_scoring_us / 1000.0,
+                    t_step_us / 1000.0,
+                    n_logits_calls,
+                    n_step_calls);
         }
 
         std::vector<int32_t> roots;

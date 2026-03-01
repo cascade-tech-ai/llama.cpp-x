@@ -269,9 +269,9 @@ struct common_params_speculative {
 
     // eagle3 speculative decoding (beam rollout)
 
-    int32_t eagle_max_depth     = 16;    // max draft depth (tokens)
+    int32_t eagle_max_depth     = 7;     // max draft depth (tokens)
     int32_t eagle_max_proposals = 16;    // beam width / max proposals
-    int32_t eagle_beam_width    = 0;     // beam width for rollout (0 = use eagle_max_proposals)
+    int32_t eagle_beam_width    = 8;     // beam width for rollout
     float   eagle_prob_threshold = 1e-4f; // min draft prob to expand a node
 
     // ngram-based speculative decoding
