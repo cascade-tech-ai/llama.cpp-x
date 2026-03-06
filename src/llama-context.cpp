@@ -1871,6 +1871,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // capture eagle3 hidden states (if enabled)
         if (!eagle3_hidden.empty() && !res->t_eagle3_hidden.empty()) {
+            // The host-side EAGLE capture path reads intermediate outputs directly into
+            // per-sequence caches. Ensure all split backends have completed before copying.
+            ggml_backend_sched_synchronize(sched.get());
+
             const int64_t n_embd = hparams.n_embd;
             const uint32_t n_tokens = ubatch.n_tokens;
 
