@@ -246,6 +246,10 @@ const llama_eagle3_tensors & get_runtime_tensors(const llama_eagle3_model & mode
     return model.tensors;
 }
 
+const llama_eagle3_tensors & get_host_tensors(const llama_eagle3_model & model) {
+    return model.tensors;
+}
+
 bool alloc_state_device(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
@@ -1010,7 +1014,6 @@ bool llama_eagle3_logits(
     }
 
     const auto & hp = model.hparams;
-    const auto & tensors = get_runtime_tensors(model, rt);
 
     if (rt.backend_compute && rt.buft_compute) {
         if (build_logits_graph(model, rt, rt.logits_graph)) {
@@ -1023,6 +1026,8 @@ bool llama_eagle3_logits(
             }
         }
     }
+
+    const auto & tensors = get_host_tensors(model);
 
     const size_t mem_size = 8ull * 1024ull * 1024ull;
     std::vector<uint8_t> buf(mem_size);
@@ -1306,7 +1311,6 @@ bool llama_eagle3_step(
     }
 
     const auto & hp = model.hparams;
-    const auto & tensors = get_runtime_tensors(model, rt);
     const bool hidden_from_state = hidden_in == nullptr;
     if (hidden_from_state && hidden_in_dim != hp.hidden_size) {
         return false;
@@ -1387,6 +1391,8 @@ bool llama_eagle3_step(
             }
         }
     }
+
+    const auto & tensors = get_host_tensors(model);
 
     const size_t mem_size = estimate_step_mem(hp, state.past_len);
     std::vector<uint8_t> buf(mem_size);
