@@ -1,6 +1,7 @@
 // AI-GENERATED: This file was modified with AI assistance for an experimental fork.
 // DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -46,6 +47,7 @@ int main(int argc, char ** argv) {
     ctx_tgt   = llama_init_tgt->context();
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
+    auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
 
     // load the draft model (non-eagle3)
     llama_model_ptr model_dft;
@@ -83,9 +85,50 @@ int main(int argc, char ** argv) {
         }
     }
 
+    const bool has_chat_template = common_chat_templates_was_explicit(chat_templates.get());
+    if (params.conversation_mode == COMMON_CONVERSATION_MODE_AUTO) {
+        params.conversation_mode = has_chat_template
+            ? COMMON_CONVERSATION_MODE_ENABLED
+            : COMMON_CONVERSATION_MODE_DISABLED;
+    }
+
+    if (params.conversation_mode && !has_chat_template) {
+        LOG_WRN("%s: chat template is not available or is not supported. This may cause the model to output suboptimal responses\n", __func__);
+    }
+
+    std::string prompt = params.prompt;
+    if (params.conversation_mode && params.enable_chat_template) {
+        if (!params.prompt.empty() && params.system_prompt.empty()) {
+            LOG_WRN("*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?\n");
+        }
+
+        std::vector<common_chat_msg> chat_msgs;
+        if (!params.system_prompt.empty()) {
+            common_chat_msg system_msg;
+            system_msg.role = "system";
+            system_msg.content = params.system_prompt;
+            chat_msgs.push_back(std::move(system_msg));
+        }
+        if (!params.prompt.empty()) {
+            common_chat_msg user_msg;
+            user_msg.role = "user";
+            user_msg.content = params.prompt;
+            chat_msgs.push_back(std::move(user_msg));
+        }
+
+        if (!chat_msgs.empty()) {
+            common_chat_templates_inputs inputs;
+            inputs.use_jinja = params.use_jinja;
+            inputs.messages = std::move(chat_msgs);
+            inputs.add_generation_prompt = !params.prompt.empty();
+
+            prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+        }
+    }
+
     // Tokenize the prompt
     std::vector<llama_token> inp;
-    inp = common_tokenize(ctx_tgt, params.prompt, true, true);
+    inp = common_tokenize(ctx_tgt, prompt, true, true);
 
     if (llama_n_ctx(ctx_tgt) < (uint32_t) inp.size()) {
         LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", __func__, (int) inp.size(), llama_n_ctx(ctx_tgt));
