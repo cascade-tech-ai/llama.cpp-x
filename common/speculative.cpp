@@ -563,6 +563,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
     common_speculative_tree last_tree;
+    std::vector<float> cached_tail_hidden_concat;
+    size_t cached_tail_capture_idx = 0;
 
     // Dump buffers (CASCADE_EAGLE_DUMP_DIR)
     bool dump_pending = false;
@@ -657,6 +659,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         cached_prompt_len = 0;
         base_state = {};
+        cached_tail_hidden_concat.clear();
+        cached_tail_capture_idx = 0;
 
         if (!enabled) {
             return;
@@ -699,6 +703,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         if (seq_id != active_seq_id) {
             cached_prompt_len = 0;
             base_state = {};
+            cached_tail_hidden_concat.clear();
+            cached_tail_capture_idx = 0;
             active_seq_id = seq_id;
         }
 
@@ -733,7 +739,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         // more step using the teacher hidden at the last prompt token and input_id = id_last.
         std::vector<const ggml_tensor *> layer_tensors;
         size_t n_tokens = 0;
-        if (!fetch_hidden_tensors(layer_tensors, n_tokens) || n_tokens < prompt_tgt.size()) {
+        if (!fetch_hidden_tensors(layer_tensors, n_tokens)) {
             return;
         }
 
@@ -741,7 +747,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         const bool dump_root = dump_pending && !dump_dir.empty();
         llama_eagle3_step_debug dbg_root;
         if (dump_root) {
-            if (!build_hidden_concat_host(layer_tensors, prompt_tgt.size() - 1, hidden_concat_buf)) {
+            if (cached_tail_capture_idx >= n_tokens ||
+                !build_hidden_concat_host(layer_tensors, cached_tail_capture_idx, hidden_concat_buf)) {
                 return;
             }
             dbg_root.embd        = &dump_head_embd_by_step;
@@ -769,7 +776,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         rt,
                         root_state,
                         layer_tensors,
-                        prompt_tgt.size() - 1,
+                        cached_tail_capture_idx,
                         id_last,
                         nullptr,
                         dump_root ? &dbg_root : nullptr)) {
@@ -1360,21 +1367,18 @@ private:
         if (prompt_tgt.size() < cached_prompt_len) {
             cached_prompt_len = 0;
             base_state = {};
+            cached_tail_hidden_concat.clear();
+            cached_tail_capture_idx = 0;
         }
 
         if (prompt_tgt.size() == cached_prompt_len && cached_prompt_len > 0) {
-            std::vector<const ggml_tensor *> layer_tensors;
-            size_t n_tokens = 0;
-            if (!fetch_hidden_tensors(layer_tensors, n_tokens) || n_tokens < prompt_tgt.size()) {
-                cached_prompt_len = 0;
-                base_state = {};
-                return false;
-            }
             return true;
         }
 
         if (prompt_tgt.size() < 2) {
             cached_prompt_len = prompt_tgt.size();
+            cached_tail_hidden_concat.clear();
+            cached_tail_capture_idx = 0;
             return true;
         }
 
@@ -1383,8 +1387,22 @@ private:
         if (!fetch_hidden_tensors(layer_tensors, n_tokens)) {
             return false;
         }
-        if (n_tokens < prompt_tgt.size()) {
+        if (cached_prompt_len == 0 && n_tokens < prompt_tgt.size()) {
             return false;
+        }
+        if (cached_prompt_len > 0) {
+            const size_t delta = prompt_tgt.size() - cached_prompt_len;
+            if (delta == 0) {
+                cached_tail_capture_idx = 0;
+                return true;
+            }
+            if (cached_tail_hidden_concat.size() != (size_t) hidden_in_dim || n_tokens < delta) {
+                cached_prompt_len = 0;
+                base_state = {};
+                cached_tail_hidden_concat.clear();
+                cached_tail_capture_idx = 0;
+                return false;
+            }
         }
 
         if (cached_prompt_len == 0) {
@@ -1455,11 +1473,53 @@ private:
             dump_head_hidden_after_step.reserve(n_steps_total * (size_t) hidden_size);
         }
 
-        const size_t start = cached_prompt_len > 0 ? cached_prompt_len - 1 : 0;
+        if (cached_prompt_len > 0) {
+            const size_t first_new = cached_prompt_len;
+            llama_eagle3_step_debug dbg;
+            if (dump_steps) {
+                dbg.embd        = &dump_head_embd_by_step;
+                dbg.embd_norm   = &dump_head_embd_norm_by_step;
+                dbg.hidden_proj = &dump_head_hidden_proj_by_step;
+                dbg.hidden_norm = &dump_head_hidden_norm_by_step;
+                dbg.cat         = &dump_head_cat_by_step;
+                dbg.q           = &dump_head_q_by_step;
+                dbg.k           = &dump_head_k_by_step;
+                dbg.v           = &dump_head_v_by_step;
+
+                dump_head_input_ids.push_back((int32_t) prompt_tgt[first_new]);
+                dump_teacher_hidden_by_step.insert(
+                    dump_teacher_hidden_by_step.end(),
+                    cached_tail_hidden_concat.begin(),
+                    cached_tail_hidden_concat.end());
+            }
+
+            if (!llama_eagle3_step(
+                        *model,
+                        rt,
+                        base_state,
+                        cached_tail_hidden_concat.data(),
+                        hidden_in_dim,
+                        prompt_tgt[first_new],
+                        nullptr,
+                        dump_steps ? &dbg : nullptr)) {
+                return false;
+            }
+
+            if (dump_steps) {
+                dump_head_hidden_after_step.insert(
+                    dump_head_hidden_after_step.end(),
+                    base_state.hidden.begin(),
+                    base_state.hidden.end());
+            }
+        }
+
+        const size_t start = cached_prompt_len > 0 ? cached_prompt_len : 0;
+        const size_t local_offset = cached_prompt_len > 0 ? cached_prompt_len : 0;
         for (size_t i = start; i + 1 < prompt_tgt.size(); ++i) {
             llama_eagle3_step_debug dbg;
             if (dump_steps) {
-                if (!build_hidden_concat_host(layer_tensors, i, hidden_concat_buf)) {
+                const size_t local_idx = i - local_offset;
+                if (!build_hidden_concat_host(layer_tensors, local_idx, hidden_concat_buf)) {
                     return false;
                 }
                 dbg.embd        = &dump_head_embd_by_step;
@@ -1483,7 +1543,7 @@ private:
                         rt,
                         base_state,
                         layer_tensors,
-                        i,
+                        i - local_offset,
                         prompt_tgt[i + 1],
                         nullptr,
                         dump_steps ? &dbg : nullptr)) {
@@ -1498,6 +1558,13 @@ private:
             }
         }
 
+        const size_t tail_idx = cached_prompt_len > 0
+            ? (prompt_tgt.size() - cached_prompt_len - 1)
+            : (prompt_tgt.size() - 1);
+        if (!build_hidden_concat_host(layer_tensors, tail_idx, cached_tail_hidden_concat)) {
+            return false;
+        }
+        cached_tail_capture_idx = tail_idx;
         cached_prompt_len = prompt_tgt.size();
         return true;
     }
