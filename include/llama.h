@@ -1033,6 +1033,13 @@ extern "C" {
             int32_t layer_id,
             size_t * n_tokens);
 
+    // Return the backend-resident captured hidden-state tensor for the current decode call.
+    // Shape is [n_embd, n_tokens]. The returned tensor is owned by the context.
+    LLAMA_API const struct ggml_tensor * llama_eagle3_get_hidden_capture(
+            struct llama_context * ctx,
+            int32_t layer_id,
+            size_t * n_tokens);
+
     //
     // Speculative tree attention mask [EXPERIMENTAL]
     //

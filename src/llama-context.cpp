@@ -14,6 +14,10 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -23,6 +27,91 @@
 //
 // llama_context
 //
+
+static bool tensor_copy_2d_async(
+        ggml_backend_t backend,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t dst_i1) {
+    if (!backend || !src || !dst || dst_i1 < 0) {
+        return false;
+    }
+    if (src->type != dst->type ||
+        src->ne[0] != dst->ne[0] ||
+        dst->ne[1] < dst_i1 + src->ne[1]) {
+        return false;
+    }
+    if (src->ne[1] == 0) {
+        return true;
+    }
+
+#if defined(GGML_USE_CUDA)
+    if (ggml_backend_is_cuda(backend)) {
+        return ggml_backend_cuda_tensor_copy_2d_async(backend, src, dst, dst_i1);
+    }
+#endif
+
+    const size_t row_bytes = (size_t) src->nb[1];
+    const size_t n_rows = (size_t) src->ne[1];
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src && buf_dst && ggml_backend_buffer_is_host(buf_src) && ggml_backend_buffer_is_host(buf_dst)) {
+        std::memcpy(
+                (char *) dst->data + (size_t) dst_i1 * (size_t) dst->nb[1],
+                src->data,
+                row_bytes * n_rows);
+        return true;
+    }
+
+    ggml_backend_synchronize(backend);
+
+    std::vector<uint8_t> tmp(row_bytes * n_rows);
+    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(dst, tmp.data(), (size_t) dst_i1 * (size_t) dst->nb[1], tmp.size());
+    return true;
+}
+
+static bool tensor_copy_bytes_async(
+        ggml_backend_t backend,
+        ggml_tensor * src,
+        size_t src_offset,
+        ggml_tensor * dst,
+        size_t dst_offset,
+        size_t size) {
+    if (!backend || !src || !dst) {
+        return false;
+    }
+    if (src_offset + size > ggml_nbytes(src) || dst_offset + size > ggml_nbytes(dst)) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+
+#if defined(GGML_USE_CUDA)
+    if (ggml_backend_is_cuda(backend)) {
+        return ggml_backend_cuda_tensor_copy_bytes_async(backend, src, src_offset, dst, dst_offset, size);
+    }
+#endif
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src && buf_dst && ggml_backend_buffer_is_host(buf_src) && ggml_backend_buffer_is_host(buf_dst)) {
+        std::memcpy(
+                (char *) dst->data + dst_offset,
+                (const char *) src->data + src_offset,
+                size);
+        return true;
+    }
+
+    ggml_backend_synchronize(backend);
+
+    std::vector<uint8_t> tmp(size);
+    ggml_backend_tensor_get(src, tmp.data(), src_offset, size);
+    ggml_backend_tensor_set(dst, tmp.data(), dst_offset, size);
+    return true;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -589,6 +678,13 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+ggml_backend_t llama_context::primary_backend() const {
+    if (!backend_ptrs.empty()) {
+        return backend_ptrs.front();
+    }
+    return backend_cpu;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -695,77 +791,155 @@ llama_rope_params llama_context::get_rope_params(int il) const {
 
 bool llama_context::eagle3_set_layers(const std::vector<int32_t> & layers) {
     eagle3_layer_ids = layers;
-    eagle3_hidden.clear();
-    eagle3_hidden.reserve(layers.size());
+    eagle3_capture_clear();
+    eagle3_capture.clear();
+    eagle3_capture.reserve(layers.size());
     for (int32_t layer_id : layers) {
-        eagle3_hidden.push_back({layer_id, {}});
+        eagle3_capture.push_back({});
+        eagle3_capture.back().layer_id = layer_id;
     }
-    eagle3_last_pos.clear();
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
     return !eagle3_layer_ids.empty();
 }
 
 void llama_context::eagle3_clear() {
-    eagle3_hidden.clear();
     eagle3_layer_ids.clear();
-    eagle3_last_pos.clear();
+    eagle3_capture_clear();
+    eagle3_capture.clear();
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
 }
 
 void llama_context::eagle3_clear_seq(llama_seq_id seq_id) {
-    for (auto & layer : eagle3_hidden) {
-        layer.seq_hidden.erase(seq_id);
-    }
-    eagle3_last_pos.erase(seq_id);
+    GGML_UNUSED(seq_id);
 }
 
 void llama_context::eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos) {
-    const int32_t n_embd = model.hparams.n_embd;
-    if (n_embd <= 0) {
-        return;
-    }
-
-    const size_t keep = pos > 0 ? (size_t) pos * n_embd : 0;
-
-    for (auto & layer : eagle3_hidden) {
-        auto it = layer.seq_hidden.find(seq_id);
-        if (it == layer.seq_hidden.end()) {
-            continue;
-        }
-
-        auto & vec = it->second;
-        if (vec.size() > keep) {
-            vec.resize(keep);
-        }
-        if (keep == 0) {
-            layer.seq_hidden.erase(seq_id);
-        }
-    }
-
-    if (pos <= 0) {
-        eagle3_last_pos.erase(seq_id);
-    } else {
-        eagle3_last_pos[seq_id] = pos - 1;
-    }
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(pos);
 }
 
 const std::vector<float> * llama_context::eagle3_get_hidden_seq(
         llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const {
     n_tokens = 0;
-    for (const auto & layer : eagle3_hidden) {
-        if (layer.layer_id != layer_id) {
+    if (seq_id != 0) {
+        return nullptr;
+    }
+    for (const auto & layer : eagle3_capture) {
+        if (layer.layer_id != layer_id || layer.tensor == nullptr) {
             continue;
         }
-        auto it = layer.seq_hidden.find(seq_id);
-        if (it == layer.seq_hidden.end()) {
+        if (layer.tensor->ne[0] <= 0 || eagle3_capture_n_tokens == 0) {
             return nullptr;
         }
-        const auto & vec = it->second;
-        if (model.hparams.n_embd <= 0) {
-            return nullptr;
-        }
-        n_tokens = vec.size() / model.hparams.n_embd;
-        return &vec;
+        const size_t n_elems = (size_t) layer.tensor->ne[0] * (size_t) eagle3_capture_n_tokens;
+        layer.host_cache.resize(n_elems);
+        ggml_backend_tensor_get(layer.tensor, layer.host_cache.data(), 0, n_elems * sizeof(float));
+        n_tokens = eagle3_capture_n_tokens;
+        return &layer.host_cache;
     }
     return nullptr;
+}
+
+const ggml_tensor * llama_context::eagle3_get_hidden_capture(int32_t layer_id, size_t & n_tokens) const {
+    n_tokens = 0;
+    for (const auto & layer : eagle3_capture) {
+        if (layer.layer_id != layer_id || layer.tensor == nullptr) {
+            continue;
+        }
+        n_tokens = eagle3_capture_n_tokens;
+        return layer.tensor;
+    }
+    return nullptr;
+}
+
+void llama_context::eagle3_capture_clear() {
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
+    for (auto & layer : eagle3_capture) {
+        layer.backend = nullptr;
+        layer.ctx.reset();
+        layer.buf.reset();
+        layer.tensor = nullptr;
+        layer.capacity = 0;
+        layer.host_cache.clear();
+    }
+}
+
+bool llama_context::eagle3_capture_begin(uint32_t n_tokens) {
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = n_tokens;
+    return true;
+}
+
+bool llama_context::eagle3_capture_append(const llama_ubatch & ubatch, const llm_graph_result & res) {
+    if (eagle3_capture.empty() || res.t_eagle3_hidden.empty() || ubatch.n_tokens == 0) {
+        return true;
+    }
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    const uint32_t required = eagle3_capture_n_tokens + n_tokens;
+    const uint32_t capacity = std::max(eagle3_capture_capacity, required);
+
+    for (auto & layer : eagle3_capture) {
+        auto it = res.t_eagle3_hidden.find(layer.layer_id);
+        if (it == res.t_eagle3_hidden.end() || it->second == nullptr) {
+            continue;
+        }
+
+        ggml_tensor * src = it->second;
+        if (src->ne[1] != (int64_t) n_tokens) {
+            LLAMA_LOG_WARN("%s: eagle3 hidden shape mismatch for layer %d\n", __func__, layer.layer_id);
+            continue;
+        }
+        const int64_t n_embd = src->ne[0];
+
+        ggml_backend_t backend_src = ggml_backend_sched_get_tensor_backend(sched.get(), src);
+        if (!backend_src) {
+            return false;
+        }
+
+        if (!layer.tensor || layer.backend != backend_src || layer.capacity < (int32_t) capacity) {
+            ggml_init_params params = {
+                /* .mem_size   = */ (size_t) ggml_tensor_overhead() * 8 + 1024,
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+
+            ggml_context_ptr ctx_capture(ggml_init(params));
+            if (!ctx_capture) {
+                return false;
+            }
+
+            ggml_tensor * t_capture = ggml_new_tensor_2d(ctx_capture.get(), GGML_TYPE_F32, n_embd, capacity);
+            if (!t_capture) {
+                return false;
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_src);
+            ggml_backend_buffer_ptr buf_capture(ggml_backend_alloc_ctx_tensors_from_buft(ctx_capture.get(), buft));
+            if (!buf_capture) {
+                return false;
+            }
+
+            layer.backend = backend_src;
+            layer.ctx = std::move(ctx_capture);
+            layer.buf = std::move(buf_capture);
+            layer.tensor = t_capture;
+            layer.capacity = (int32_t) capacity;
+        }
+
+        const size_t n_bytes = (size_t) n_embd * (size_t) n_tokens * sizeof(float);
+        const size_t dst_offset = (size_t) eagle3_capture_n_tokens * (size_t) layer.tensor->nb[1];
+        if (!tensor_copy_bytes_async(backend_src, src, 0, layer.tensor, dst_offset, n_bytes)) {
+            return false;
+        }
+    }
+
+    eagle3_capture_n_tokens = required;
+    eagle3_capture_capacity = std::max(eagle3_capture_capacity, required);
+    return true;
 }
 
 void llama_context::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
@@ -1733,6 +1907,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+    if (!eagle3_capture_begin(n_tokens_all)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize EAGLE3 hidden capture\n", __func__);
+        return -2;
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1784,6 +1963,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (!eagle3_capture_append(ubatch, *res)) {
+            LLAMA_LOG_ERROR("%s: failed to append EAGLE3 hidden capture\n", __func__);
+            return -2;
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -1866,72 +2050,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         GGML_ABORT("unknown pooling type");
                     }
-            }
-        }
-
-        // capture eagle3 hidden states (if enabled)
-        if (!eagle3_hidden.empty() && !res->t_eagle3_hidden.empty()) {
-            // The host-side EAGLE capture path reads intermediate outputs directly into
-            // per-sequence caches. Ensure all split backends have completed before copying.
-            ggml_backend_sched_synchronize(sched.get());
-
-            const int64_t n_embd = hparams.n_embd;
-            const uint32_t n_tokens = ubatch.n_tokens;
-
-            std::vector<eagle3_hidden_layer_cache *> layer_caches;
-            std::vector<std::vector<float>> layer_bufs;
-            layer_caches.reserve(eagle3_hidden.size());
-            layer_bufs.reserve(eagle3_hidden.size());
-
-            for (auto & layer_cache : eagle3_hidden) {
-                auto it = res->t_eagle3_hidden.find(layer_cache.layer_id);
-                if (it == res->t_eagle3_hidden.end() || it->second == nullptr) {
-                    continue;
-                }
-
-                ggml_tensor * t_hidden = it->second;
-                if (t_hidden->ne[0] != n_embd || t_hidden->ne[1] != (int64_t) n_tokens) {
-                    LLAMA_LOG_WARN("%s: eagle3 hidden shape mismatch for layer %d\n", __func__, layer_cache.layer_id);
-                    continue;
-                }
-
-                std::vector<float> buf((size_t) n_embd * n_tokens);
-                ggml_backend_t backend_hidden = ggml_backend_sched_get_tensor_backend(sched.get(), t_hidden);
-                GGML_ASSERT(backend_hidden != nullptr);
-                ggml_backend_tensor_get(t_hidden, buf.data(), 0, buf.size() * sizeof(float));
-
-                layer_caches.push_back(&layer_cache);
-                layer_bufs.push_back(std::move(buf));
-            }
-
-            if (!layer_caches.empty()) {
-                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    const llama_pos pos = ubatch.pos[i * ubatch.n_pos];
-
-                    for (int s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                        const llama_seq_id seq_id = ubatch.seq_id[i][s];
-
-                        llama_pos last_pos = std::numeric_limits<llama_pos>::min();
-                        auto it_last = eagle3_last_pos.find(seq_id);
-                        if (it_last != eagle3_last_pos.end()) {
-                            last_pos = it_last->second;
-                        }
-                        if (pos <= last_pos) {
-                            continue;
-                        }
-
-                        for (size_t l = 0; l < layer_caches.size(); ++l) {
-                            auto * cache = layer_caches[l];
-                            auto & vec = cache->seq_hidden[seq_id];
-                            const float * src = layer_bufs[l].data() + (size_t) i * n_embd;
-                            const size_t offset = vec.size();
-                            vec.resize(offset + n_embd);
-                            std::memcpy(vec.data() + offset, src, n_embd * sizeof(float));
-                        }
-
-                        eagle3_last_pos[seq_id] = pos;
-                    }
-                }
             }
         }
 
@@ -3421,6 +3539,17 @@ const float * llama_eagle3_get_hidden_seq(
 
     *n_tokens = n;
     return vec->data();
+}
+
+const ggml_tensor * llama_eagle3_get_hidden_capture(
+        llama_context * ctx,
+        int32_t layer_id,
+        size_t * n_tokens) {
+    if (!ctx || !n_tokens) {
+        return nullptr;
+    }
+
+    return ctx->eagle3_get_hidden_capture(layer_id, *n_tokens);
 }
 
 void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {
