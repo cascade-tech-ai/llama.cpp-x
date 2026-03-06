@@ -247,6 +247,8 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    ggml_backend_t primary_backend() const;
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -260,6 +262,7 @@ public:
     void eagle3_clear_seq(llama_seq_id seq_id);
     void eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos);
     const std::vector<float> * eagle3_get_hidden_seq(llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const;
+    const ggml_tensor * eagle3_get_hidden_capture(int32_t layer_id, size_t & n_tokens) const;
     const std::vector<int32_t> & eagle3_layers() const { return eagle3_layer_ids; }
 
     void set_kq_mask_tree(const llama_kq_mask_tree * tree);
@@ -273,6 +276,10 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    bool eagle3_capture_begin(uint32_t n_tokens);
+    bool eagle3_capture_append(const llama_ubatch & ubatch, const llm_graph_result & res);
+    void eagle3_capture_clear();
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -365,14 +372,20 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 
-    struct eagle3_hidden_layer_cache {
+    struct eagle3_hidden_capture_layer {
         int32_t layer_id = -1;
-        std::unordered_map<llama_seq_id, std::vector<float>> seq_hidden;
+        ggml_backend_t backend = nullptr;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * tensor = nullptr;
+        int32_t capacity = 0;
+        mutable std::vector<float> host_cache;
     };
 
     std::vector<int32_t> eagle3_layer_ids;
-    std::vector<eagle3_hidden_layer_cache> eagle3_hidden;
-    std::unordered_map<llama_seq_id, llama_pos> eagle3_last_pos;
+    std::vector<eagle3_hidden_capture_layer> eagle3_capture;
+    uint32_t eagle3_capture_n_tokens = 0;
+    uint32_t eagle3_capture_capacity = 0;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

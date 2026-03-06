@@ -123,6 +123,29 @@ struct llama_eagle3_step_graph {
     ggml_tensor * t_logits     = nullptr;
 };
 
+struct llama_eagle3_step_batch_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+    int32_t                 n_beams = 0;
+
+    // Batched inputs (backing storage for per-beam views below).
+    ggml_tensor * t_hidden_in_b = nullptr; // [hidden_in_dim, n_beams]
+    ggml_tensor * t_tok_b       = nullptr; // [n_beams]
+    ggml_tensor * t_pos_b       = nullptr; // [n_beams]
+
+    std::vector<ggml_tensor *> t_hidden_in;
+    std::vector<ggml_tensor *> t_tok;
+    std::vector<ggml_tensor *> t_pos;
+    std::vector<ggml_tensor *> t_k_past_input;
+    std::vector<ggml_tensor *> t_v_past_input;
+
+    std::vector<ggml_tensor *> t_hidden_out;
+    std::vector<ggml_tensor *> t_k_total;
+    std::vector<ggml_tensor *> t_v_total;
+    std::vector<ggml_tensor *> t_logits;
+};
+
 struct llama_eagle3_topk_graph {
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf_compute;
@@ -145,6 +168,27 @@ struct llama_eagle3_topk_batch_graph {
     ggml_tensor * t_hidden    = nullptr; // [hidden_size, n_beams]
     ggml_tensor * t_probs     = nullptr; // [draft_vocab_size, n_beams]
     ggml_tensor * t_topk_idx  = nullptr; // [k, n_beams]
+    ggml_tensor * t_topk_prob = nullptr; // [k, n_beams]
+
+    // Views into t_hidden for convenient per-beam filling without host staging.
+    std::vector<ggml_tensor *> t_hidden_cols; // [n_beams], each [hidden_size, 1]
+};
+
+struct llama_eagle3_select_batch_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+    int32_t                 k = 0;
+    int32_t                 n_beams = 0;
+    int32_t                 n_select = 0;
+
+    ggml_tensor * t_hidden            = nullptr; // [hidden_size, n_beams]
+    ggml_tensor * t_beam_logprob      = nullptr; // [n_beams]
+    ggml_tensor * t_selected_linear   = nullptr; // [n_select, 1]
+    ggml_tensor * t_selected_draft    = nullptr; // [n_select, 1]
+    ggml_tensor * t_selected_logprob  = nullptr; // [n_select, 1]
+
+    std::vector<ggml_tensor *> t_hidden_cols; // [n_beams], each [hidden_size, 1]
 };
 
 struct llama_eagle3_runtime {
@@ -169,6 +213,7 @@ struct llama_eagle3_runtime {
     // Preferred backend for EAGLE head execution. Falls back to CPU path if unavailable.
     ggml_backend_ptr backend_compute;
     ggml_backend_buffer_type_t buft_compute = nullptr;
+    ggml_backend_t target_backend = nullptr; // non-owning; source backend for target hidden capture tensors
 
     // Backend-local copies of EAGLE head weights (same layout as llama_eagle3_model::tensors).
     ggml_context_ptr        ctx_weights_compute;
@@ -179,8 +224,11 @@ struct llama_eagle3_runtime {
     mutable llama_eagle3_logits_graph logits_graph;
     mutable llama_eagle3_topk_graph topk_graph;
     mutable llama_eagle3_topk_batch_graph topk_batch_graph;
+    mutable llama_eagle3_select_batch_graph select_batch_graph;
     mutable uint64_t step_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_graph step_graph;
+    mutable uint64_t step_batch_graph_key = ~uint64_t(0);
+    mutable llama_eagle3_step_batch_graph step_batch_graph;
 };
 
 llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & err);
@@ -197,6 +245,16 @@ bool llama_eagle3_step(
         llama_eagle3_state & state,
         const float * hidden_in,
         int32_t hidden_in_dim,
+        llama_token input_id,
+        std::vector<float> * logits_out,
+        llama_eagle3_step_debug * dbg = nullptr);
+
+bool llama_eagle3_step_from_hidden_capture(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        llama_eagle3_state & state,
+        const std::vector<const ggml_tensor *> & hidden_capture,
+        size_t token_idx,
         llama_token input_id,
         std::vector<float> * logits_out,
         llama_eagle3_step_debug * dbg = nullptr);
@@ -231,9 +289,35 @@ bool llama_eagle3_topk_state_batch(
         std::vector<int32_t> & topk_idx_out,
         std::vector<float> & topk_prob_out);
 
+bool llama_eagle3_select_state_batch(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        std::vector<int32_t> & selected_linear_out,
+        std::vector<int32_t> & selected_draft_idx_out,
+        std::vector<float> & selected_logprob_out);
+
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state);
 bool llama_eagle3_state_get_hidden(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         llama_eagle3_state & state,
         std::vector<float> & hidden_out);
+
+bool llama_eagle3_step_batch(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<llama_eagle3_state *> & states,
+        int32_t hidden_in_dim,
+        const std::vector<llama_token> & input_ids);
+
+bool llama_eagle3_step_batch_from_parents(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & parent_states,
+        int32_t hidden_in_dim,
+        const std::vector<llama_token> & input_ids,
+        const std::vector<llama_eagle3_state *> & out_states,
+        int32_t reserve_kv);

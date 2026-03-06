@@ -4,6 +4,9 @@
 
 #include "common.h"
 #include "ggml.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 #include "llama-eagle3.h"
 #include "llama.h"
 #include "log.h"
@@ -554,6 +557,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     const llama_vocab * vocab_tgt = nullptr;
     const bool verbose;
     const bool profile;
+    const bool profile_gpu;
     const std::string dump_dir;
 
     std::vector<float> hidden_concat_buf;
@@ -602,12 +606,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         , model(nullptr, llama_eagle3_free)
         , verbose(std::getenv("CASCADE_EAGLE_VERBOSE") != nullptr)
         , profile(std::getenv("CASCADE_EAGLE_PROFILE") != nullptr)
+        , profile_gpu(std::getenv("CASCADE_EAGLE_PROFILE_GPU") != nullptr)
         , dump_dir(std::getenv("CASCADE_EAGLE_DUMP_DIR") ? std::getenv("CASCADE_EAGLE_DUMP_DIR") : "") {
         if (!ctx_tgt) {
             LOG_ERR("%s: null target context\n", __func__);
             return;
         }
-
         if (params.mparams_dft.path.empty()) {
             LOG_ERR("%s: eagle3 requires --model-draft pointing to an eagle3 GGUF\n", __func__);
             return;
@@ -713,6 +717,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         int64_t t_step_us = 0;
         int32_t n_logits_calls = 0;
         int32_t n_step_calls = 0;
+#if defined(GGML_USE_CUDA)
+        double t_logits_gpu_ms = 0.0;
+        double t_step_gpu_ms   = 0.0;
+#endif
 
         const int64_t t_prefill_start = ggml_time_us();
         if (!prefill_to(prompt_tgt, seq_id)) {
@@ -723,20 +731,19 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         // The speculative-simple example keeps the last token separate (id_last) and only decodes
         // prompt_tgt up to the token before it. For EAGLE alignment, we must advance the head one
         // more step using the teacher hidden at the last prompt token and input_id = id_last.
-        std::vector<const float *> layer_ptrs;
+        std::vector<const ggml_tensor *> layer_tensors;
         size_t n_tokens = 0;
-        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens) || n_tokens < prompt_tgt.size()) {
+        if (!fetch_hidden_tensors(layer_tensors, n_tokens) || n_tokens < prompt_tgt.size()) {
             return;
         }
 
         llama_eagle3_state root_state = base_state;
-        if (!build_hidden_concat(layer_ptrs, prompt_tgt.size() - 1, hidden_concat_buf)) {
-            return;
-        }
-
         const bool dump_root = dump_pending && !dump_dir.empty();
         llama_eagle3_step_debug dbg_root;
         if (dump_root) {
+            if (!build_hidden_concat_host(layer_tensors, prompt_tgt.size() - 1, hidden_concat_buf)) {
+                return;
+            }
             dbg_root.embd        = &dump_head_embd_by_step;
             dbg_root.embd_norm   = &dump_head_embd_norm_by_step;
             dbg_root.hidden_proj = &dump_head_hidden_proj_by_step;
@@ -757,7 +764,15 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         {
             const int64_t t_step_start = ggml_time_us();
             ++n_step_calls;
-            if (!llama_eagle3_step(*model, rt, root_state, hidden_concat_buf.data(), hidden_in_dim, id_last, nullptr, dump_root ? &dbg_root : nullptr)) {
+            if (!llama_eagle3_step_from_hidden_capture(
+                        *model,
+                        rt,
+                        root_state,
+                        layer_tensors,
+                        prompt_tgt.size() - 1,
+                        id_last,
+                        nullptr,
+                        dump_root ? &dbg_root : nullptr)) {
                 return;
             }
             t_step_us += ggml_time_us() - t_step_start;
@@ -807,14 +822,19 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_token token = LLAMA_TOKEN_NULL;
         };
 
-        std::vector<beam_state> beams;
-        beams.push_back({0.0f, {}, root_state});
+        std::vector<beam_state> beams_a((size_t) std::max(1, beam_width));
+        std::vector<beam_state> beams_b((size_t) std::max(1, beam_width));
+        int32_t n_beams = 1;
+        beams_a[0] = {0.0f, {}, root_state};
 
         std::vector<std::pair<float, llama_tokens>> all_nodes;
 
         for (int depth = 0; depth < max_depth; ++depth) {
+            auto & beams_cur = (depth & 1) ? beams_b : beams_a;
+            auto & beams_nxt = (depth & 1) ? beams_a : beams_b;
+
             std::vector<beam_expansion> expansions;
-            expansions.reserve(beams.size() * (size_t) beam_width);
+            expansions.reserve((size_t) n_beams * (size_t) beam_width);
 
             const int k = std::min<int>(beam_width, model->hparams.draft_vocab_size);
             if (k <= 0) {
@@ -823,72 +843,107 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             std::vector<size_t> active_beam_idx;
             std::vector<const llama_eagle3_state *> active_states;
-            active_beam_idx.reserve(beams.size());
-            active_states.reserve(beams.size());
-            for (size_t beam_idx = 0; beam_idx < beams.size(); ++beam_idx) {
-                if (!llama_eagle3_state_has_hidden(beams[beam_idx].state)) {
+            active_beam_idx.reserve((size_t) n_beams);
+            active_states.reserve((size_t) n_beams);
+            for (int32_t beam_idx = 0; beam_idx < n_beams; ++beam_idx) {
+                if (!llama_eagle3_state_has_hidden(beams_cur[(size_t) beam_idx].state)) {
                     continue;
                 }
-                active_beam_idx.push_back(beam_idx);
-                active_states.push_back(&beams[beam_idx].state);
+                active_beam_idx.push_back((size_t) beam_idx);
+                active_states.push_back(&beams_cur[(size_t) beam_idx].state);
             }
             if (active_states.empty()) {
                 break;
             }
 
-            std::vector<int32_t> topk_idx;
-            std::vector<float> topk_prob;
+            std::vector<float> active_logprob;
+            active_logprob.reserve(active_beam_idx.size());
+            for (size_t beam_idx : active_beam_idx) {
+                active_logprob.push_back(beams_cur[beam_idx].logprob);
+            }
+
+            std::vector<int32_t> selected_linear;
+            std::vector<int32_t> selected_draft_idx;
+            std::vector<float> selected_logprob;
             {
                 const int64_t t_logits_start = ggml_time_us();
                 ++n_logits_calls;
-                if (!llama_eagle3_topk_state_batch(*model, rt, active_states, k, topk_idx, topk_prob)) {
+#if defined(GGML_USE_CUDA)
+                ggml_backend_cuda_profiler_zone zone = {};
+                if (profile_gpu) {
+                    ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
+                }
+#endif
+                const bool ok = llama_eagle3_select_state_batch(
+                        *model,
+                        rt,
+                        active_states,
+                        active_logprob,
+                        k,
+                        selected_linear,
+                        selected_draft_idx,
+                        selected_logprob);
+#if defined(GGML_USE_CUDA)
+                if (profile_gpu) {
+                    t_logits_gpu_ms += ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
+                }
+#endif
+                if (!ok) {
                     break;
                 }
                 t_logits_us += ggml_time_us() - t_logits_start;
             }
 
             const int64_t t_scoring_start = ggml_time_us();
-            for (size_t ai = 0; ai < active_beam_idx.size(); ++ai) {
-                const size_t beam_idx = active_beam_idx[ai];
-                auto & beam = beams[beam_idx];
-                const size_t off = ai * (size_t) k;
-                for (int j = 0; j < k; ++j) {
-                    const int draft_idx = topk_idx[off + (size_t) j];
-                    const float prob = topk_prob[off + (size_t) j];
-                    if (draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
-                        continue;
-                    }
+            for (size_t rank = 0; rank < selected_linear.size(); ++rank) {
+                const int32_t linear = selected_linear[rank];
+                const int32_t draft_idx = selected_draft_idx[rank];
+                if (linear < 0 || draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
+                    continue;
+                }
 
-                    const int32_t base_id = draft_idx + model->d2t[draft_idx];
-                    const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
-                    if (verbose) {
-                        const bool base_ok = base_id >= 0 && base_id < model->hparams.vocab_size;
-                        const std::string piece = base_ok && vocab_tgt
-                            ? common_token_to_piece(vocab_tgt, base_id)
-                            : std::string("<invalid>");
-                        const std::string escaped = escape_token_piece(piece);
-                        LOG_INF("eagle3 depth=%d beam=%zu rank=%d token=%d piece=\"%s\" p=%.6f%s\n",
-                                depth,
-                                beam_idx,
-                                j,
-                                base_id,
-                                escaped.c_str(),
-                                prob,
-                                filtered ? " (filtered)" : "");
-                    }
+                const int32_t parent_active = linear / k;
+                if (parent_active < 0 || parent_active >= (int32_t) active_beam_idx.size()) {
+                    continue;
+                }
 
-                    if (filtered) {
-                        continue;
-                    }
-                    if (base_id < 0 || base_id >= model->hparams.vocab_size) {
-                        continue;
-                    }
+                const size_t beam_idx = active_beam_idx[(size_t) parent_active];
+                const auto & beam = beams_cur[beam_idx];
+                const float total_logprob = selected_logprob[rank];
+                const float prob = std::exp(total_logprob - beam.logprob);
+                const int32_t base_id = draft_idx + model->d2t[draft_idx];
+                const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
 
-                    expansions.push_back({
-                        /* logprob  = */ beam.logprob + std::log(std::max(prob, 1e-12f)),
-                        /* beam_idx = */ beam_idx,
-                        /* token    = */ base_id,
-                    });
+                if (verbose) {
+                    const bool base_ok = base_id >= 0 && base_id < model->hparams.vocab_size;
+                    const std::string piece = base_ok && vocab_tgt
+                        ? common_token_to_piece(vocab_tgt, base_id)
+                        : std::string("<invalid>");
+                    const std::string escaped = escape_token_piece(piece);
+                    LOG_INF("eagle3 depth=%d beam=%zu rank=%zu token=%d piece=\"%s\" p=%.6f%s\n",
+                            depth,
+                            beam_idx,
+                            rank,
+                            base_id,
+                            escaped.c_str(),
+                            prob,
+                            filtered ? " (filtered)" : "");
+                }
+
+                if (filtered) {
+                    continue;
+                }
+                if (base_id < 0 || base_id >= model->hparams.vocab_size) {
+                    continue;
+                }
+
+                expansions.push_back({
+                    /* logprob  = */ total_logprob,
+                    /* beam_idx = */ beam_idx,
+                    /* token    = */ base_id,
+                });
+                if ((int) expansions.size() >= beam_width) {
+                    break;
                 }
             }
             t_scoring_us += ggml_time_us() - t_scoring_start;
@@ -897,52 +952,64 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 break;
             }
 
-            std::sort(expansions.begin(), expansions.end(),
-                [](const beam_expansion & a, const beam_expansion & b) {
-                    return a.logprob > b.logprob;
-                });
+            std::vector<const llama_eagle3_state *> parent_states;
+            std::vector<llama_eagle3_state *> out_states;
+            std::vector<llama_token> candidate_input_ids;
+            parent_states.reserve(expansions.size());
+            out_states.reserve(expansions.size());
+            candidate_input_ids.reserve(expansions.size());
 
-            if ((int) expansions.size() > beam_width) {
-                expansions.resize(beam_width);
-            }
+            const int32_t n_next = (int32_t) expansions.size();
+            for (int32_t i = 0; i < n_next; ++i) {
+                const auto & expansion = expansions[(size_t) i];
+                const auto & parent = beams_cur[expansion.beam_idx];
 
-            std::vector<beam_state> candidates;
-            candidates.reserve(expansions.size());
-
-            for (const auto & expansion : expansions) {
-                const auto & parent = beams[expansion.beam_idx];
-
-                beam_state child;
+                beam_state & child = beams_nxt[(size_t) i];
                 child.logprob = expansion.logprob;
                 child.tokens = parent.tokens;
                 child.tokens.push_back(expansion.token);
-                child.state = parent.state;
 
-                {
-                    const int64_t t_step_start = ggml_time_us();
-                    ++n_step_calls;
-                    const float * hidden_step = child.state.hidden.empty() ? nullptr : child.state.hidden.data();
-                    if (!llama_eagle3_step(*model, rt, child.state, hidden_step, hidden_size, expansion.token, nullptr)) {
-                        continue;
-                    }
-                    t_step_us += ggml_time_us() - t_step_start;
-                }
-
-                candidates.push_back(std::move(child));
+                parent_states.push_back(&parent.state);
+                out_states.push_back(&child.state);
+                candidate_input_ids.push_back(expansion.token);
             }
 
-            if (candidates.empty()) {
+            if (!candidate_input_ids.empty()) {
+                const int64_t t_step_start = ggml_time_us();
+                ++n_step_calls;
+#if defined(GGML_USE_CUDA)
+                ggml_backend_cuda_profiler_zone zone = {};
+                if (profile_gpu) {
+                    ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/step_batch");
+                }
+#endif
+                const int32_t reserve_kv = std::max(0, max_depth - depth - 1);
+                const bool ok = llama_eagle3_step_batch_from_parents(
+                        *model,
+                        rt,
+                        parent_states,
+                        hidden_size,
+                        candidate_input_ids,
+                        out_states,
+                        reserve_kv);
+#if defined(GGML_USE_CUDA)
+                if (profile_gpu) {
+                    t_step_gpu_ms += ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/step_batch");
+                }
+#endif
+                if (!ok) {
+                    break;
+                }
+                t_step_us += ggml_time_us() - t_step_start;
+            }
+
+            if (candidate_input_ids.empty()) {
                 break;
             }
 
-            std::sort(candidates.begin(), candidates.end(),
-                [](const beam_state & a, const beam_state & b) {
-                    return a.logprob > b.logprob;
-                });
-
-            beams = std::move(candidates);
-
-            for (const auto & cand : beams) {
+            n_beams = (int32_t) candidate_input_ids.size();
+            for (int32_t i = 0; i < n_beams; ++i) {
+                const auto & cand = beams_nxt[(size_t) i];
                 all_nodes.push_back({cand.logprob, cand.tokens});
             }
         }
@@ -960,19 +1027,40 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         if (profile) {
             const int64_t t_total_us = ggml_time_us() - t_draft_start;
-            LOG_INF("eagle3 profile: prompt=%zu depth=%d beam=%d props=%d out=%zu total=%.3fms prefill=%.3fms logits=%.3fms score=%.3fms step=%.3fms calls(logits=%d,step=%d)\n",
-                    prompt_tgt.size(),
-                    max_depth,
-                    beam_width,
-                    max_proposals,
-                    all_nodes.size(),
-                    t_total_us / 1000.0,
-                    t_prefill_us / 1000.0,
-                    t_logits_us / 1000.0,
-                    t_scoring_us / 1000.0,
-                    t_step_us / 1000.0,
-                    n_logits_calls,
-                    n_step_calls);
+#if defined(GGML_USE_CUDA)
+            if (profile_gpu) {
+                LOG_INF("eagle3 profile: prompt=%zu depth=%d beam=%d props=%d out=%zu total=%.3fms prefill=%.3fms logits=%.3fms score=%.3fms step=%.3fms calls(logits=%d,step=%d) gpu(logits=%.3fms,step=%.3fms)\n",
+                        prompt_tgt.size(),
+                        max_depth,
+                        beam_width,
+                        max_proposals,
+                        all_nodes.size(),
+                        t_total_us / 1000.0,
+                        t_prefill_us / 1000.0,
+                        t_logits_us / 1000.0,
+                        t_scoring_us / 1000.0,
+                        t_step_us / 1000.0,
+                        n_logits_calls,
+                        n_step_calls,
+                        t_logits_gpu_ms,
+                        t_step_gpu_ms);
+            } else
+#endif
+            {
+                LOG_INF("eagle3 profile: prompt=%zu depth=%d beam=%d props=%d out=%zu total=%.3fms prefill=%.3fms logits=%.3fms score=%.3fms step=%.3fms calls(logits=%d,step=%d)\n",
+                        prompt_tgt.size(),
+                        max_depth,
+                        beam_width,
+                        max_proposals,
+                        all_nodes.size(),
+                        t_total_us / 1000.0,
+                        t_prefill_us / 1000.0,
+                        t_logits_us / 1000.0,
+                        t_scoring_us / 1000.0,
+                        t_step_us / 1000.0,
+                        n_logits_calls,
+                        n_step_calls);
+            }
         }
 
         std::vector<int32_t> roots;
@@ -1032,43 +1120,45 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 
 private:
-    bool fetch_hidden_ptrs(
-            llama_seq_id seq_id,
-            std::vector<const float *> & ptrs,
+    bool fetch_hidden_tensors(
+            std::vector<const ggml_tensor *> & tensors,
             size_t & n_tokens) const {
-        ptrs.clear();
+        tensors.clear();
         n_tokens = 0;
 
         for (int32_t layer_id : layer_ids) {
             size_t n_layer_tokens = 0;
-            const float * data = llama_eagle3_get_hidden_seq(ctx_tgt, seq_id, layer_id, &n_layer_tokens);
+            const ggml_tensor * data = llama_eagle3_get_hidden_capture(ctx_tgt, layer_id, &n_layer_tokens);
             if (!data || n_layer_tokens == 0) {
                 return false;
             }
-            if (ptrs.empty()) {
+            if (tensors.empty()) {
                 n_tokens = n_layer_tokens;
             } else if (n_layer_tokens != n_tokens) {
                 return false;
             }
-            ptrs.push_back(data);
+            tensors.push_back(data);
         }
 
-        return !ptrs.empty();
+        return !tensors.empty();
     }
 
-    bool build_hidden_concat(
-            const std::vector<const float *> & ptrs,
+    bool build_hidden_concat_host(
+            const std::vector<const ggml_tensor *> & tensors,
             size_t token_idx,
             std::vector<float> & out) const {
-        if (ptrs.empty()) {
+        if (tensors.empty()) {
             return false;
         }
 
         out.resize((size_t) hidden_in_dim);
         size_t offset = 0;
-        for (const float * layer_ptr : ptrs) {
-            const float * src = layer_ptr + token_idx * (size_t) target_hidden_size;
-            std::memcpy(out.data() + offset, src, (size_t) target_hidden_size * sizeof(float));
+        for (const ggml_tensor * t : tensors) {
+            if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != target_hidden_size || token_idx >= (size_t) t->ne[1]) {
+                return false;
+            }
+            const size_t n_bytes = (size_t) target_hidden_size * sizeof(float);
+            ggml_backend_tensor_get(t, out.data() + offset, token_idx * (size_t) t->nb[1], n_bytes);
             offset += (size_t) target_hidden_size;
         }
         return true;
@@ -1118,9 +1208,9 @@ private:
         std::vector<int32_t> layer_ids_i32(layer_ids.begin(), layer_ids.end());
 
         // Dump per-layer teacher hiddens (prompt_tgt only).
-        std::vector<const float *> layer_ptrs;
+        std::vector<const ggml_tensor *> layer_tensors;
         size_t n_layer_tokens = 0;
-        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_layer_tokens) || n_layer_tokens < n_prompt) {
+        if (!fetch_hidden_tensors(layer_tensors, n_layer_tokens) || n_layer_tokens < n_prompt) {
             LOG_ERR("%s: failed to fetch teacher hidden ptrs for dump\n", __func__);
             return false;
         }
@@ -1135,11 +1225,12 @@ private:
             return false;
         }
 
-        for (size_t li = 0; li < layer_ptrs.size(); ++li) {
+        for (size_t li = 0; li < layer_tensors.size(); ++li) {
             const int32_t layer_id = layer_ids[li];
-            const float * data = layer_ptrs[li];
+            std::vector<float> layer_host((size_t) n_prompt * (size_t) target_hidden_size);
+            ggml_backend_tensor_get(layer_tensors[li], layer_host.data(), 0, layer_host.size() * sizeof(float));
             const fs::path p = dir / ("teacher_hidden_layer_" + std::to_string(layer_id) + ".npy");
-            if (!write_npy_f32(p, data, {n_prompt, (size_t) target_hidden_size})) {
+            if (!write_npy_f32(p, layer_host.data(), {n_prompt, (size_t) target_hidden_size})) {
                 return false;
             }
         }
@@ -1272,9 +1363,9 @@ private:
         }
 
         if (prompt_tgt.size() == cached_prompt_len && cached_prompt_len > 0) {
-            std::vector<const float *> layer_ptrs;
+            std::vector<const ggml_tensor *> layer_tensors;
             size_t n_tokens = 0;
-            if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens) || n_tokens < prompt_tgt.size()) {
+            if (!fetch_hidden_tensors(layer_tensors, n_tokens) || n_tokens < prompt_tgt.size()) {
                 cached_prompt_len = 0;
                 base_state = {};
                 return false;
@@ -1287,9 +1378,9 @@ private:
             return true;
         }
 
-        std::vector<const float *> layer_ptrs;
+        std::vector<const ggml_tensor *> layer_tensors;
         size_t n_tokens = 0;
-        if (!fetch_hidden_ptrs(seq_id, layer_ptrs, n_tokens)) {
+        if (!fetch_hidden_tensors(layer_tensors, n_tokens)) {
             return false;
         }
         if (n_tokens < prompt_tgt.size()) {
@@ -1303,7 +1394,7 @@ private:
                 std::vector<float> all_hidden;
                 all_hidden.resize(prompt_tgt.size() * (size_t) hidden_in_dim);
                 for (size_t i = 0; i < prompt_tgt.size(); ++i) {
-                    if (!build_hidden_concat(layer_ptrs, i, hidden_concat_buf)) {
+                    if (!build_hidden_concat_host(layer_tensors, i, hidden_concat_buf)) {
                         return false;
                     }
                     std::memcpy(
@@ -1366,12 +1457,11 @@ private:
 
         const size_t start = cached_prompt_len > 0 ? cached_prompt_len - 1 : 0;
         for (size_t i = start; i + 1 < prompt_tgt.size(); ++i) {
-            if (!build_hidden_concat(layer_ptrs, i, hidden_concat_buf)) {
-                return false;
-            }
-
             llama_eagle3_step_debug dbg;
             if (dump_steps) {
+                if (!build_hidden_concat_host(layer_tensors, i, hidden_concat_buf)) {
+                    return false;
+                }
                 dbg.embd        = &dump_head_embd_by_step;
                 dbg.embd_norm   = &dump_head_embd_norm_by_step;
                 dbg.hidden_proj = &dump_head_hidden_proj_by_step;
@@ -1388,7 +1478,15 @@ private:
                     hidden_concat_buf.end());
             }
 
-            if (!llama_eagle3_step(*model, rt, base_state, hidden_concat_buf.data(), hidden_in_dim, prompt_tgt[i + 1], nullptr, dump_steps ? &dbg : nullptr)) {
+            if (!llama_eagle3_step_from_hidden_capture(
+                        *model,
+                        rt,
+                        base_state,
+                        layer_tensors,
+                        i,
+                        prompt_tgt[i + 1],
+                        nullptr,
+                        dump_steps ? &dbg : nullptr)) {
                 return false;
             }
 
