@@ -21,15 +21,21 @@ def _add_repo_paths(kestrel_path: Path, repo_root: Path) -> None:
     sys.path.insert(0, str(kestrel_path))
 
 
-def _to_numpy(tensor: torch.Tensor, dtype: str) -> np.ndarray:
+def _to_numpy(tensor: torch.Tensor, dtype: str) -> tuple[np.ndarray, str | None]:
+    tensor = tensor.detach().cpu().contiguous()
+
     if dtype == "f16":
-        tensor = tensor.to(dtype=torch.float16)
-    elif dtype == "f32":
-        tensor = tensor.to(dtype=torch.float32)
-    else:
-        raise ValueError(f"Unsupported dtype: {dtype}")
-    arr = tensor.detach().cpu().numpy()
-    return np.ascontiguousarray(arr)
+        arr = tensor.to(dtype=torch.float16).numpy()
+        return np.ascontiguousarray(arr), None
+    if dtype == "f32":
+        arr = tensor.to(dtype=torch.float32).numpy()
+        return np.ascontiguousarray(arr), None
+    if dtype == "bf16":
+        # NumPy does not expose a native bfloat16 dtype here, so store raw BF16 payload bytes.
+        arr = tensor.to(dtype=torch.bfloat16).view(torch.uint16).numpy()
+        return np.ascontiguousarray(arr), "bf16"
+
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def _require_keys(state: Dict[str, torch.Tensor], keys: Iterable[str]) -> None:
@@ -65,7 +71,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--dtype",
-        choices=("f16", "f32"),
+        choices=("f16", "bf16", "f32"),
         default="f16",
         help="Output tensor dtype (default: f16)",
     )
@@ -84,7 +90,7 @@ def main() -> int:
 
     _add_repo_paths(kestrel_path, repo_root)
 
-    from gguf import GGUFWriter, GGUFValueType
+    from gguf import GGMLQuantizationType, GGUFWriter, GGUFValueType
     from kestrel.draft_loader import load_draft_head
 
     state, d2t, _t2d, config = load_draft_head(args.head)
@@ -196,11 +202,21 @@ def main() -> int:
     )
 
     for src, dst in mapping.items():
-        writer.add_tensor(dst, _to_numpy(state[src], args.dtype))
+        tensor, raw_dtype = _to_numpy(state[src], args.dtype)
+        writer.add_tensor(
+            dst,
+            tensor,
+            raw_dtype=GGMLQuantizationType.BF16 if raw_dtype == "bf16" else None,
+        )
 
     for src, dst in optional.items():
         if src in state:
-            writer.add_tensor(dst, _to_numpy(state[src], args.dtype))
+            tensor, raw_dtype = _to_numpy(state[src], args.dtype)
+            writer.add_tensor(
+                dst,
+                tensor,
+                raw_dtype=GGMLQuantizationType.BF16 if raw_dtype == "bf16" else None,
+            )
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
