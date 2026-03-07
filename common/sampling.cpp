@@ -608,7 +608,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_tree(
     }
 
     while (true) {
-        const int idx = (int) tree.batch_start + node;
+        const int idx = tree.row_indices.size() == n_nodes
+            ? (int) tree.row_indices[(size_t) node]
+            : (int) tree.batch_start + node;
         id = common_sampler_sample(gsmpl, ctx, idx, grammar_first);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);

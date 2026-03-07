@@ -12,11 +12,13 @@ struct common_speculative_tree {
     std::vector<llama_token> tokens;
     std::vector<int32_t> parents; // -1 for root nodes
     std::vector<int32_t> depths;
+    std::vector<uint32_t> row_indices; // optional explicit target batch row per logical node
 
     void clear() {
         tokens.clear();
         parents.clear();
         depths.clear();
+        row_indices.clear();
         batch_start = 1;
     }
 
@@ -58,6 +60,9 @@ bool common_speculative_get_tree(common_speculative * spec, common_speculative_t
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+
+// informs the speculative decoder of the exact accepted token sequence for the most recent tree pass
+void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & ids, llama_seq_id seq_id = 0);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

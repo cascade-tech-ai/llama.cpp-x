@@ -156,6 +156,11 @@ struct common_speculative_state {
 
     virtual void accept(uint16_t n_accepted) = 0;
 
+    virtual void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id) {
+        GGML_UNUSED(ids);
+        GGML_UNUSED(seq_id);
+    }
+
     virtual bool get_tree(common_speculative_tree & out) const {
         out.clear();
         return false;
@@ -563,6 +568,9 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
     common_speculative_tree last_tree;
+    std::vector<llama_eagle3_state> last_tree_states;
+    llama_eagle3_state last_root_state;
+    bool has_last_root_state = false;
     std::vector<float> cached_tail_hidden_concat;
     size_t cached_tail_capture_idx = 0;
 
@@ -695,6 +703,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_tokens & draft_tokens) override {
         draft_tokens.clear();
         last_tree.clear();
+        last_tree_states.clear();
+        has_last_root_state = false;
 
         if (!enabled) {
             return;
@@ -808,6 +818,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         if (!llama_eagle3_state_has_hidden(root_state)) {
             return;
         }
+        last_root_state = root_state;
+        has_last_root_state = true;
 
         if (dump_root) {
             std::vector<float> root_hidden;
@@ -855,7 +867,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         int32_t n_beams = 1;
         beams_a[0] = {0.0f, {}, root_state};
 
-        std::vector<std::pair<float, llama_tokens>> all_nodes;
+        struct proposal_path {
+            float logprob = 0.0f;
+            llama_tokens tokens;
+        };
+
+        std::vector<proposal_path> all_nodes;
+        std::map<llama_tokens, llama_eagle3_state> prefix_states;
 
         for (int depth = 0; depth < max_depth; ++depth) {
             auto & beams_cur = (depth & 1) ? beams_b : beams_a;
@@ -1056,6 +1074,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             n_beams = (int32_t) candidate_input_ids.size();
             for (int32_t i = 0; i < n_beams; ++i) {
                 const auto & cand = beams_nxt[(size_t) i];
+                prefix_states[cand.tokens] = cand.state;
                 all_nodes.push_back({cand.logprob, cand.tokens});
             }
         }
@@ -1065,7 +1084,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         }
 
         std::sort(all_nodes.begin(), all_nodes.end(),
-            [](const auto & a, const auto & b) { return a.first > b.first; });
+            [](const auto & a, const auto & b) { return a.logprob > b.logprob; });
 
         if ((int) all_nodes.size() > max_proposals) {
             all_nodes.resize(max_proposals);
@@ -1147,8 +1166,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         std::vector<int32_t> roots;
         std::vector<std::vector<int32_t>> children;
 
+        last_tree_states.clear();
+
         for (const auto & entry : all_nodes) {
-            const auto & seq = entry.second;
+            const auto & seq = entry.tokens;
             int32_t parent = -1;
             for (size_t depth = 0; depth < seq.size(); ++depth) {
                 const llama_token tok = seq[depth];
@@ -1174,6 +1195,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     last_tree.tokens.push_back(tok);
                     last_tree.parents.push_back(parent);
                     last_tree.depths.push_back((int32_t) depth);
+                    last_tree_states.emplace_back();
                     children.emplace_back();
 
                     if (parent < 0) {
@@ -1181,6 +1203,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     } else {
                         children[parent].push_back(node_idx);
                     }
+                }
+
+                llama_tokens prefix(seq.begin(), seq.begin() + (ptrdiff_t) depth + 1);
+                auto it_state = prefix_states.find(prefix);
+                if (it_state != prefix_states.end()) {
+                    last_tree_states[(size_t) node_idx] = it_state->second;
                 }
 
                 parent = node_idx;
@@ -1193,6 +1221,69 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     void accept(uint16_t n_accepted) override {
         // noop
         GGML_UNUSED(n_accepted);
+    }
+
+    void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id) override {
+        if (seq_id != active_seq_id || ids.empty() || !has_last_root_state) {
+            return;
+        }
+
+        std::vector<int32_t> roots;
+        std::vector<std::vector<int32_t>> children(last_tree.tokens.size());
+        roots.reserve(last_tree.tokens.size());
+
+        for (size_t i = 0; i < last_tree.tokens.size(); ++i) {
+            const int32_t parent = last_tree.parents[i];
+            if (parent < 0) {
+                roots.push_back((int32_t) i);
+            } else if ((size_t) parent < children.size()) {
+                children[(size_t) parent].push_back((int32_t) i);
+            }
+        }
+
+        const auto find_token = [&](const std::vector<int32_t> & list, llama_token tok) -> int32_t {
+            for (int32_t idx : list) {
+                if (last_tree.tokens[(size_t) idx] == tok) {
+                    return idx;
+                }
+            }
+            return -1;
+        };
+
+        std::vector<int32_t> accepted_nodes;
+        int32_t node = find_token(roots, ids[0]);
+        while (node >= 0) {
+            accepted_nodes.push_back(node);
+            if (accepted_nodes.size() >= ids.size() - 1) {
+                break;
+            }
+            const llama_token next_tok = ids[accepted_nodes.size()];
+            node = find_token(children[(size_t) node], next_tok);
+        }
+
+        size_t n_tokens = 0;
+        std::vector<const ggml_tensor *> layer_tensors;
+        if (!fetch_hidden_tensors(layer_tensors, n_tokens) || n_tokens == 0) {
+            return;
+        }
+
+        if (accepted_nodes.empty()) {
+            base_state = last_root_state;
+            cached_tail_capture_idx = 0;
+        } else {
+            const int32_t deepest = accepted_nodes.back();
+            if ((size_t) deepest >= last_tree_states.size()) {
+                return;
+            }
+            const size_t row_idx = (size_t) last_tree.batch_start + (size_t) deepest;
+            if (row_idx >= n_tokens) {
+                return;
+            }
+            base_state = last_tree_states[(size_t) deepest];
+            cached_tail_capture_idx = row_idx;
+        }
+
+        cached_prompt_len += ids.size();
     }
 
     bool get_tree(common_speculative_tree & out) const override {
@@ -2216,6 +2307,15 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
     }
 
     impl->accept(n_accepted);
+}
+
+void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & ids, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->curr_impl == nullptr || ids.empty()) {
+        return;
+    }
+
+    common_speculative_state * impl = spec->curr_impl;
+    impl->accept_tokens(ids, seq_id);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
