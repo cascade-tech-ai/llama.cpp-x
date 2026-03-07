@@ -291,6 +291,34 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+bool llama_kv_cache::kv_idx_rm(const uint32_t * idxs, size_t n) {
+    if (!idxs) {
+        return false;
+    }
+
+    for (size_t j = 0; j < n; ++j) {
+        const uint32_t idx_abs = idxs[j];
+        const uint32_t strm = idx_abs / get_size();
+        const uint32_t idx  = idx_abs % get_size();
+
+        if (strm >= n_stream) {
+            return false;
+        }
+
+        auto & cells = v_cells[strm];
+        auto & head  = v_heads[strm];
+
+        if (!cells.is_empty(idx)) {
+            cells.rm(idx);
+            if (idx < head) {
+                head = idx;
+            }
+        }
+    }
+
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
@@ -2282,6 +2310,24 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    return true;
+}
+
+bool llama_kv_cache_context::get_kv_slot_indices(std::vector<uint32_t> & dst) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty()) {
+        return false;
+    }
+
+    const auto & sinfo = sinfos[i_cur];
+    const uint32_t kv_size = kv->get_size();
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t offs = sinfo.strm[s] * kv_size;
+        for (uint32_t i = 0; i < sinfo.size(); ++i) {
+            dst.push_back(offs + sinfo.idxs[s][i]);
+        }
+    }
 
     return true;
 }

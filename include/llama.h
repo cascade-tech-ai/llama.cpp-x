@@ -709,6 +709,13 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Removes the exact KV cells identified by absolute cache indices.
+    // Returns false if the memory backend does not support KV-index-based removal.
+    LLAMA_API bool llama_memory_kv_idx_rm(
+            llama_memory_t mem,
+            const uint32_t * idxs,
+                   size_t    n);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -1038,6 +1045,12 @@ extern "C" {
     LLAMA_API const struct ggml_tensor * llama_eagle3_get_hidden_capture(
             struct llama_context * ctx,
             int32_t layer_id,
+            size_t * n_tokens);
+
+    // Return the absolute KV slot indices used by the most recent decode call.
+    // The returned pointer is owned by the context and is valid until the next decode/reset.
+    LLAMA_API const uint32_t * llama_get_kv_slot_indices(
+            struct llama_context * ctx,
             size_t * n_tokens);
 
     //

@@ -140,6 +140,10 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid::kv_idx_rm(const uint32_t * idxs, size_t n) {
+    return mem_attn->kv_idx_rm(idxs, n);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -263,6 +267,10 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+bool llama_memory_hybrid_context::get_kv_slot_indices(std::vector<uint32_t> & dst) const {
+    return ctx_attn ? ctx_attn->get_kv_slot_indices(dst) : false;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

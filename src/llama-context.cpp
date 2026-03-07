@@ -717,6 +717,15 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+const uint32_t * llama_context::get_kv_slot_indices(size_t * n_tokens) const {
+    if (!n_tokens) {
+        return nullptr;
+    }
+
+    *n_tokens = kv_slots.size();
+    return kv_slots.empty() ? nullptr : kv_slots.data();
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1846,6 +1855,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
+    kv_slots.clear();
 
     sched_reserve();
 
@@ -1969,6 +1979,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_LOG_ERROR("%s: failed to append EAGLE3 hidden capture\n", __func__);
             return -2;
         }
+
+        mctx->get_kv_slot_indices(kv_slots);
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -3552,6 +3564,16 @@ const ggml_tensor * llama_eagle3_get_hidden_capture(
     return ctx->eagle3_get_hidden_capture(layer_id, *n_tokens);
 }
 
+const uint32_t * llama_get_kv_slot_indices(
+        llama_context * ctx,
+        size_t * n_tokens) {
+    if (!ctx || !n_tokens) {
+        return nullptr;
+    }
+
+    return ctx->get_kv_slot_indices(n_tokens);
+}
+
 void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {
     if (!ctx) {
         return;
@@ -3673,6 +3695,17 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_kv_idx_rm(
+        llama_memory_t mem,
+        const uint32_t * idxs,
+        size_t n) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->kv_idx_rm(idxs, n);
 }
 
 void llama_memory_seq_cp(

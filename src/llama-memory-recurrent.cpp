@@ -210,6 +210,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_memory_recurrent::kv_idx_rm(const uint32_t * idxs, size_t n) {
+    (void) idxs;
+    (void) n;
+    return true;
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;

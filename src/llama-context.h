@@ -80,6 +80,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    const uint32_t * get_kv_slot_indices(size_t * n_tokens) const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -346,6 +347,7 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    std::vector<uint32_t> kv_slots;  // map batch token positions to absolute KV slot indices for the last logical batch
 
     struct swap_info {
         uint32_t i0;

@@ -88,6 +88,15 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::kv_idx_rm(const uint32_t * idxs, size_t n) {
+    bool res = true;
+
+    res = res & kv_base->kv_idx_rm(idxs, n);
+    res = res & kv_swa ->kv_idx_rm(idxs, n);
+
+    return res;
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -320,6 +329,10 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+bool llama_kv_cache_iswa_context::get_kv_slot_indices(std::vector<uint32_t> & dst) const {
+    return ctx_base ? ctx_base->get_kv_slot_indices(dst) : false;
 }
 
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {

@@ -47,15 +47,6 @@ struct scoped_prof {
     }
 };
 
-struct eagle_tree_layout {
-    std::vector<int32_t> roots;
-    std::vector<std::vector<int32_t>> children;
-    std::vector<int32_t> leaves;
-    std::vector<llama_seq_id> leaf_seq_ids;
-    std::vector<std::vector<llama_seq_id>> node_seq_ids;
-    std::vector<std::vector<int32_t>> leaf_paths;
-};
-
 static int32_t find_tree_token(const common_speculative_tree & tree, const std::vector<int32_t> & nodes, llama_token tok) {
     for (int32_t node : nodes) {
         if (tree.tokens[(size_t) node] == tok) {
@@ -65,115 +56,35 @@ static int32_t find_tree_token(const common_speculative_tree & tree, const std::
     return -1;
 }
 
-static eagle_tree_layout build_eagle_tree_layout(const common_speculative_tree & tree) {
-    eagle_tree_layout layout;
+static std::vector<int32_t> trace_accepted_tree_nodes(const common_speculative_tree & tree, const llama_tokens & ids) {
+    std::vector<int32_t> nodes;
+    if (ids.empty() || tree.tokens.empty()) {
+        return nodes;
+    }
+
     const size_t n_nodes = tree.tokens.size();
-    layout.children.resize(n_nodes);
+    std::vector<int32_t> roots;
+    std::vector<std::vector<int32_t>> children(n_nodes);
 
     for (size_t i = 0; i < n_nodes; ++i) {
         const int32_t parent = tree.parents[i];
         if (parent < 0) {
-            layout.roots.push_back((int32_t) i);
+            roots.push_back((int32_t) i);
         } else if ((size_t) parent < n_nodes) {
-            layout.children[(size_t) parent].push_back((int32_t) i);
+            children[(size_t) parent].push_back((int32_t) i);
         }
     }
 
-    for (size_t i = 0; i < n_nodes; ++i) {
-        if (layout.children[i].empty()) {
-            layout.leaves.push_back((int32_t) i);
-        }
-    }
-
-    layout.leaf_seq_ids.resize(layout.leaves.size());
-    for (size_t i = 0; i < layout.leaves.size(); ++i) {
-        layout.leaf_seq_ids[i] = (llama_seq_id) (1 + i);
-    }
-
-    layout.leaf_paths.resize(layout.leaves.size());
-    for (size_t i = 0; i < layout.leaves.size(); ++i) {
-        std::vector<int32_t> path;
-        for (int32_t node = layout.leaves[i]; node >= 0; node = tree.parents[(size_t) node]) {
-            path.push_back(node);
-        }
-        std::reverse(path.begin(), path.end());
-        layout.leaf_paths[i] = std::move(path);
-    }
-
-    layout.node_seq_ids.resize(n_nodes);
-    std::function<const std::vector<llama_seq_id> &(int32_t)> dfs = [&](int32_t node) -> const std::vector<llama_seq_id> & {
-        auto & seqs = layout.node_seq_ids[(size_t) node];
-        if (!seqs.empty()) {
-            return seqs;
-        }
-        if (layout.children[(size_t) node].empty()) {
-            auto it = std::find(layout.leaves.begin(), layout.leaves.end(), node);
-            GGML_ASSERT(it != layout.leaves.end());
-            const size_t leaf_idx = (size_t) std::distance(layout.leaves.begin(), it);
-            seqs.push_back(layout.leaf_seq_ids[leaf_idx]);
-            return seqs;
-        }
-        for (int32_t child : layout.children[(size_t) node]) {
-            const auto & child_seqs = dfs(child);
-            seqs.insert(seqs.end(), child_seqs.begin(), child_seqs.end());
-        }
-        return seqs;
-    };
-
-    for (int32_t root : layout.roots) {
-        dfs(root);
-    }
-
-    return layout;
-}
-
-static std::vector<int32_t> trace_accepted_tree_nodes(const common_speculative_tree & tree, const eagle_tree_layout & layout, const llama_tokens & ids) {
-    std::vector<int32_t> nodes;
-    if (ids.empty()) {
-        return nodes;
-    }
-
-    int32_t node = find_tree_token(tree, layout.roots, ids[0]);
+    int32_t node = find_tree_token(tree, roots, ids[0]);
     while (node >= 0) {
         nodes.push_back(node);
         if (nodes.size() >= ids.size() - 1) {
             break;
         }
-        node = find_tree_token(tree, layout.children[(size_t) node], ids[nodes.size()]);
+        node = find_tree_token(tree, children[(size_t) node], ids[nodes.size()]);
     }
 
     return nodes;
-}
-
-static void build_eagle_tree_batch(
-        llama_batch & batch_tgt,
-        const llama_token id_last,
-        const llama_pos base_pos,
-        const eagle_tree_layout & layout,
-        common_speculative_tree & tree) {
-    std::vector<llama_seq_id> shared_seq_ids;
-    shared_seq_ids.reserve(1 + layout.leaf_seq_ids.size());
-    shared_seq_ids.push_back(0);
-    shared_seq_ids.insert(shared_seq_ids.end(), layout.leaf_seq_ids.begin(), layout.leaf_seq_ids.end());
-    common_batch_add(batch_tgt, id_last, base_pos, shared_seq_ids, true);
-
-    tree.row_indices.assign(tree.tokens.size(), std::numeric_limits<uint32_t>::max());
-
-    for (size_t leaf_idx = 0; leaf_idx < layout.leaf_paths.size(); ++leaf_idx) {
-        const llama_seq_id seq_id = layout.leaf_seq_ids[leaf_idx];
-        for (int32_t node : layout.leaf_paths[leaf_idx]) {
-            const llama_pos pos = base_pos + 1 + tree.depths[(size_t) node];
-            const uint32_t row = batch_tgt.n_tokens;
-            common_batch_add(batch_tgt, tree.tokens[(size_t) node], pos, { seq_id }, true);
-            if (tree.row_indices[(size_t) node] == std::numeric_limits<uint32_t>::max()) {
-                tree.row_indices[(size_t) node] = row;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < tree.row_indices.size(); ++i) {
-        GGML_ASSERT(tree.row_indices[i] != std::numeric_limits<uint32_t>::max());
-    }
 }
 }
 
@@ -355,10 +266,7 @@ int main(int argc, char ** argv) {
 
     common_speculative_begin(spec, prompt_tgt, 0);
 
-    const int max_tree_seq_ids = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3
-        ? std::max(1, params.speculative.eagle_max_proposals + 1)
-        : 1;
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, max_tree_seq_ids);
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     const auto t_enc_end = ggml_time_us();
 
@@ -392,7 +300,7 @@ int main(int argc, char ** argv) {
         common_speculative_tree tree;
         const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
-        eagle_tree_layout tree_layout;
+        std::vector<uint32_t> tree_kv_slots;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -411,19 +319,20 @@ int main(int argc, char ** argv) {
             }
 
             if (use_tree) {
-                tree_layout = build_eagle_tree_layout(tree);
-                if ((int) tree_layout.leaf_seq_ids.size() + 1 > (int) llama_n_seq_max(ctx_tgt)) {
-                    LOG_ERR("%s: insufficient n_seq_max=%u for %zu EAGLE branches\n",
-                            __func__, llama_n_seq_max(ctx_tgt), tree_layout.leaf_seq_ids.size());
-                    return 1;
+                common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
+                tree.row_indices.resize(tree.tokens.size());
+                for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                    const llama_pos pos = n_past + tree.depths[i];
+                    tree.row_indices[i] = batch_tgt.n_tokens;
+                    common_batch_add(batch_tgt, tree.tokens[i], pos, { 0 }, true);
                 }
 
-                auto * mem = llama_get_memory(ctx_tgt);
-                for (llama_seq_id seq_id : tree_layout.leaf_seq_ids) {
-                    llama_memory_seq_rm(mem, seq_id, -1, -1);
-                    llama_memory_seq_cp(mem, 0, seq_id, -1, -1);
-                }
-                build_eagle_tree_batch(batch_tgt, id_last, n_past++, tree_layout, tree);
+                const llama_kq_mask_tree mask = {
+                    /* .n_nodes     = */ tree.tokens.size(),
+                    /* .parent      = */ tree.parents.data(),
+                    /* .batch_start = */ tree.batch_start,
+                };
+                llama_set_kq_mask_tree(ctx_tgt, &mask);
             } else {
                 common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
                 for (size_t i = 0; i < draft.size(); ++i) {
@@ -437,6 +346,18 @@ int main(int argc, char ** argv) {
             llama_decode(ctx_tgt, batch_tgt);
             pass_target_fwd_ms = zone_target_fwd.elapsed_ms();
             t_target_fwd_us += (int64_t) (zone_target_fwd.elapsed_ms() * 1000.0);
+
+            if (use_tree) {
+                size_t n_slots = 0;
+                const uint32_t * slots = llama_get_kv_slot_indices(ctx_tgt, &n_slots);
+                if (!slots || n_slots != (size_t) batch_tgt.n_tokens) {
+                    LOG_ERR("%s: failed to retrieve KV slots for EAGLE tree batch (got %zu, expected %d)\n",
+                            __func__, n_slots, batch_tgt.n_tokens);
+                    return 1;
+                }
+                tree_kv_slots.assign(slots, slots + n_slots);
+                llama_clear_kq_mask_tree(ctx_tgt);
+            }
         }
 
         // sample from the full target batch and return the accepted tokens based on the target sampler
@@ -490,20 +411,30 @@ int main(int argc, char ** argv) {
         }
         common_speculative_accept(spec, ids_limited.size() - 1);
 
-        std::vector<int32_t> accepted_nodes;
         if (use_tree) {
-            accepted_nodes = trace_accepted_tree_nodes(tree, tree_layout, ids_limited);
+            const std::vector<int32_t> accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
             auto * mem = llama_get_memory(ctx_tgt);
-            if (!accepted_nodes.empty()) {
-                const int32_t deepest = accepted_nodes.back();
-                const auto & seq_ids = tree_layout.node_seq_ids[(size_t) deepest];
-                GGML_ASSERT(!seq_ids.empty());
-                const llama_pos p0 = n_past_before + 1;
-                const llama_pos p1 = p0 + (llama_pos) accepted_nodes.size();
-                llama_memory_seq_cp(mem, seq_ids[0], 0, p0, p1);
+
+            std::vector<char> keep(tree.tokens.size(), 0);
+            for (int32_t node : accepted_nodes) {
+                if (node >= 0 && (size_t) node < keep.size()) {
+                    keep[(size_t) node] = 1;
+                }
             }
-            for (llama_seq_id seq_id : tree_layout.leaf_seq_ids) {
-                llama_memory_seq_rm(mem, seq_id, -1, -1);
+
+            std::vector<uint32_t> reject_slots;
+            reject_slots.reserve(tree.tokens.size());
+            for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                if (!keep[i]) {
+                    const uint32_t row = tree.row_indices[i];
+                    GGML_ASSERT(row < tree_kv_slots.size());
+                    reject_slots.push_back(tree_kv_slots[row]);
+                }
+            }
+
+            if (!reject_slots.empty() && !llama_memory_kv_idx_rm(mem, reject_slots.data(), reject_slots.size())) {
+                LOG_ERR("%s: failed to remove rejected EAGLE KV slots\n", __func__);
+                return 1;
             }
         }
 
@@ -539,7 +470,7 @@ int main(int argc, char ** argv) {
             if (!use_tree) {
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
             }
-            if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && !use_tree) {
+            if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
                 llama_eagle3_trim_seq(ctx_tgt, 0, n_past);
             }
         }
