@@ -721,11 +721,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         int64_t t_scoring_us = 0;
         int64_t t_logits_us = 0;
         int64_t t_step_us = 0;
+        int64_t t_root_step_us = 0;
         int32_t n_logits_calls = 0;
         int32_t n_step_calls = 0;
+        std::vector<double> depth_select_ms;
+        std::vector<double> depth_score_ms;
+        std::vector<double> depth_step_ms;
+        std::vector<int32_t> depth_active_beams;
+        std::vector<int32_t> depth_expansions;
 #if defined(GGML_USE_CUDA)
         double t_logits_gpu_ms = 0.0;
         double t_step_gpu_ms   = 0.0;
+        double t_root_step_gpu_ms = 0.0;
+        std::vector<double> depth_select_gpu_ms;
+        std::vector<double> depth_step_gpu_ms;
 #endif
 
         const int64_t t_prefill_start = ggml_time_us();
@@ -771,6 +780,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         {
             const int64_t t_step_start = ggml_time_us();
             ++n_step_calls;
+#if defined(GGML_USE_CUDA)
+            ggml_backend_cuda_profiler_zone zone = {};
+            if (profile_gpu) {
+                ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/root_step");
+            }
+#endif
             if (!llama_eagle3_step_from_hidden_capture(
                         *model,
                         rt,
@@ -782,7 +797,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         dump_root ? &dbg_root : nullptr)) {
                 return;
             }
+#if defined(GGML_USE_CUDA)
+            if (profile_gpu) {
+                t_root_step_gpu_ms += ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/root_step");
+            }
+#endif
             t_step_us += ggml_time_us() - t_step_start;
+            t_root_step_us += ggml_time_us() - t_step_start;
         }
         if (!llama_eagle3_state_has_hidden(root_state)) {
             return;
@@ -842,6 +863,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             std::vector<beam_expansion> expansions;
             expansions.reserve((size_t) n_beams * (size_t) beam_width);
+            depth_active_beams.push_back(n_beams);
 
             const int k = std::min<int>(beam_width, model->hparams.draft_vocab_size);
             if (k <= 0) {
@@ -872,6 +894,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             std::vector<int32_t> selected_linear;
             std::vector<int32_t> selected_draft_idx;
             std::vector<float> selected_logprob;
+            double depth_select_gpu = 0.0;
             {
                 const int64_t t_logits_start = ggml_time_us();
                 ++n_logits_calls;
@@ -892,13 +915,19 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         selected_logprob);
 #if defined(GGML_USE_CUDA)
                 if (profile_gpu) {
-                    t_logits_gpu_ms += ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
+                    depth_select_gpu = ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
+                    t_logits_gpu_ms += depth_select_gpu;
                 }
 #endif
                 if (!ok) {
                     break;
                 }
-                t_logits_us += ggml_time_us() - t_logits_start;
+                const double depth_select = (ggml_time_us() - t_logits_start) / 1000.0;
+                t_logits_us += (int64_t) (depth_select * 1000.0);
+                depth_select_ms.push_back(depth_select);
+#if defined(GGML_USE_CUDA)
+                depth_select_gpu_ms.push_back(depth_select_gpu);
+#endif
             }
 
             const int64_t t_scoring_start = ggml_time_us();
@@ -953,7 +982,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     break;
                 }
             }
-            t_scoring_us += ggml_time_us() - t_scoring_start;
+            const double depth_score = (ggml_time_us() - t_scoring_start) / 1000.0;
+            t_scoring_us += (int64_t) (depth_score * 1000.0);
+            depth_score_ms.push_back(depth_score);
+            depth_expansions.push_back((int32_t) expansions.size());
 
             if (expansions.empty()) {
                 break;
@@ -984,6 +1016,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             if (!candidate_input_ids.empty()) {
                 const int64_t t_step_start = ggml_time_us();
                 ++n_step_calls;
+                double depth_step_gpu = 0.0;
 #if defined(GGML_USE_CUDA)
                 ggml_backend_cuda_profiler_zone zone = {};
                 if (profile_gpu) {
@@ -1001,13 +1034,19 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         reserve_kv);
 #if defined(GGML_USE_CUDA)
                 if (profile_gpu) {
-                    t_step_gpu_ms += ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/step_batch");
+                    depth_step_gpu = ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/step_batch");
+                    t_step_gpu_ms += depth_step_gpu;
                 }
 #endif
                 if (!ok) {
                     break;
                 }
-                t_step_us += ggml_time_us() - t_step_start;
+                const double depth_step = (ggml_time_us() - t_step_start) / 1000.0;
+                t_step_us += (int64_t) (depth_step * 1000.0);
+                depth_step_ms.push_back(depth_step);
+#if defined(GGML_USE_CUDA)
+                depth_step_gpu_ms.push_back(depth_step_gpu);
+#endif
             }
 
             if (candidate_input_ids.empty()) {
@@ -1067,6 +1106,41 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         t_step_us / 1000.0,
                         n_logits_calls,
                         n_step_calls);
+            }
+
+            LOG_INF("eagle3 profile root: prompt=%zu root_step=%.3fms\n",
+                    prompt_tgt.size(),
+                    t_root_step_us / 1000.0);
+
+            for (size_t i = 0; i < depth_active_beams.size(); ++i) {
+                const double select_ms = i < depth_select_ms.size() ? depth_select_ms[i] : 0.0;
+                const double score_ms  = i < depth_score_ms.size()  ? depth_score_ms[i]  : 0.0;
+                const double step_ms   = i < depth_step_ms.size()   ? depth_step_ms[i]   : 0.0;
+                const int32_t expands  = i < depth_expansions.size() ? depth_expansions[i] : 0;
+#if defined(GGML_USE_CUDA)
+                if (profile_gpu) {
+                    const double select_gpu_ms = i < depth_select_gpu_ms.size() ? depth_select_gpu_ms[i] : 0.0;
+                    const double step_gpu_ms   = i < depth_step_gpu_ms.size()   ? depth_step_gpu_ms[i]   : 0.0;
+                    LOG_INF("eagle3 profile depth=%zu active_beams=%d expansions=%d select=%.3fms score=%.3fms step=%.3fms gpu(select=%.3fms,step=%.3fms)\n",
+                            i,
+                            depth_active_beams[i],
+                            expands,
+                            select_ms,
+                            score_ms,
+                            step_ms,
+                            select_gpu_ms,
+                            step_gpu_ms);
+                } else
+#endif
+                {
+                    LOG_INF("eagle3 profile depth=%zu active_beams=%d expansions=%d select=%.3fms score=%.3fms step=%.3fms\n",
+                            i,
+                            depth_active_beams[i],
+                            expands,
+                            select_ms,
+                            score_ms,
+                            step_ms);
+                }
             }
         }
 
