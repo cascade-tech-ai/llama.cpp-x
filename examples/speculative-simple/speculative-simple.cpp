@@ -7,11 +7,43 @@
 #include "speculative.h"
 #include "log.h"
 #include "llama.h"
+#include "ggml-cuda.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+namespace {
+struct scoped_prof {
+    bool enabled = false;
+    const char * name = nullptr;
+    int64_t t_start_us = 0;
+
+    scoped_prof(bool enabled, const char * name) : enabled(enabled), name(name) {
+        if (!enabled) {
+            return;
+        }
+        t_start_us = ggml_time_us();
+#if defined(GGML_USE_CUDA)
+        ggml_backend_cuda_nvtx_push(name);
+#endif
+    }
+
+    ~scoped_prof() {
+        if (!enabled) {
+            return;
+        }
+#if defined(GGML_USE_CUDA)
+        ggml_backend_cuda_nvtx_pop();
+#endif
+    }
+
+    double elapsed_ms() const {
+        return enabled ? (ggml_time_us() - t_start_us) / 1000.0 : 0.0;
+    }
+};
+}
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -27,7 +59,8 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (params.speculative.mparams_dft.path.empty()) {
+    if (params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+        params.speculative.mparams_dft.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
         return 1;
     }
@@ -48,10 +81,12 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
     auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
+    const bool profile_spec = std::getenv("CASCADE_SPEC_PROFILE") != nullptr;
 
     // load the draft model (non-eagle3)
     llama_model_ptr model_dft;
-    if (params.speculative.type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
+    if (params.speculative.type != COMMON_SPECULATIVE_TYPE_EAGLE3 &&
+        params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
         // TODO: simplify this logic
         {
             const auto & params_spec = params.speculative;
@@ -188,8 +223,14 @@ int main(int argc, char ** argv) {
     const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
+    int64_t t_eagle_total_us = 0;
+    int64_t t_target_total_us = 0;
+    int64_t t_target_fwd_us = 0;
+    int64_t t_target_sampling_us = 0;
+    int32_t n_target_passes = 0;
 
     while (true) {
+        const int pass_idx = n_target_passes;
         // optionally, generate draft tokens that can be appended to the target batch
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -197,18 +238,29 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
-        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last, 0);
+        double pass_eagle_ms = 0.0;
+        llama_tokens draft;
+        {
+            scoped_prof zone_eagle(profile_spec, "spec/target_pass/eagle_total");
+            draft = spec
+                ? common_speculative_draft(spec, params_spec, prompt_tgt, id_last, 0)
+                : llama_tokens{};
+            pass_eagle_ms = zone_eagle.elapsed_ms();
+            t_eagle_total_us += (int64_t) (pass_eagle_ms * 1000.0);
+        }
         common_speculative_tree tree;
-        const bool has_tree = common_speculative_get_tree(spec, tree);
+        const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
         // always have a token to evaluate from before - id_last
+        scoped_prof zone_target(profile_spec, "spec/target_pass/total");
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+        double pass_target_fwd_ms = 0.0;
         {
             // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
@@ -238,7 +290,10 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
+            scoped_prof zone_target_fwd(profile_spec, "spec/target_pass/forward");
             llama_decode(ctx_tgt, batch_tgt);
+            pass_target_fwd_ms = zone_target_fwd.elapsed_ms();
+            t_target_fwd_us += (int64_t) (zone_target_fwd.elapsed_ms() * 1000.0);
 
             if (use_tree) {
                 llama_clear_kq_mask_tree(ctx_tgt);
@@ -252,9 +307,13 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
+        scoped_prof zone_target_sampling(profile_spec, "spec/target_pass/sampling");
+        const int64_t t_sampling_start = ggml_time_us();
         const auto ids = use_tree
             ? common_sampler_sample_and_accept_tree(smpl, ctx_tgt, 0, tree)
             : common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        const double pass_target_sampling_ms = zone_target_sampling.elapsed_ms();
+        t_target_sampling_us += ggml_time_us() - t_sampling_start;
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
@@ -264,6 +323,20 @@ int main(int argc, char ** argv) {
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
+        t_target_total_us += (int64_t) (zone_target.elapsed_ms() * 1000.0);
+        ++n_target_passes;
+
+        if (profile_spec) {
+            LOG_INF("spec profile: pass=%d target_total=%.3fms target_forward=%.3fms target_sampling=%.3fms eagle_total=%.3fms draft_tokens=%zu accepted=%zu use_tree=%d\n",
+                    pass_idx,
+                    zone_target.elapsed_ms(),
+                    pass_target_fwd_ms,
+                    pass_target_sampling_ms,
+                    pass_eagle_ms,
+                    draft.size(),
+                    ids.size() - 1,
+                    use_tree ? 1 : 0);
+        }
 
         // process the accepted tokens and update contexts
         //
@@ -320,6 +393,15 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+
+    if (profile_spec) {
+        LOG_INF("spec profile total: target_passes=%d target_total=%.3fms target_forward=%.3fms target_sampling=%.3fms eagle_total=%.3fms\n",
+                n_target_passes,
+                t_target_total_us / 1000.0,
+                t_target_fwd_us / 1000.0,
+                t_target_sampling_us / 1000.0,
+                t_eagle_total_us / 1000.0);
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
