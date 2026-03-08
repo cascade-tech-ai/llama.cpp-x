@@ -206,7 +206,40 @@ Verification gate:
 - All required checks A/B/C.
 
 Status:
-- not started
+- completed
+
+Verification notes:
+- 2026-03-08:
+  - No net code change was required here because `61744981` already has the compact verifier shape we want for this step:
+    - row `0` = root (`id_last`)
+    - rows `1..max_proposals` = speculative node slots
+    - unused node rows padded
+  - The compact verifier remained the active exact path after Step 1.
+  - I tested a follow-on experiment that bound explicit `kv_slot` values directly to the compact verifier rows.
+  - That experiment failed exactness immediately on both CPU and CUDA.
+  - Root cause:
+    - accepted seq `0` tokens are still carried forward in sparse speculative cells
+    - naive fixed slot reuse collides with those sparse accepted cells on later passes
+    - so explicit slot binding for the compact verifier must wait until accepted-path compaction / commit exists
+  - The failed experiment was reverted before proceeding.
+- Greedy exactness check:
+  - inherited exact compact path remains the same as Step 1
+  - CPU baseline vs CPU EAGLE: identical
+  - CUDA baseline vs CUDA EAGLE: identical
+  - CPU/CUDA EAGLE outputs identical to each other
+- First-token Kestrel parity check:
+  - unchanged from Step 1 because this step made no behavior change in the accepted implementation
+
+Step result:
+- Step 2 is satisfied by the inherited compact verifier design on this branch.
+- Explicit `kv_slot` use in the compact verifier is deferred until Step 5, where accepted-path compaction/commit can make slot reuse safe.
+- Summary numbers for this step:
+  - first-token KL divergence vs Kestrel:
+    - CPU `0.0001017`
+    - CUDA `0.0003182`
+  - CUDA EAGLE decode throughput:
+    - standardized 1B perf check: `216.607 tok/s`
+    - matching baseline: `451.740 tok/s`
 
 ### Step 3. Keep compact tree metadata GPU-native
 
