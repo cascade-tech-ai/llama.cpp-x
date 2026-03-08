@@ -156,9 +156,10 @@ struct common_speculative_state {
 
     virtual void accept(uint16_t n_accepted) = 0;
 
-    virtual void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id) {
+    virtual void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id, const common_speculative_tree * tree) {
         GGML_UNUSED(ids);
         GGML_UNUSED(seq_id);
+        GGML_UNUSED(tree);
     }
 
     virtual bool get_tree(common_speculative_tree & out) const {
@@ -1223,7 +1224,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         GGML_UNUSED(n_accepted);
     }
 
-    void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id) override {
+    void accept_tokens(const llama_tokens & ids, llama_seq_id seq_id, const common_speculative_tree * tree) override {
         if (seq_id != active_seq_id || ids.empty() || !has_last_root_state) {
             return;
         }
@@ -1275,7 +1276,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             if ((size_t) deepest >= last_tree_states.size()) {
                 return;
             }
-            const size_t row_idx = (size_t) last_tree.batch_start + (size_t) deepest;
+            size_t row_idx = (size_t) last_tree.batch_start + (size_t) deepest;
+            if (tree != nullptr && tree->row_indices.size() == last_tree.tokens.size()) {
+                row_idx = tree->row_indices[(size_t) deepest];
+            }
             if (row_idx >= n_tokens) {
                 return;
             }
@@ -2309,13 +2313,17 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
     impl->accept(n_accepted);
 }
 
-void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & ids, llama_seq_id seq_id) {
+void common_speculative_accept_tokens(
+        common_speculative * spec,
+        const llama_tokens & ids,
+        llama_seq_id seq_id,
+        const common_speculative_tree * tree) {
     if (spec == nullptr || spec->curr_impl == nullptr || ids.empty()) {
         return;
     }
 
     common_speculative_state * impl = spec->curr_impl;
-    impl->accept_tokens(ids, seq_id);
+    impl->accept_tokens(ids, seq_id, tree);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

@@ -62,7 +62,11 @@ bool common_speculative_get_tree(common_speculative * spec, common_speculative_t
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // informs the speculative decoder of the exact accepted token sequence for the most recent tree pass
-void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & ids, llama_seq_id seq_id = 0);
+void common_speculative_accept_tokens(
+        common_speculative * spec,
+        const llama_tokens & ids,
+        llama_seq_id seq_id = 0,
+        const common_speculative_tree * tree = nullptr);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

@@ -1460,6 +1460,9 @@ void common_batch_add(
 
     batch.token   [batch.n_tokens] = id;
     batch.pos     [batch.n_tokens] = pos;
+    if (batch.kv_idx) {
+        batch.kv_idx[batch.n_tokens] = UINT32_MAX;
+    }
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
     for (size_t i = 0; i < seq_ids.size(); ++i) {
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];

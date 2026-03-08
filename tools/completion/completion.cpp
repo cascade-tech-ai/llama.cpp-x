@@ -700,6 +700,7 @@ int main(int argc, char ** argv) {
                         /* .n_nodes     = */ tree.tokens.size(),
                         /* .parent      = */ tree.parents.data(),
                         /* .batch_start = */ tree.batch_start,
+                        /* .row_indices = */ nullptr,
                     };
                     llama_set_kq_mask_tree(ctx, &mask);
                 } else {

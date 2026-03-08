@@ -219,6 +219,7 @@ bool llama_batch_allocr::init(
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
             /*.pos          =*/ batch.pos,
+            /*.kv_idx       =*/ batch.kv_idx,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
@@ -399,6 +400,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->token     .resize(n_tokens);
     udata->embd      .clear();
     udata->pos       .resize(n_tokens);
+    udata->kv_idx    .resize(n_tokens, UINT32_MAX);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
@@ -421,6 +423,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
         /*.pos          =*/ udata->pos.data(),
+        /*.kv_idx       =*/ udata->kv_idx.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
@@ -656,6 +659,7 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     pos       .clear();
+    kv_idx    .clear();
     n_seq_id  .clear();
     seq_id    .clear();
     seq_id_unq.clear();
@@ -689,6 +693,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->token     .resize(n_tokens);
     udata->embd      .resize(n_embd_all);
     udata->pos       .resize(n_pos_all);
+    udata->kv_idx    .resize(n_tokens, UINT32_MAX);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
@@ -717,6 +722,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->pos[j*n_tokens + i] = batch.pos[src_off + idxs[i]];
         }
 
+        if (batch.kv_idx) {
+            udata->kv_idx[i] = batch.kv_idx[idxs[i]];
+        }
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
 
@@ -756,6 +764,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
+        /*.kv_idx       =*/ udata->kv_idx.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
@@ -866,6 +875,7 @@ struct llama_batch llama_batch_get_one(
         /*tokens   =*/ tokens,
         /*embd     =*/ nullptr,
         /*pos      =*/ nullptr,
+        /*kv_idx   =*/ nullptr,
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
@@ -878,6 +888,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*tokens   =*/ nullptr,
         /*embd     =*/ nullptr,
         /*pos      =*/ nullptr,
+        /*kv_idx   =*/ nullptr,
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
@@ -906,6 +917,7 @@ void llama_batch_free(struct llama_batch batch) {
     if (batch.token)    free(batch.token);
     if (batch.embd)     free(batch.embd);
     if (batch.pos)      free(batch.pos);
+    if (batch.kv_idx)   free(batch.kv_idx);
     if (batch.n_seq_id) free(batch.n_seq_id);
     if (batch.seq_id) {
         for (int i = 0; batch.seq_id[i] != nullptr; ++i) {

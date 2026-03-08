@@ -236,6 +236,7 @@ extern "C" {
         llama_token  *  token;
         float        *  embd;
         llama_pos    *  pos;
+        uint32_t     *  kv_idx;   // optional explicit KV cache cell index per token; UINT32_MAX = auto-select
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
@@ -1063,6 +1064,7 @@ extern "C" {
         size_t       n_nodes;
         const int32_t * parent;
         uint32_t     batch_start;
+        const uint32_t * row_indices; // optional explicit batch row per node; defaults to batch_start + node
     };
 
     // Apply a tree mask override for the next decode call.

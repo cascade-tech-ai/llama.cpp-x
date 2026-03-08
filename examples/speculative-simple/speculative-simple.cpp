@@ -47,6 +47,14 @@ struct scoped_prof {
     }
 };
 
+static std::string tokens_to_debug_string(llama_context * ctx, const llama_tokens & toks) {
+    std::string out;
+    for (llama_token tok : toks) {
+        out += common_token_to_piece(ctx, tok);
+    }
+    return out;
+}
+
 static int32_t find_tree_token(const common_speculative_tree & tree, const std::vector<int32_t> & nodes, llama_token tok) {
     for (int32_t node : nodes) {
         if (tree.tokens[(size_t) node] == tok) {
@@ -130,6 +138,8 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
     auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
     const bool profile_spec = std::getenv("CASCADE_SPEC_PROFILE") != nullptr;
+    const bool trace_spec   = std::getenv("CASCADE_SPEC_TRACE") != nullptr;
+    const bool rebuild_tree_accept = std::getenv("CASCADE_TREE_REBUILD_ACCEPTED") != nullptr;
 
     // load the draft model (non-eagle3)
     llama_model_ptr model_dft;
@@ -267,6 +277,10 @@ int main(int argc, char ** argv) {
     common_speculative_begin(spec, prompt_tgt, 0);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    batch_tgt.kv_idx = (uint32_t *) malloc(sizeof(uint32_t) * llama_n_batch(ctx_tgt));
+    for (uint32_t i = 0; i < llama_n_batch(ctx_tgt); ++i) {
+        batch_tgt.kv_idx[i] = UINT32_MAX;
+    }
 
     const auto t_enc_end = ggml_time_us();
 
@@ -320,17 +334,32 @@ int main(int argc, char ** argv) {
 
             if (use_tree) {
                 common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
+                batch_tgt.kv_idx[batch_tgt.n_tokens - 1] = (uint32_t) n_past_before;
                 tree.row_indices.resize(tree.tokens.size());
-                for (size_t i = 0; i < tree.tokens.size(); ++i) {
-                    const llama_pos pos = n_past + tree.depths[i];
-                    tree.row_indices[i] = batch_tgt.n_tokens;
-                    common_batch_add(batch_tgt, tree.tokens[i], pos, { 0 }, true);
+                std::vector<uint32_t> node_order(tree.tokens.size());
+                for (uint32_t i = 0; i < node_order.size(); ++i) {
+                    node_order[i] = i;
+                }
+                std::stable_sort(node_order.begin(), node_order.end(), [&](uint32_t a, uint32_t b) {
+                    const int32_t da = tree.depths[a];
+                    const int32_t db = tree.depths[b];
+                    if (da != db) {
+                        return da < db;
+                    }
+                    return a < b;
+                });
+                for (uint32_t node : node_order) {
+                    const llama_pos pos = n_past + tree.depths[node];
+                    tree.row_indices[node] = batch_tgt.n_tokens;
+                    common_batch_add(batch_tgt, tree.tokens[node], pos, { 0 }, true);
+                    batch_tgt.kv_idx[batch_tgt.n_tokens - 1] = (uint32_t) (n_past_before + 1 + node);
                 }
 
                 const llama_kq_mask_tree mask = {
                     /* .n_nodes     = */ tree.tokens.size(),
                     /* .parent      = */ tree.parents.data(),
                     /* .batch_start = */ tree.batch_start,
+                    /* .row_indices = */ tree.row_indices.data(),
                 };
                 llama_set_kq_mask_tree(ctx_tgt, &mask);
             } else {
@@ -405,9 +434,21 @@ int main(int argc, char ** argv) {
                     ids_limited.size() - 1,
                     use_tree ? 1 : 0);
         }
+        if (trace_spec) {
+            std::fprintf(stderr,
+                    "spec trace: pass=%d n_past_before=%d use_tree=%d id_last=%d('%s') draft=%zu accepted=%zu out=\"%s\"\n",
+                    pass_idx,
+                    n_past_before,
+                    use_tree ? 1 : 0,
+                    (int) id_last,
+                    common_token_to_piece(ctx_tgt, id_last).c_str(),
+                    draft.size(),
+                    ids_limited.size(),
+                    tokens_to_debug_string(ctx_tgt, ids_limited).c_str());
+        }
 
         if (use_tree) {
-            common_speculative_accept_tokens(spec, ids_limited, 0);
+            common_speculative_accept_tokens(spec, ids_limited, 0, &tree);
         }
         common_speculative_accept(spec, ids_limited.size() - 1);
 
@@ -435,6 +476,26 @@ int main(int argc, char ** argv) {
             if (!reject_slots.empty() && !llama_memory_kv_idx_rm(mem, reject_slots.data(), reject_slots.size())) {
                 LOG_ERR("%s: failed to remove rejected EAGLE KV slots\n", __func__);
                 return 1;
+            }
+        }
+
+        if (use_tree && rebuild_tree_accept) {
+            auto * mem = llama_get_memory(ctx_tgt);
+            llama_memory_seq_rm(mem, 0, n_past_before, -1);
+
+            llama_tokens rebuild;
+            rebuild.reserve(ids_limited.size());
+            rebuild.push_back(id_last);
+            if (ids_limited.size() > 1) {
+                rebuild.insert(rebuild.end(), ids_limited.begin(), ids_limited.end() - 1);
+            }
+
+            if (!rebuild.empty()) {
+                llama_batch batch_rebuild = llama_batch_get_one(rebuild.data(), rebuild.size());
+                if (llama_decode(ctx_tgt, batch_rebuild) != 0) {
+                    LOG_ERR("%s: failed to rebuild accepted compact-tree tokens\n", __func__);
+                    return 1;
+                }
             }
         }
 
@@ -467,9 +528,7 @@ int main(int argc, char ** argv) {
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
-            if (!use_tree) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
-            }
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
             if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
                 llama_eagle3_trim_seq(ctx_tgt, 0, n_past);
             }

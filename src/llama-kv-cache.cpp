@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_kv_cache
@@ -834,6 +835,33 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ubatch.kv_idx) {
+            GGML_ASSERT(n_stream == 1 && "explicit kv_idx is currently only supported for a single KV stream");
+
+            bool any_explicit = false;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                any_explicit = any_explicit || ubatch.kv_idx[s*n_tokens + i] != UINT32_MAX;
+            }
+
+            if (!any_explicit) {
+                // fall through to normal slot search
+            } else {
+            std::unordered_set<uint32_t> seen;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t idx = ubatch.kv_idx[s*n_tokens + i];
+                if (idx == UINT32_MAX || idx >= cells.size() || !seen.insert(idx).second || !cells.is_empty(idx)) {
+                    LLAMA_LOG_ERROR("%s: explicit kv_idx[%u] = %u invalid (size=%u dup=%d empty=%d)\n",
+                            __func__, i, idx, cells.size(),
+                            idx != UINT32_MAX ? (seen.count(idx) > 0 ? 1 : 0) : 0,
+                            idx < cells.size() ? (cells.is_empty(idx) ? 1 : 0) : 0);
+                    return { };
+                }
+                res.idxs[s].push_back(idx);
+            }
+            continue;
+            }
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1493,7 +1521,7 @@ static void apply_tree_kq_mask_override(
     std::vector<uint32_t> row_idx(n_nodes, UINT32_MAX);
 
     for (uint32_t i = 0; i < n_nodes; ++i) {
-        const uint32_t ubatch_idx = batch_start + i;
+        const uint32_t ubatch_idx = tree.row_indices ? tree.row_indices[i] : (batch_start + i);
         const uint32_t stream = ubatch_idx / n_tps;
         const uint32_t ii = ubatch_idx % n_tps;
         if (stream >= n_stream) {
