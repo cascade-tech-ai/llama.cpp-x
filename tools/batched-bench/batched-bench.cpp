@@ -82,6 +82,7 @@ int main(int argc, char ** argv) {
                 batch.token    + i,
                 nullptr,
                 batch.pos      + i,
+                batch.kv_slot  ? batch.kv_slot + i : nullptr,
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
                 batch.logits   + i,

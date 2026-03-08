@@ -236,6 +236,7 @@ extern "C" {
         llama_token  *  token;
         float        *  embd;
         llama_pos    *  pos;
+        int32_t      *  kv_slot;  // optional explicit KV cache slot index per token; null = allocator decides
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
