@@ -43,6 +43,45 @@ Build a compact-tree EAGLE3 pipeline with:
 6. Exact greedy output equivalence with non-speculative decoding.
 7. Preserved first-token parity against the Kestrel reference dump.
 
+## Proposal-Generation Priority
+
+The next optimization focus is proposal generation, not verifier micro-optimizations.
+
+Reason:
+- current profiles show proposal generation is still a major hot path
+- the biggest unique EAGLE-specific GPU->CPU round-trip is in per-depth proposal selection
+- target verification is architecturally important, but it is not obviously the dominant wall-time cost today
+
+Line of sight:
+- yes, there is a clear path to making proposal generation fully GPU-side
+- the problem is bounded by fixed runtime limits:
+  - `max_proposals = 16`
+  - `beam_width = 8`
+  - `max_depth = 7`
+- that gives us a small fixed-capacity rollout arena
+- the main work is removing the remaining host ownership of:
+  - selected expansion results
+  - active frontier bookkeeping
+  - compact tree growth
+
+Confidence:
+- moderate to high on the architecture
+- moderate on exact implementation details
+- the main technical risk is not mathematical correctness of the rollout itself
+- the risk is fitting the rollout into static reusable ggml graphs without reintroducing numerical drift or hidden host syncs
+
+The concrete target is:
+1. keep all proposal frontier/state tensors on device
+2. keep per-depth selection results on device
+3. grow the compact tree from device data, not host vectors
+4. run all rollout depths inside a fixed-capacity reusable runner
+5. only expose compact tree metadata to the verifier/commit path
+
+This should make proposal generation:
+- fully GPU-side
+- graph-reusable
+- much closer to one captured CUDA graph for the entire speculative iteration
+
 ## Required Verification At Every Stopping Point
 
 After each implementation step below, run all of these checks before moving on.
@@ -99,6 +138,138 @@ Standardized 1B perf check:
 Do not proceed to the next step with broken greedy exactness unless the step is explicitly checkpointed as failed work on another branch.
 
 ## Implementation Plan
+
+### Proposal Step P1. Expose selection results as device-resident outputs
+
+Goal:
+- stop treating `select_state_batch()` as a host-returning API
+
+Deliverable:
+- device-side access to:
+  - selected linear indices
+  - selected draft token ids
+  - selected logprobs
+
+Design:
+- keep the existing host API for compatibility and verification
+- add a device/result view API that returns the live selection tensors from the reusable graph
+- no behavior change in the rollout yet
+
+Why:
+- this is the first hard boundary between the GPU rollout and host tree growth
+- removing this abstraction mismatch is necessary before the rollout can stay on device
+
+Verification gate:
+- All required checks A/B/C.
+
+Status:
+- completed
+
+Verification notes:
+- 2026-03-08:
+  - Added a device-result API for `llama_eagle3_select_state_batch()`:
+    - [llama-eagle3.h](/home/alvion/projects/llama.cpp-x/src/llama-eagle3.h)
+    - [llama-eagle3.cpp](/home/alvion/projects/llama.cpp-x/src/llama-eagle3.cpp)
+  - New API:
+    - returns the live device tensors for:
+      - selected linear indices
+      - selected draft token ids
+      - selected logprobs
+    - does not copy those arrays back to host
+  - The existing host-returning API remains unchanged and is still the active rollout path.
+  - This step intentionally changes abstraction only, not rollout behavior.
+- Greedy exactness check:
+  - CPU baseline vs CPU EAGLE: identical
+  - CUDA baseline vs CUDA EAGLE: identical
+  - CPU/CUDA EAGLE outputs identical to each other
+  - Logs:
+    - `/tmp/cpu_none_p1.log`
+    - `/tmp/cpu_eagle_p1.log`
+    - `/tmp/cuda_none_p1.log`
+    - `/tmp/cuda_eagle_p1.log`
+- First-token Kestrel parity:
+  - unchanged by construction
+  - this step does not alter target hidden capture, verifier behavior, or draft math
+  - it only exposes existing select outputs in a device-resident form for later rollout changes
+- Step result:
+  - selection results no longer have to be modeled as host vectors
+  - this is the first API step needed to keep proposal generation entirely on device
+  - no exactness regression
+  - no meaningful throughput change
+  - Summary numbers for this step:
+    - first-token KL divergence vs Kestrel:
+      - CPU `0.0001017`
+      - CUDA `0.0003182`
+    - CUDA EAGLE decode throughput:
+      - standardized 1B perf check: `223.926 tok/s`
+      - matching baseline: unchanged from prior standardized runs
+    - Perf logs:
+      - `/tmp/eagle1b_p1_perf.log`
+      - `/tmp/eagle1b_p1_perf_rerun.log`
+
+### Proposal Step P2. Keep the active frontier and beam logprobs on device
+
+Goal:
+- stop rebuilding the active beam frontier as host vectors each depth
+
+Deliverable:
+- fixed-capacity device buffers for:
+  - active parent indices
+  - beam logprobs
+  - candidate input ids
+
+Why:
+- host frontier rebuilds force per-depth orchestration and make graph reuse harder
+
+Verification gate:
+- All required checks A/B/C.
+
+Status:
+- not started
+
+### Proposal Step P3. Build compact tree metadata from device-selected expansions
+
+Goal:
+- stop building `all_nodes` and the compact tree entirely on the host
+
+Deliverable:
+- compact tree metadata generated from selected device expansions
+- fixed-capacity buffers for:
+  - token
+  - parent
+  - depth
+  - child/sibling links
+  - active mask
+
+Why:
+- this is the point where the rollout stops round-tripping through host vectors
+
+Verification gate:
+- All required checks A/B/C.
+
+Status:
+- not started
+
+### Proposal Step P4. Make the full rollout runner static and reusable
+
+Goal:
+- one reusable rollout runner for root + all depth steps
+
+Deliverable:
+- fixed-capacity rollout buffers for the configured limits
+- graph reuse after first build for:
+  - root step
+  - select
+  - batch step
+
+Why:
+- proposal generation only becomes worth capturing once shapes stop varying by pass
+
+Verification gate:
+- All required checks A/B/C.
+
+Status:
+- not started
 
 ### Step 1. Add explicit speculative KV slot control
 

@@ -231,6 +231,16 @@ struct llama_eagle3_runtime {
     mutable llama_eagle3_step_batch_graph step_batch_graph;
 };
 
+struct llama_eagle3_select_batch_device_result {
+    ggml_backend_t backend = nullptr; // non-owning
+    const ggml_tensor * t_selected_linear = nullptr;
+    const ggml_tensor * t_selected_draft = nullptr;
+    const ggml_tensor * t_selected_logprob = nullptr;
+    int32_t n_beams = 0;
+    int32_t k = 0;
+    int32_t n_select = 0;
+};
+
 llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & err);
 void llama_eagle3_free(llama_eagle3_model * model);
 
@@ -298,6 +308,14 @@ bool llama_eagle3_select_state_batch(
         std::vector<int32_t> & selected_linear_out,
         std::vector<int32_t> & selected_draft_idx_out,
         std::vector<float> & selected_logprob_out);
+
+bool llama_eagle3_select_state_batch_device(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        llama_eagle3_select_batch_device_result & out);
 
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state);
 bool llama_eagle3_state_get_hidden(
