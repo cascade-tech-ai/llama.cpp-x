@@ -951,8 +951,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 beam_states[(size_t) beam_idx] = &beams_cur[(size_t) beam_idx].state;
             }
 
-            std::vector<int32_t> selected_linear;
-            std::vector<int32_t> selected_draft_idx;
+            std::vector<int32_t> selected_parent_slot;
+            std::vector<int32_t> selected_base_idx;
             std::vector<float> selected_logprob;
             double depth_select_gpu = 0.0;
             {
@@ -964,16 +964,71 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
                 }
 #endif
-                const bool ok = llama_eagle3_select_state_slots(
-                        *model,
-                        rt,
-                        beam_states,
-                        active_cur,
-                        beam_logprob_cur,
-                        k,
-                        selected_linear,
-                        selected_draft_idx,
-                        selected_logprob);
+                bool ok = false;
+#if defined(GGML_USE_CUDA)
+                if (rt.backend_compute && ggml_backend_is_cuda(rt.backend_compute.get())) {
+                    llama_eagle3_select_batch_device_result device_out;
+                    ok = llama_eagle3_select_state_slots_device(
+                            *model,
+                            rt,
+                            beam_states,
+                            active_cur,
+                            beam_logprob_cur,
+                            k,
+                            device_out);
+                    if (ok) {
+                        selected_parent_slot.resize((size_t) device_out.n_select);
+                        selected_base_idx.resize((size_t) device_out.n_select);
+                        selected_logprob.resize((size_t) device_out.n_select);
+
+                        ggml_backend_tensor_get_async(
+                                rt.backend_compute.get(),
+                                const_cast<ggml_tensor *>(device_out.t_selected_parent),
+                                selected_parent_slot.data(),
+                                0,
+                                selected_parent_slot.size() * sizeof(int32_t));
+                        ggml_backend_tensor_get_async(
+                                rt.backend_compute.get(),
+                                const_cast<ggml_tensor *>(device_out.t_selected_base),
+                                selected_base_idx.data(),
+                                0,
+                                selected_base_idx.size() * sizeof(int32_t));
+                        ggml_backend_tensor_get_async(
+                                rt.backend_compute.get(),
+                                const_cast<ggml_tensor *>(device_out.t_selected_logprob),
+                                selected_logprob.data(),
+                                0,
+                                selected_logprob.size() * sizeof(float));
+                        ggml_backend_synchronize(rt.backend_compute.get());
+                    }
+                } else
+#endif
+                {
+                    std::vector<int32_t> selected_linear;
+                    std::vector<int32_t> selected_draft_idx;
+                    ok = llama_eagle3_select_state_slots(
+                            *model,
+                            rt,
+                            beam_states,
+                            active_cur,
+                            beam_logprob_cur,
+                            k,
+                            selected_linear,
+                            selected_draft_idx,
+                            selected_logprob);
+                    if (ok) {
+                        selected_parent_slot.resize(selected_linear.size());
+                        selected_base_idx.resize(selected_draft_idx.size());
+                        for (size_t i = 0; i < selected_linear.size(); ++i) {
+                            const int32_t linear = selected_linear[i];
+                            const int32_t draft_idx = selected_draft_idx[i];
+                            selected_parent_slot[i] = linear >= 0 ? linear / k : -1;
+                            selected_base_idx[i] = (draft_idx >= 0 && draft_idx < model->hparams.draft_vocab_size)
+                                    ? draft_idx + model->d2t[draft_idx]
+                                    : -1;
+                        }
+                    }
+                }
 #if defined(GGML_USE_CUDA)
                 if (profile_gpu) {
                     depth_select_gpu = ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
@@ -994,14 +1049,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 
             const int64_t t_scoring_start = ggml_time_us();
-            for (size_t rank = 0; rank < selected_linear.size(); ++rank) {
-                const int32_t linear = selected_linear[rank];
-                const int32_t draft_idx = selected_draft_idx[rank];
-                if (linear < 0 || draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
+            for (size_t rank = 0; rank < selected_parent_slot.size(); ++rank) {
+                const int32_t parent_slot = selected_parent_slot[rank];
+                const int32_t base_id = selected_base_idx[rank];
+                if (parent_slot < 0 || base_id < 0 || base_id >= model->hparams.vocab_size) {
                     continue;
                 }
 
-                const int32_t parent_slot = linear / k;
                 if (parent_slot < 0 || parent_slot >= beam_width) {
                     continue;
                 }
@@ -1012,7 +1066,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 }
                 const float total_logprob = selected_logprob[rank];
                 const float prob = std::exp(total_logprob - beam_logprob_cur[beam_idx]);
-                const int32_t base_id = draft_idx + model->d2t[draft_idx];
                 const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
 
                 if (verbose) {

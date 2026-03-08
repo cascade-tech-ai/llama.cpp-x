@@ -184,8 +184,11 @@ struct llama_eagle3_select_batch_graph {
 
     ggml_tensor * t_hidden            = nullptr; // [hidden_size, n_beams]
     ggml_tensor * t_beam_logprob      = nullptr; // [n_beams]
+    ggml_tensor * t_d2t               = nullptr; // [draft_vocab_size]
     ggml_tensor * t_selected_linear   = nullptr; // [n_select, 1]
+    ggml_tensor * t_selected_parent   = nullptr; // [n_select, 1]
     ggml_tensor * t_selected_draft    = nullptr; // [n_select, 1]
+    ggml_tensor * t_selected_base     = nullptr; // [n_select, 1]
     ggml_tensor * t_selected_logprob  = nullptr; // [n_select, 1]
 
     std::vector<ggml_tensor *> t_hidden_cols; // [n_beams], each [hidden_size, 1]
@@ -234,7 +237,9 @@ struct llama_eagle3_runtime {
 struct llama_eagle3_select_batch_device_result {
     ggml_backend_t backend = nullptr; // non-owning
     const ggml_tensor * t_selected_linear = nullptr;
+    const ggml_tensor * t_selected_parent = nullptr;
     const ggml_tensor * t_selected_draft = nullptr;
+    const ggml_tensor * t_selected_base = nullptr;
     const ggml_tensor * t_selected_logprob = nullptr;
     int32_t n_beams = 0;
     int32_t k = 0;

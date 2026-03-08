@@ -821,6 +821,10 @@ bool build_select_batch_graph(
     t_selected_linear = ggml_cont(ctx.get(), t_selected_linear);
     ggml_tensor * t_selected_linear_flat = ggml_reshape_1d(ctx.get(), t_selected_linear, n_select);
     t_selected_linear_flat = ggml_cont(ctx.get(), t_selected_linear_flat);
+    ggml_tensor * t_selected_linear_f = ggml_cast(ctx.get(), t_selected_linear_flat, GGML_TYPE_F32);
+    ggml_tensor * t_selected_parent_f = ggml_scale(ctx.get(), t_selected_linear_f, 1.0f / float(k));
+    ggml_tensor * t_selected_parent = ggml_cast(ctx.get(), t_selected_parent_f, GGML_TYPE_I32);
+    t_selected_parent = ggml_cont(ctx.get(), t_selected_parent);
 
     ggml_tensor * t_total_rows = ggml_reshape_2d(ctx.get(), t_total, 1, k * n_beams);
     ggml_tensor * t_selected_logprob = ggml_get_rows(ctx.get(), t_total_rows, t_selected_linear_flat);
@@ -832,10 +836,21 @@ bool build_select_batch_graph(
     t_selected_draft_f = ggml_reshape_2d(ctx.get(), t_selected_draft_f, n_select, 1);
     ggml_tensor * t_selected_draft = ggml_cast(ctx.get(), t_selected_draft_f, GGML_TYPE_I32);
     t_selected_draft = ggml_cont(ctx.get(), t_selected_draft);
+    ggml_tensor * t_selected_draft_flat = ggml_reshape_1d(ctx.get(), t_selected_draft, n_select);
+    t_selected_draft_flat = ggml_cont(ctx.get(), t_selected_draft_flat);
+
+    ggml_tensor * t_d2t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, hp.draft_vocab_size);
+    ggml_set_name(t_d2t, "eagle3.d2t");
+    ggml_tensor * t_selected_offset = ggml_get_rows(ctx.get(), t_d2t, t_selected_draft_flat);
+    t_selected_offset = ggml_reshape_1d(ctx.get(), t_selected_offset, n_select);
+    ggml_tensor * t_selected_base = ggml_add(ctx.get(), t_selected_draft_flat, t_selected_offset);
+    t_selected_base = ggml_cont(ctx.get(), t_selected_base);
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_selected_linear);
+    ggml_build_forward_expand(gf, t_selected_parent);
     ggml_build_forward_expand(gf, t_selected_draft);
+    ggml_build_forward_expand(gf, t_selected_base);
     ggml_build_forward_expand(gf, t_selected_logprob);
 
     ggml_backend_buffer_ptr buf_compute;
@@ -846,6 +861,8 @@ bool build_select_batch_graph(
         return false;
     }
 
+    ggml_backend_tensor_set(t_d2t, model.d2t.data(), 0, (size_t) hp.draft_vocab_size * sizeof(int32_t));
+
     graph.ctx = std::move(ctx);
     graph.buf_compute = std::move(buf_compute);
     graph.gf = gf;
@@ -854,8 +871,11 @@ bool build_select_batch_graph(
     graph.n_select = n_select;
     graph.t_hidden = t_hidden;
     graph.t_beam_logprob = t_beam_logprob;
+    graph.t_d2t = t_d2t;
     graph.t_selected_linear = t_selected_linear;
+    graph.t_selected_parent = t_selected_parent;
     graph.t_selected_draft = t_selected_draft;
+    graph.t_selected_base = t_selected_base;
     graph.t_selected_logprob = t_selected_logprob;
     graph.t_hidden_cols = std::move(t_hidden_cols);
     return true;
@@ -2329,7 +2349,9 @@ bool llama_eagle3_select_state_batch_device(
 
     out.backend = rt.backend_compute.get();
     out.t_selected_linear = graph.t_selected_linear;
+    out.t_selected_parent = graph.t_selected_parent;
     out.t_selected_draft = graph.t_selected_draft;
+    out.t_selected_base = graph.t_selected_base;
     out.t_selected_logprob = graph.t_selected_logprob;
     out.n_beams = n_beams;
     out.k = k;
@@ -2412,7 +2434,9 @@ bool llama_eagle3_select_state_slots_device(
 
     out.backend = rt.backend_compute.get();
     out.t_selected_linear = graph.t_selected_linear;
+    out.t_selected_parent = graph.t_selected_parent;
     out.t_selected_draft = graph.t_selected_draft;
+    out.t_selected_base = graph.t_selected_base;
     out.t_selected_logprob = graph.t_selected_logprob;
     out.n_beams = n_beams;
     out.k = k;
