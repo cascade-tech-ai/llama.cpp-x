@@ -225,7 +225,57 @@ Verification gate:
 - All required checks A/B/C.
 
 Status:
-- not started
+- completed
+
+Verification notes:
+- 2026-03-08:
+  - Reworked the rollout loop in [speculative.cpp](/home/alvion/projects/llama.cpp-x/common/speculative.cpp) to use fixed beam slots plus an active mask instead of compacting `active_beam_idx` / `active_states` host vectors every depth.
+  - Added slot-aware selection APIs in:
+    - [llama-eagle3.h](/home/alvion/projects/llama.cpp-x/src/llama-eagle3.h)
+    - [llama-eagle3.cpp](/home/alvion/projects/llama.cpp-x/src/llama-eagle3.cpp)
+  - New behavior:
+    - selection always runs over a fixed `beam_width` slot set
+    - inactive beams are masked out instead of removed from the frontier
+    - parent slot indices now remain stable across rollout depths
+  - Important CUDA fix:
+    - using literal `-inf` for inactive beam logprobs in the select graph degraded ranking badly on CUDA
+    - replaced with a large finite negative sentinel (`-1e30f`)
+    - this restored CUDA proposal quality close to the CPU path
+- Greedy exactness check:
+  - CPU baseline vs CPU EAGLE: identical
+  - CUDA baseline vs CUDA EAGLE: identical
+  - CPU/CUDA EAGLE outputs identical to each other
+  - Stdout-only exactness artifacts:
+    - `/tmp/cpu_none_p2.out`
+    - `/tmp/cpu_eagle_p2.out`
+    - `/tmp/cuda_none_p2.out`
+    - `/tmp/cuda_eagle_p2.out`
+  - Stderr/perf artifacts:
+    - `/tmp/cpu_none_p2.err`
+    - `/tmp/cpu_eagle_p2.err`
+    - `/tmp/cuda_none_p2.err`
+    - `/tmp/cuda_eagle_p2.err`
+- First-token Kestrel parity:
+  - unchanged by construction
+  - this step changes proposal frontier bookkeeping and select invocation shape only
+  - it does not alter:
+    - target hidden capture
+    - target verifier semantics
+    - root draft step math
+    - first-token logits extraction
+- Step result:
+  - the host no longer compacts the active frontier before every select call
+  - proposal selection now has a fixed beam-slot layout, which is the right shape for later graph/static-runner work
+  - beam logprobs are still mirrored on host for now, but the frontier shape is no longer host-compacted
+  - Summary numbers for this step:
+    - first-token KL divergence vs Kestrel:
+      - CPU `0.0001017`
+      - CUDA `0.0003182`
+    - CUDA EAGLE decode throughput:
+      - standardized 1B perf check: `182.359 tok/s`
+      - matching baseline: `361.465 tok/s`
+    - Perf logs:
+      - `/tmp/eagle1b_p2_perf_fix.log`
 
 ### Proposal Step P3. Build compact tree metadata from device-selected expansions
 

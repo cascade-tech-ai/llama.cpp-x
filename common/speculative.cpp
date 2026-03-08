@@ -892,6 +892,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             ? std::min(params.eagle_beam_width, max_proposals)
             : max_proposals;
         const float prob_threshold = params.eagle_prob_threshold;
+        const float inactive_beam_logprob = -1e30f;
 
         struct beam_state {
             float logprob = 0.0f;
@@ -907,8 +908,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         std::vector<beam_state> beams_a((size_t) std::max(1, beam_width));
         std::vector<beam_state> beams_b((size_t) std::max(1, beam_width));
-        int32_t n_beams = 1;
+        std::vector<uint8_t> active_a((size_t) std::max(1, beam_width), 0);
+        std::vector<uint8_t> active_b((size_t) std::max(1, beam_width), 0);
+        std::vector<float> beam_logprob_a((size_t) std::max(1, beam_width), inactive_beam_logprob);
+        std::vector<float> beam_logprob_b((size_t) std::max(1, beam_width), inactive_beam_logprob);
         beams_a[0] = {0.0f, {}, root_state};
+        active_a[0] = 1;
+        beam_logprob_a[0] = 0.0f;
 
         struct proposal_path {
             float logprob = 0.0f;
@@ -921,35 +927,28 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         for (int depth = 0; depth < max_depth; ++depth) {
             auto & beams_cur = (depth & 1) ? beams_b : beams_a;
             auto & beams_nxt = (depth & 1) ? beams_a : beams_b;
+            auto & active_cur = (depth & 1) ? active_b : active_a;
+            auto & active_nxt = (depth & 1) ? active_a : active_b;
+            auto & beam_logprob_cur = (depth & 1) ? beam_logprob_b : beam_logprob_a;
+            auto & beam_logprob_nxt = (depth & 1) ? beam_logprob_a : beam_logprob_b;
 
             std::vector<beam_expansion> expansions;
-            expansions.reserve((size_t) n_beams * (size_t) beam_width);
-            depth_active_beams.push_back(n_beams);
+            expansions.reserve((size_t) beam_width * (size_t) beam_width);
+
+            int32_t n_active = 0;
+            for (uint8_t active : active_cur) {
+                n_active += active ? 1 : 0;
+            }
+            depth_active_beams.push_back(n_active);
 
             const int k = std::min<int>(beam_width, model->hparams.draft_vocab_size);
-            if (k <= 0) {
+            if (k <= 0 || n_active == 0) {
                 break;
             }
 
-            std::vector<size_t> active_beam_idx;
-            std::vector<const llama_eagle3_state *> active_states;
-            active_beam_idx.reserve((size_t) n_beams);
-            active_states.reserve((size_t) n_beams);
-            for (int32_t beam_idx = 0; beam_idx < n_beams; ++beam_idx) {
-                if (!llama_eagle3_state_has_hidden(beams_cur[(size_t) beam_idx].state)) {
-                    continue;
-                }
-                active_beam_idx.push_back((size_t) beam_idx);
-                active_states.push_back(&beams_cur[(size_t) beam_idx].state);
-            }
-            if (active_states.empty()) {
-                break;
-            }
-
-            std::vector<float> active_logprob;
-            active_logprob.reserve(active_beam_idx.size());
-            for (size_t beam_idx : active_beam_idx) {
-                active_logprob.push_back(beams_cur[beam_idx].logprob);
+            std::vector<const llama_eagle3_state *> beam_states((size_t) beam_width);
+            for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+                beam_states[(size_t) beam_idx] = &beams_cur[(size_t) beam_idx].state;
             }
 
             std::vector<int32_t> selected_linear;
@@ -965,11 +964,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/select_state_batch");
                 }
 #endif
-                const bool ok = llama_eagle3_select_state_batch(
+                const bool ok = llama_eagle3_select_state_slots(
                         *model,
                         rt,
-                        active_states,
-                        active_logprob,
+                        beam_states,
+                        active_cur,
+                        beam_logprob_cur,
                         k,
                         selected_linear,
                         selected_draft_idx,
@@ -988,6 +988,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 depth_select_ms.push_back(depth_select);
 #if defined(GGML_USE_CUDA)
                 depth_select_gpu_ms.push_back(depth_select_gpu);
+#else
+                GGML_UNUSED(depth_select_gpu);
 #endif
             }
 
@@ -999,15 +1001,17 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     continue;
                 }
 
-                const int32_t parent_active = linear / k;
-                if (parent_active < 0 || parent_active >= (int32_t) active_beam_idx.size()) {
+                const int32_t parent_slot = linear / k;
+                if (parent_slot < 0 || parent_slot >= beam_width) {
                     continue;
                 }
 
-                const size_t beam_idx = active_beam_idx[(size_t) parent_active];
-                const auto & beam = beams_cur[beam_idx];
+                const size_t beam_idx = (size_t) parent_slot;
+                if (active_cur[beam_idx] == 0) {
+                    continue;
+                }
                 const float total_logprob = selected_logprob[rank];
-                const float prob = std::exp(total_logprob - beam.logprob);
+                const float prob = std::exp(total_logprob - beam_logprob_cur[beam_idx]);
                 const int32_t base_id = draft_idx + model->d2t[draft_idx];
                 const bool filtered = prob_threshold > 0.0f && prob < prob_threshold;
 
@@ -1068,10 +1072,18 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 child.logprob = expansion.logprob;
                 child.tokens = parent.tokens;
                 child.tokens.push_back(expansion.token);
+                active_nxt[(size_t) i] = 1;
+                beam_logprob_nxt[(size_t) i] = expansion.logprob;
 
                 parent_states.push_back(&parent.state);
                 out_states.push_back(&child.state);
                 candidate_input_ids.push_back(expansion.token);
+            }
+
+            for (int32_t i = n_next; i < beam_width; ++i) {
+                beams_nxt[(size_t) i] = {};
+                active_nxt[(size_t) i] = 0;
+                beam_logprob_nxt[(size_t) i] = inactive_beam_logprob;
             }
 
             if (!candidate_input_ids.empty()) {
@@ -1107,6 +1119,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 depth_step_ms.push_back(depth_step);
 #if defined(GGML_USE_CUDA)
                 depth_step_gpu_ms.push_back(depth_step_gpu);
+#else
+                GGML_UNUSED(depth_step_gpu);
 #endif
             }
 
@@ -1114,8 +1128,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 break;
             }
 
-            n_beams = (int32_t) candidate_input_ids.size();
-            for (int32_t i = 0; i < n_beams; ++i) {
+            for (int32_t i = 0; i < n_next; ++i) {
                 const auto & cand = beams_nxt[(size_t) i];
                 prefix_states[cand.tokens] = cand.state;
                 all_nodes.push_back({cand.logprob, cand.tokens});

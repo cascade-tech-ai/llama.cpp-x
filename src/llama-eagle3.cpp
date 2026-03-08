@@ -2337,6 +2337,199 @@ bool llama_eagle3_select_state_batch_device(
     return true;
 }
 
+bool llama_eagle3_select_state_slots_device(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<uint8_t> & active_mask,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        llama_eagle3_select_batch_device_result & out) {
+    out = {};
+
+    const auto & hp = model.hparams;
+    const int32_t n_beams = (int32_t) states.size();
+    if (n_beams <= 0 || (int32_t) active_mask.size() != n_beams || (int32_t) beam_logprob.size() != n_beams) {
+        return false;
+    }
+
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    const int32_t n_select = n_beams * k;
+    if (n_select <= 0) {
+        return false;
+    }
+
+    if (!(rt.backend_compute && rt.buft_compute)) {
+        return false;
+    }
+
+    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+        return false;
+    }
+
+    auto & graph = rt.select_batch_graph;
+    if ((int32_t) graph.t_hidden_cols.size() != n_beams) {
+        return false;
+    }
+
+    std::vector<float> zero_hidden((size_t) hp.hidden_size, 0.0f);
+    std::vector<float> masked_logprob = beam_logprob;
+    const float inactive_logprob = -1e30f;
+
+    for (int32_t ib = 0; ib < n_beams; ++ib) {
+        const bool active = active_mask[(size_t) ib] != 0;
+        const llama_eagle3_state * st = states[(size_t) ib];
+        ggml_tensor * dst = graph.t_hidden_cols[(size_t) ib];
+        if (!dst) {
+            return false;
+        }
+
+        if (active && st && st->dev && st->dev->t_hidden) {
+            ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+        } else if (active && st && !st->hidden.empty()) {
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+        } else {
+            masked_logprob[(size_t) ib] = inactive_logprob;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, zero_hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+        }
+    }
+
+    ggml_backend_tensor_set_async(
+            rt.backend_compute.get(),
+            graph.t_beam_logprob,
+            masked_logprob.data(),
+            0,
+            masked_logprob.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    out.backend = rt.backend_compute.get();
+    out.t_selected_linear = graph.t_selected_linear;
+    out.t_selected_draft = graph.t_selected_draft;
+    out.t_selected_logprob = graph.t_selected_logprob;
+    out.n_beams = n_beams;
+    out.k = k;
+    out.n_select = n_select;
+    return true;
+}
+
+bool llama_eagle3_select_state_slots(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<uint8_t> & active_mask,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        std::vector<int32_t> & selected_linear_out,
+        std::vector<int32_t> & selected_draft_idx_out,
+        std::vector<float> & selected_logprob_out) {
+    const auto & hp = model.hparams;
+    const int32_t n_beams = (int32_t) states.size();
+    if (n_beams <= 0 || (int32_t) active_mask.size() != n_beams || (int32_t) beam_logprob.size() != n_beams) {
+        return false;
+    }
+
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    const int32_t n_select = n_beams * k;
+    if (n_select <= 0) {
+        return false;
+    }
+
+    if (rt.backend_compute && rt.buft_compute) {
+        llama_eagle3_select_batch_device_result device_out;
+        if (llama_eagle3_select_state_slots_device(model, rt, states, active_mask, beam_logprob, k, device_out)) {
+            selected_linear_out.resize((size_t) n_select);
+            selected_draft_idx_out.resize((size_t) n_select);
+            selected_logprob_out.resize((size_t) n_select);
+
+            ggml_backend_tensor_get_async(
+                    rt.backend_compute.get(),
+                    const_cast<ggml_tensor *>(device_out.t_selected_linear),
+                    selected_linear_out.data(),
+                    0,
+                    selected_linear_out.size() * sizeof(int32_t));
+            ggml_backend_tensor_get_async(
+                    rt.backend_compute.get(),
+                    const_cast<ggml_tensor *>(device_out.t_selected_draft),
+                    selected_draft_idx_out.data(),
+                    0,
+                    selected_draft_idx_out.size() * sizeof(int32_t));
+            ggml_backend_tensor_get_async(
+                    rt.backend_compute.get(),
+                    const_cast<ggml_tensor *>(device_out.t_selected_logprob),
+                    selected_logprob_out.data(),
+                    0,
+                    selected_logprob_out.size() * sizeof(float));
+            ggml_backend_synchronize(rt.backend_compute.get());
+            return true;
+        }
+    }
+
+    std::vector<const llama_eagle3_state *> active_states;
+    std::vector<float> active_logprob;
+    std::vector<int32_t> active_to_slot;
+    active_states.reserve((size_t) n_beams);
+    active_logprob.reserve((size_t) n_beams);
+    active_to_slot.reserve((size_t) n_beams);
+
+    for (int32_t ib = 0; ib < n_beams; ++ib) {
+        if (active_mask[(size_t) ib] == 0) {
+            continue;
+        }
+        const llama_eagle3_state * st = states[(size_t) ib];
+        if (!st || !llama_eagle3_state_has_hidden(*st)) {
+            continue;
+        }
+        active_to_slot.push_back(ib);
+        active_states.push_back(st);
+        active_logprob.push_back(beam_logprob[(size_t) ib]);
+    }
+
+    if (active_states.empty()) {
+        selected_linear_out.assign((size_t) n_select, -1);
+        selected_draft_idx_out.assign((size_t) n_select, -1);
+        selected_logprob_out.assign((size_t) n_select, -INFINITY);
+        return true;
+    }
+
+    std::vector<int32_t> active_linear;
+    std::vector<int32_t> active_draft_idx;
+    std::vector<float> active_selected_logprob;
+    if (!llama_eagle3_select_state_batch(model, rt, active_states, active_logprob, k, active_linear, active_draft_idx, active_selected_logprob)) {
+        return false;
+    }
+
+    selected_linear_out.assign((size_t) n_select, -1);
+    selected_draft_idx_out.assign((size_t) n_select, -1);
+    selected_logprob_out.assign((size_t) n_select, -INFINITY);
+
+    const size_t n_active_select = active_linear.size();
+    for (size_t i = 0; i < n_active_select && i < (size_t) n_select; ++i) {
+        const int32_t active_linear_i = active_linear[i];
+        const int32_t active_parent = active_linear_i / k;
+        const int32_t local_rank = active_linear_i % k;
+        if (active_parent < 0 || active_parent >= (int32_t) active_to_slot.size()) {
+            continue;
+        }
+        selected_linear_out[i] = active_to_slot[(size_t) active_parent] * k + local_rank;
+        selected_draft_idx_out[i] = active_draft_idx[i];
+        selected_logprob_out[i] = active_selected_logprob[i];
+    }
+
+    return true;
+}
+
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state) {
     return !state.hidden.empty() || (state.dev && state.dev->t_hidden != nullptr);
 }

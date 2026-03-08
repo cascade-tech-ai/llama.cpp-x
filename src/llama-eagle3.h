@@ -317,6 +317,26 @@ bool llama_eagle3_select_state_batch_device(
         int32_t k,
         llama_eagle3_select_batch_device_result & out);
 
+bool llama_eagle3_select_state_slots(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<uint8_t> & active_mask,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        std::vector<int32_t> & selected_linear_out,
+        std::vector<int32_t> & selected_draft_idx_out,
+        std::vector<float> & selected_logprob_out);
+
+bool llama_eagle3_select_state_slots_device(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<uint8_t> & active_mask,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        llama_eagle3_select_batch_device_result & out);
+
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state);
 bool llama_eagle3_state_get_hidden(
         const llama_eagle3_model & model,
