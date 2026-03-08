@@ -2257,6 +2257,86 @@ bool llama_eagle3_select_state_batch(
     return true;
 }
 
+bool llama_eagle3_select_state_batch_device(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const std::vector<const llama_eagle3_state *> & states,
+        const std::vector<float> & beam_logprob,
+        int32_t k,
+        llama_eagle3_select_batch_device_result & out) {
+    out = {};
+
+    const auto & hp = model.hparams;
+    const int32_t n_beams = (int32_t) states.size();
+    if (n_beams <= 0 || (int32_t) beam_logprob.size() != n_beams) {
+        return false;
+    }
+
+    k = std::min(k, hp.draft_vocab_size);
+    if (k <= 0) {
+        return false;
+    }
+
+    const int32_t n_select = n_beams * k;
+    if (n_select <= 0) {
+        return false;
+    }
+
+    if (!(rt.backend_compute && rt.buft_compute)) {
+        return false;
+    }
+
+    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+        return false;
+    }
+
+    auto & graph = rt.select_batch_graph;
+    if ((int32_t) graph.t_hidden_cols.size() != n_beams) {
+        return false;
+    }
+
+    for (int32_t ib = 0; ib < n_beams; ++ib) {
+        const llama_eagle3_state * st = states[(size_t) ib];
+        if (!st) {
+            return false;
+        }
+
+        ggml_tensor * dst = graph.t_hidden_cols[(size_t) ib];
+        if (!dst) {
+            return false;
+        }
+
+        if (!st->hidden.empty()) {
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+        } else if (st->dev && st->dev->t_hidden) {
+            ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+        } else {
+            return false;
+        }
+    }
+
+    ggml_backend_tensor_set_async(
+            rt.backend_compute.get(),
+            graph.t_beam_logprob,
+            beam_logprob.data(),
+            0,
+            beam_logprob.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    out.backend = rt.backend_compute.get();
+    out.t_selected_linear = graph.t_selected_linear;
+    out.t_selected_draft = graph.t_selected_draft;
+    out.t_selected_logprob = graph.t_selected_logprob;
+    out.n_beams = n_beams;
+    out.k = k;
+    out.n_select = n_select;
+    return true;
+}
+
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state) {
     return !state.hidden.empty() || (state.dev && state.dev->t_hidden != nullptr);
 }
