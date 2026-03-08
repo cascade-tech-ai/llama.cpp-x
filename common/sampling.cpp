@@ -156,12 +156,59 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    void set_logits_raw(const float * logits, int n_vocab) {
+        GGML_ASSERT(logits != nullptr);
+        cur.resize((size_t) n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[(size_t) token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
 
     mutable int64_t t_total_us = 0;
 };
+
+static llama_token common_sampler_apply_prepared(common_sampler * gsmpl, bool grammar_first) {
+    llama_token id = LLAMA_TOKEN_NULL;
+
+    auto & grmr  = gsmpl->grmr;
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p;
+
+    if (grammar_first) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first) {
+        return id;
+    }
+
+    llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+    llama_sampler_apply(grmr, &single_token_data_array);
+
+    const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+    if (is_valid) {
+        return id;
+    }
+
+    llama_sampler_apply(grmr,  &cur_p);
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
 
 std::string common_params_sampling::print() const {
     char result[1024];
@@ -457,10 +504,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     llama_token id = LLAMA_TOKEN_NULL;
 
-    auto & grmr  = gsmpl->grmr;
-    auto & chain = gsmpl->chain;
-    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -474,51 +517,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             // TODO: simplify
             gsmpl->cur.resize(1);
             gsmpl->cur[0] = { id, 0.0f, 1.0f };
-            cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), 0, true };
+            gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), 0, true };
 
             return id;
         }
     }
 
     gsmpl->set_logits(ctx, idx);
-
-    if (grammar_first) {
-        llama_sampler_apply(grmr, &cur_p);
-    }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    id = cur_p.data[cur_p.selected].id;
-
-    if (grammar_first) {
-        return id;
-    }
-
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
-        llama_sampler_apply(grmr, &single_token_data_array);
-
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
-        }
-    }
-
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
-
-    llama_sampler_apply(grmr,  &cur_p);
-    llama_sampler_apply(chain, &cur_p);
-
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-    id = cur_p.data[cur_p.selected].id;
-
-    return id;
+    return common_sampler_apply_prepared(gsmpl, grammar_first);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -576,33 +582,57 @@ std::vector<llama_token> common_sampler_sample_and_accept_tree(
         return result;
     }
 
-    std::vector<int32_t> roots;
-    std::vector<std::vector<int32_t>> children(n_nodes);
-    roots.reserve(n_nodes);
+    llama_synchronize(ctx);
+    const auto tm = gsmpl->tm();
 
-    for (size_t i = 0; i < n_nodes; ++i) {
-        const int32_t parent = tree.parents[i];
-        if (parent < 0) {
-            roots.push_back((int32_t) i);
-        } else if ((size_t) parent < n_nodes) {
-            children[parent].push_back((int32_t) i);
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    const auto sample_idx = [&](int idx) -> llama_token {
+        llama_token tok = llama_get_sampled_token_ith(ctx, idx);
+        if (tok != LLAMA_TOKEN_NULL) {
+            return tok;
         }
-    }
 
-    const auto find_token = [&](const std::vector<int32_t> & list, llama_token tok) -> int32_t {
-        for (int32_t idx : list) {
-            if (tree.tokens[idx] == tok) {
-                return idx;
+        const float * logits = llama_get_logits_ith_nosync(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        gsmpl->set_logits_raw(logits, n_vocab);
+        return common_sampler_apply_prepared(gsmpl, grammar_first);
+    };
+
+    const auto find_child = [&](int32_t parent, llama_token tok) -> int32_t {
+        if (parent < 0) {
+            for (size_t i = 0; i < n_nodes; ++i) {
+                if (tree.parents[i] < 0 && tree.tokens[i] == tok) {
+                    return (int32_t) i;
+                }
+            }
+            return -1;
+        }
+
+        if (tree.first_child.size() == n_nodes && tree.next_sibling.size() == n_nodes) {
+            for (int32_t child = tree.first_child[(size_t) parent]; child >= 0; child = tree.next_sibling[(size_t) child]) {
+                if (tree.tokens[(size_t) child] == tok) {
+                    return child;
+                }
+            }
+            return -1;
+        }
+
+        for (size_t i = 0; i < n_nodes; ++i) {
+            if (tree.parents[i] == parent && tree.tokens[i] == tok) {
+                return (int32_t) i;
             }
         }
         return -1;
     };
 
-    llama_token id = common_sampler_sample(gsmpl, ctx, idx_last, grammar_first);
+    llama_token id = sample_idx(idx_last);
     common_sampler_accept(gsmpl, id, true);
     result.push_back(id);
 
-    int32_t node = find_token(roots, id);
+    int32_t node = find_child(-1, id);
     if (node < 0) {
         return result;
     }
@@ -611,13 +641,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_tree(
         const int idx = tree.row_indices.size() == n_nodes
             ? (int) tree.row_indices[(size_t) node]
             : (int) tree.batch_start + node;
-        id = common_sampler_sample(gsmpl, ctx, idx, grammar_first);
+        id = sample_idx(idx);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
-        const int32_t child = (node >= 0 && (size_t) node < children.size())
-            ? find_token(children[node], id)
-            : -1;
+        const int32_t child = find_child(node, id);
         if (child < 0) {
             break;
         }

@@ -3451,9 +3451,25 @@ float * llama_get_logits(llama_context * ctx) {
     return ctx->get_logits();
 }
 
+float * llama_get_logits_nosync(llama_context * ctx) {
+    return ctx->get_logits();
+}
+
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
+    float * res = nullptr;
+
+    res = ctx->get_sampled_logits_ith(i);
+
+    if (!res) {
+        res = ctx->get_logits_ith(i);
+    }
+
+    return res;
+}
+
+float * llama_get_logits_ith_nosync(llama_context * ctx, int32_t i) {
     float * res = nullptr;
 
     res = ctx->get_sampled_logits_ith(i);
