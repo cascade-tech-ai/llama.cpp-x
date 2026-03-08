@@ -149,30 +149,60 @@ static void build_eagle_tree_batch(
         llama_batch & batch_tgt,
         const llama_token id_last,
         const llama_pos base_pos,
+        const int32_t max_nodes,
         const eagle_tree_layout & layout,
         common_speculative_tree & tree) {
     std::vector<llama_seq_id> shared_seq_ids;
-    shared_seq_ids.reserve(1 + layout.leaf_seq_ids.size());
+    shared_seq_ids.reserve(1 + (size_t) max_nodes);
     shared_seq_ids.push_back(0);
-    shared_seq_ids.insert(shared_seq_ids.end(), layout.leaf_seq_ids.begin(), layout.leaf_seq_ids.end());
+    for (int32_t i = 0; i < max_nodes; ++i) {
+        shared_seq_ids.push_back((llama_seq_id) (1 + i));
+    }
     common_batch_add(batch_tgt, id_last, base_pos, shared_seq_ids, true);
 
     tree.row_indices.assign(tree.tokens.size(), std::numeric_limits<uint32_t>::max());
+    std::vector<int32_t> nodes(tree.tokens.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        nodes[i] = (int32_t) i;
+    }
 
-    for (size_t leaf_idx = 0; leaf_idx < layout.leaf_paths.size(); ++leaf_idx) {
-        const llama_seq_id seq_id = layout.leaf_seq_ids[leaf_idx];
-        for (int32_t node : layout.leaf_paths[leaf_idx]) {
-            const llama_pos pos = base_pos + 1 + tree.depths[(size_t) node];
-            const uint32_t row = batch_tgt.n_tokens;
-            common_batch_add(batch_tgt, tree.tokens[(size_t) node], pos, { seq_id }, true);
-            if (tree.row_indices[(size_t) node] == std::numeric_limits<uint32_t>::max()) {
-                tree.row_indices[(size_t) node] = row;
-            }
+    std::stable_sort(nodes.begin(), nodes.end(), [&](int32_t a, int32_t b) {
+        const int32_t depth_a = tree.depths[(size_t) a];
+        const int32_t depth_b = tree.depths[(size_t) b];
+        if (depth_a != depth_b) {
+            return depth_a < depth_b;
         }
+        return a < b;
+    });
+
+    for (int32_t node : nodes) {
+        const auto & seq_ids = layout.node_seq_ids[(size_t) node];
+        GGML_ASSERT(!seq_ids.empty());
+
+        const llama_pos pos = base_pos + 1 + tree.depths[(size_t) node];
+        const uint32_t row = batch_tgt.n_tokens;
+        common_batch_add(batch_tgt, tree.tokens[(size_t) node], pos, seq_ids, true);
+        tree.row_indices[(size_t) node] = row;
     }
 
     for (size_t i = 0; i < tree.row_indices.size(); ++i) {
         GGML_ASSERT(tree.row_indices[i] != std::numeric_limits<uint32_t>::max());
+    }
+
+    GGML_ASSERT(max_nodes >= 0);
+    GGML_ASSERT((int32_t) tree.tokens.size() <= max_nodes);
+
+    if (max_nodes > 0) {
+        const int32_t pad_count = max_nodes - (int32_t) tree.tokens.size();
+        const int32_t max_depth = tree.depths.empty()
+            ? 0
+            : *std::max_element(tree.depths.begin(), tree.depths.end());
+
+        for (int32_t i = 0; i < pad_count; ++i) {
+            const llama_pos pad_pos = base_pos + 2 + max_depth + i;
+            const llama_seq_id pad_seq_id = (llama_seq_id) (1 + ((int32_t) tree.tokens.size() + i) % max_nodes);
+            common_batch_add(batch_tgt, id_last, pad_pos, { pad_seq_id }, true);
+        }
     }
 }
 }
@@ -419,11 +449,12 @@ int main(int argc, char ** argv) {
                 }
 
                 auto * mem = llama_get_memory(ctx_tgt);
-                for (llama_seq_id seq_id : tree_layout.leaf_seq_ids) {
+                for (int32_t i = 0; i < params_spec.eagle_max_proposals; ++i) {
+                    const llama_seq_id seq_id = (llama_seq_id) (1 + i);
                     llama_memory_seq_rm(mem, seq_id, -1, -1);
                     llama_memory_seq_cp(mem, 0, seq_id, -1, -1);
                 }
-                build_eagle_tree_batch(batch_tgt, id_last, n_past++, tree_layout, tree);
+                build_eagle_tree_batch(batch_tgt, id_last, n_past++, params_spec.eagle_max_proposals, tree_layout, tree);
             } else {
                 common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
                 for (size_t i = 0; i < draft.size(); ++i) {
@@ -502,7 +533,8 @@ int main(int argc, char ** argv) {
                 const llama_pos p1 = p0 + (llama_pos) accepted_nodes.size();
                 llama_memory_seq_cp(mem, seq_ids[0], 0, p0, p1);
             }
-            for (llama_seq_id seq_id : tree_layout.leaf_seq_ids) {
+            for (int32_t i = 0; i < params_spec.eagle_max_proposals; ++i) {
+                const llama_seq_id seq_id = (llama_seq_id) (1 + i);
                 llama_memory_seq_rm(mem, seq_id, -1, -1);
             }
         }
