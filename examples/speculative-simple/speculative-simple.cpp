@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <functional>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -47,17 +46,21 @@ struct scoped_prof {
     }
 };
 
-struct eagle_tree_layout {
-    std::vector<int32_t> roots;
-    std::vector<std::vector<int32_t>> children;
-    std::vector<int32_t> leaves;
-    std::vector<llama_seq_id> leaf_seq_ids;
-    std::vector<std::vector<llama_seq_id>> node_seq_ids;
-    std::vector<std::vector<int32_t>> leaf_paths;
-};
+static int32_t find_tree_child_token(const common_speculative_tree & tree, int32_t parent, llama_token tok) {
+    const int32_t first = parent < 0
+        ? (tree.parents.empty() ? -1 : 0)
+        : tree.first_child[(size_t) parent];
 
-static int32_t find_tree_token(const common_speculative_tree & tree, const std::vector<int32_t> & nodes, llama_token tok) {
-    for (int32_t node : nodes) {
+    if (parent < 0) {
+        for (size_t i = 0; i < tree.tokens.size(); ++i) {
+            if (tree.parents[i] < 0 && tree.tokens[i] == tok) {
+                return (int32_t) i;
+            }
+        }
+        return -1;
+    }
+
+    for (int32_t node = first; node >= 0; node = tree.next_sibling[(size_t) node]) {
         if (tree.tokens[(size_t) node] == tok) {
             return node;
         }
@@ -65,81 +68,37 @@ static int32_t find_tree_token(const common_speculative_tree & tree, const std::
     return -1;
 }
 
-static eagle_tree_layout build_eagle_tree_layout(const common_speculative_tree & tree) {
-    eagle_tree_layout layout;
-    const size_t n_nodes = tree.tokens.size();
-    layout.children.resize(n_nodes);
-
-    for (size_t i = 0; i < n_nodes; ++i) {
-        const int32_t parent = tree.parents[i];
-        if (parent < 0) {
-            layout.roots.push_back((int32_t) i);
-        } else if ((size_t) parent < n_nodes) {
-            layout.children[(size_t) parent].push_back((int32_t) i);
-        }
-    }
-
-    for (size_t i = 0; i < n_nodes; ++i) {
-        if (layout.children[i].empty()) {
-            layout.leaves.push_back((int32_t) i);
-        }
-    }
-
-    layout.leaf_seq_ids.resize(layout.leaves.size());
-    for (size_t i = 0; i < layout.leaves.size(); ++i) {
-        layout.leaf_seq_ids[i] = (llama_seq_id) (1 + i);
-    }
-
-    layout.leaf_paths.resize(layout.leaves.size());
-    for (size_t i = 0; i < layout.leaves.size(); ++i) {
-        std::vector<int32_t> path;
-        for (int32_t node = layout.leaves[i]; node >= 0; node = tree.parents[(size_t) node]) {
-            path.push_back(node);
-        }
-        std::reverse(path.begin(), path.end());
-        layout.leaf_paths[i] = std::move(path);
-    }
-
-    layout.node_seq_ids.resize(n_nodes);
-    std::function<const std::vector<llama_seq_id> &(int32_t)> dfs = [&](int32_t node) -> const std::vector<llama_seq_id> & {
-        auto & seqs = layout.node_seq_ids[(size_t) node];
-        if (!seqs.empty()) {
-            return seqs;
-        }
-        if (layout.children[(size_t) node].empty()) {
-            auto it = std::find(layout.leaves.begin(), layout.leaves.end(), node);
-            GGML_ASSERT(it != layout.leaves.end());
-            const size_t leaf_idx = (size_t) std::distance(layout.leaves.begin(), it);
-            seqs.push_back(layout.leaf_seq_ids[leaf_idx]);
-            return seqs;
-        }
-        for (int32_t child : layout.children[(size_t) node]) {
-            const auto & child_seqs = dfs(child);
-            seqs.insert(seqs.end(), child_seqs.begin(), child_seqs.end());
-        }
-        return seqs;
-    };
-
-    for (int32_t root : layout.roots) {
-        dfs(root);
-    }
-
-    return layout;
+static uint32_t tree_leaf_count(const common_speculative_tree & tree) {
+    return tree.leaf_count;
 }
 
-static std::vector<int32_t> trace_accepted_tree_nodes(const common_speculative_tree & tree, const eagle_tree_layout & layout, const llama_tokens & ids) {
+static void append_seq_ids_from_mask(uint32_t mask, std::vector<llama_seq_id> & out) {
+    out.clear();
+    while (mask != 0) {
+        const uint32_t bit = __builtin_ctz(mask);
+        out.push_back((llama_seq_id) (1 + bit));
+        mask &= mask - 1;
+    }
+}
+
+static llama_seq_id first_seq_id_from_mask(uint32_t mask) {
+    GGML_ASSERT(mask != 0);
+    return (llama_seq_id) (1 + __builtin_ctz(mask));
+}
+
+static std::vector<int32_t> trace_accepted_tree_nodes(const common_speculative_tree & tree, const llama_tokens & ids) {
     std::vector<int32_t> nodes;
     if (ids.empty()) {
         return nodes;
     }
 
-    int32_t node = find_tree_token(tree, layout.roots, ids[0]);
+    int32_t node = find_tree_child_token(tree, -1, ids[0]);
     while (node >= 0) {
         nodes.push_back(node);
         if (nodes.size() >= ids.size() - 1) {
             break;
         }
-        node = find_tree_token(tree, layout.children[(size_t) node], ids[nodes.size()]);
+        node = find_tree_child_token(tree, node, ids[nodes.size()]);
     }
 
     return nodes;
@@ -150,7 +109,6 @@ static void build_eagle_tree_batch(
         const llama_token id_last,
         const llama_pos base_pos,
         const int32_t max_nodes,
-        const eagle_tree_layout & layout,
         common_speculative_tree & tree) {
     std::vector<llama_seq_id> shared_seq_ids;
     shared_seq_ids.reserve(1 + (size_t) max_nodes);
@@ -176,7 +134,8 @@ static void build_eagle_tree_batch(
     });
 
     for (int32_t node : nodes) {
-        const auto & seq_ids = layout.node_seq_ids[(size_t) node];
+        std::vector<llama_seq_id> seq_ids;
+        append_seq_ids_from_mask(tree.leaf_masks[(size_t) node], seq_ids);
         GGML_ASSERT(!seq_ids.empty());
 
         const llama_pos pos = base_pos + 1 + tree.depths[(size_t) node];
@@ -424,7 +383,6 @@ int main(int argc, char ** argv) {
         common_speculative_tree tree;
         const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
-        eagle_tree_layout tree_layout;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -443,10 +401,9 @@ int main(int argc, char ** argv) {
             }
 
             if (use_tree) {
-                tree_layout = build_eagle_tree_layout(tree);
-                if ((int) tree_layout.leaf_seq_ids.size() + 1 > (int) llama_n_seq_max(ctx_tgt)) {
+                if ((int) tree_leaf_count(tree) + 1 > (int) llama_n_seq_max(ctx_tgt)) {
                     LOG_ERR("%s: insufficient n_seq_max=%u for %zu EAGLE branches\n",
-                            __func__, llama_n_seq_max(ctx_tgt), tree_layout.leaf_seq_ids.size());
+                            __func__, llama_n_seq_max(ctx_tgt), (size_t) tree_leaf_count(tree));
                     return 1;
                 }
 
@@ -456,7 +413,8 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_rm(mem, seq_id, -1, -1);
                     llama_memory_seq_cp(mem, 0, seq_id, -1, -1);
                 }
-                build_eagle_tree_batch(batch_tgt, id_last, n_past++, params_spec.eagle_max_proposals, tree_layout, tree);
+                const llama_pos tree_base_pos = n_past++;
+                build_eagle_tree_batch(batch_tgt, id_last, tree_base_pos, params_spec.eagle_max_proposals, tree);
             } else {
                 common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
                 for (size_t i = 0; i < draft.size(); ++i) {
@@ -525,15 +483,14 @@ int main(int argc, char ** argv) {
 
         std::vector<int32_t> accepted_nodes;
         if (use_tree) {
-            accepted_nodes = trace_accepted_tree_nodes(tree, tree_layout, ids_limited);
+            accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
             auto * mem = llama_get_memory(ctx_tgt);
             if (!accepted_nodes.empty()) {
                 const int32_t deepest = accepted_nodes.back();
-                const auto & seq_ids = tree_layout.node_seq_ids[(size_t) deepest];
-                GGML_ASSERT(!seq_ids.empty());
+                const llama_seq_id seq_id = first_seq_id_from_mask(tree.leaf_masks[(size_t) deepest]);
                 const llama_pos p0 = n_past_before + 1;
                 const llama_pos p1 = p0 + (llama_pos) accepted_nodes.size();
-                llama_memory_seq_cp(mem, seq_ids[0], 0, p0, p1);
+                llama_memory_seq_cp(mem, seq_id, 0, p0, p1);
             }
             for (int32_t i = 0; i < params_spec.eagle_max_proposals; ++i) {
                 const llama_seq_id seq_id = (llama_seq_id) (1 + i);
