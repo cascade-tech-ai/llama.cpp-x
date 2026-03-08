@@ -4290,7 +4290,7 @@ static bool ggml_cuda_timing_enabled() {
     return enabled;
 }
 
-void ggml_backend_cuda_nvtx_push(const char * name) {
+extern "C" void ggml_backend_cuda_nvtx_push(const char * name) {
     if (name == nullptr) {
         return;
     }
@@ -4304,7 +4304,7 @@ void ggml_backend_cuda_nvtx_push(const char * name) {
 #endif
 }
 
-void ggml_backend_cuda_nvtx_pop(void) {
+extern "C" void ggml_backend_cuda_nvtx_pop(void) {
 #ifdef GGML_CUDA_USE_NVTX
     if (!ggml_cuda_nvtx_enabled()) {
         return;
@@ -4313,7 +4313,7 @@ void ggml_backend_cuda_nvtx_pop(void) {
 #endif
 }
 
-void ggml_backend_cuda_profiler_zone_begin(ggml_backend_t backend, ggml_backend_cuda_profiler_zone * zone, const char * name) {
+extern "C" void ggml_backend_cuda_profiler_zone_begin(ggml_backend_t backend, ggml_backend_cuda_profiler_zone * zone, const char * name) {
     if (zone == nullptr) {
         return;
     }
@@ -4351,7 +4351,7 @@ void ggml_backend_cuda_profiler_zone_begin(ggml_backend_t backend, ggml_backend_
     zone->ev_end   = (void *) ev_end;
 }
 
-float ggml_backend_cuda_profiler_zone_end(ggml_backend_t backend, ggml_backend_cuda_profiler_zone * zone, const char * name) {
+extern "C" float ggml_backend_cuda_profiler_zone_end(ggml_backend_t backend, ggml_backend_cuda_profiler_zone * zone, const char * name) {
     GGML_UNUSED(name);
 
     if (zone == nullptr) {
@@ -4402,7 +4402,7 @@ float ggml_backend_cuda_profiler_zone_end(ggml_backend_t backend, ggml_backend_c
     return ms;
 }
 
-bool ggml_backend_cuda_tensor_copy_3d_prefix_async(
+extern "C" bool ggml_backend_cuda_tensor_copy_3d_prefix_async(
         ggml_backend_t backend,
         const struct ggml_tensor * src,
         struct ggml_tensor * dst,
@@ -4462,7 +4462,7 @@ bool ggml_backend_cuda_tensor_copy_3d_prefix_async(
     return true;
 }
 
-bool ggml_backend_cuda_tensor_copy_2d_async(
+extern "C" bool ggml_backend_cuda_tensor_copy_2d_async(
         ggml_backend_t backend,
         const struct ggml_tensor * src,
         struct ggml_tensor * dst,
@@ -4520,7 +4520,7 @@ bool ggml_backend_cuda_tensor_copy_2d_async(
     return true;
 }
 
-bool ggml_backend_cuda_tensor_copy_bytes_async(
+extern "C" bool ggml_backend_cuda_tensor_copy_bytes_async(
         ggml_backend_t backend,
         const struct ggml_tensor * src,
         size_t src_offset,
@@ -4562,7 +4562,7 @@ bool ggml_backend_cuda_tensor_copy_bytes_async(
     return true;
 }
 
-bool ggml_backend_cuda_tensor_copy_bytes_between_async(
+extern "C" bool ggml_backend_cuda_tensor_copy_bytes_between_async(
         ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
         const struct ggml_tensor * src,

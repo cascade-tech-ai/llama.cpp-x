@@ -35,13 +35,13 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 //   Use only for profiling runs (it can change perf characteristics).
 // ---------------------------------------------------------------------------
 
-#ifdef GGML_USE_CUDA
-
 typedef struct ggml_backend_cuda_profiler_zone {
     void * ev_start; // cudaEvent_t (opaque)
     void * ev_end;   // cudaEvent_t (opaque)
     int    nvtx_pushed;
 } ggml_backend_cuda_profiler_zone;
+
+#ifdef GGML_USE_CUDA
 
 // NVTX helpers (no-ops unless ggml-cuda was built with NVTX support and
 // GGML_CUDA_NVTX=1 is set).
