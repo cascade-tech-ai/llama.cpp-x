@@ -299,6 +299,23 @@ bool set_eagle_kq_mask(
     return true;
 }
 
+bool set_eagle_prefix_mask(
+        ggml_backend_t backend,
+        ggml_tensor * t_mask,
+        int32_t total_len,
+        int32_t valid_len) {
+    if (!backend || !t_mask || total_len < 0 || valid_len < 0 || valid_len > total_len) {
+        return false;
+    }
+
+    std::vector<float> host((size_t) total_len, -INFINITY);
+    for (int32_t i = 0; i < valid_len; ++i) {
+        host[(size_t) i] = 0.0f;
+    }
+    ggml_backend_tensor_set_async(backend, t_mask, host.data(), 0, host.size() * sizeof(float));
+    return true;
+}
+
 bool tensor_copy_3d_token_async(
         ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
@@ -395,6 +412,17 @@ int32_t choose_kv_capacity(int32_t required_len, int32_t reserve_kv, int32_t cur
         grown = min_capacity;
     }
     return grown;
+}
+
+int32_t choose_step_graph_capacity(int32_t required_len, int32_t current_capacity) {
+    if (current_capacity >= required_len) {
+        return current_capacity;
+    }
+    int32_t cap = 1;
+    while (cap < required_len) {
+        cap <<= 1;
+    }
+    return std::max(1, cap);
 }
 
 bool tensor_copy_3d_prefix_async(
@@ -647,6 +675,7 @@ bool build_logits_graph(
     if (!buf_compute) {
         return false;
     }
+    ggml_backend_buffer_clear(buf_compute.get(), 0);
 
     graph.ctx = std::move(ctx);
     graph.buf_compute = std::move(buf_compute);
@@ -709,6 +738,7 @@ bool build_topk_graph(
     if (!buf_compute) {
         return false;
     }
+    ggml_backend_buffer_clear(buf_compute.get(), 0);
 
     graph.ctx = std::move(ctx);
     graph.buf_compute = std::move(buf_compute);
@@ -1216,6 +1246,8 @@ bool build_step_graph(
 
     ggml_tensor * t_pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_pos);
+    ggml_tensor * t_kv_idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+    ggml_set_input(t_kv_idx);
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos, rt.rope_factors,
@@ -1232,13 +1264,19 @@ bool build_step_graph(
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     GGML_ASSERT(kv_capacity >= 0);
-    ggml_tensor * t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
-    ggml_tensor * t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
+    ggml_tensor * t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity + 1);
+    ggml_tensor * t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity + 1);
     ggml_set_input(t_k_past_input);
     ggml_set_input(t_v_past_input);
 
-    ggml_tensor * t_k_total = ggml_concat(ctx.get(), t_k_past_input, t_k, 2);
-    ggml_tensor * t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
+    ggml_tensor * t_k_base = ggml_view_2d(ctx.get(), t_k_past_input, hp.head_dim * hp.num_kv_heads, kv_capacity + 1, t_k_past_input->nb[2], 0);
+    ggml_tensor * t_v_base = ggml_view_2d(ctx.get(), t_v_past_input, hp.head_dim * hp.num_kv_heads, kv_capacity + 1, t_v_past_input->nb[2], 0);
+    ggml_tensor * t_k_cur2 = ggml_view_2d(ctx.get(), t_k, hp.head_dim * hp.num_kv_heads, 1, t_k->nb[2], 0);
+    ggml_tensor * t_v_cur2 = ggml_view_2d(ctx.get(), t_v, hp.head_dim * hp.num_kv_heads, 1, t_v->nb[2], 0);
+    ggml_tensor * t_k_total_2d = ggml_set_rows(ctx.get(), t_k_base, t_k_cur2, t_kv_idx);
+    ggml_tensor * t_v_total_2d = ggml_set_rows(ctx.get(), t_v_base, t_v_cur2, t_kv_idx);
+    ggml_tensor * t_k_total = ggml_reshape_3d(ctx.get(), t_k_total_2d, hp.head_dim, hp.num_kv_heads, kv_capacity + 1);
+    ggml_tensor * t_v_total = ggml_reshape_3d(ctx.get(), t_v_total_2d, hp.head_dim, hp.num_kv_heads, kv_capacity + 1);
     ggml_tensor * t_kq_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kv_capacity + 1, 1, 1, 1);
     ggml_set_input(t_kq_mask);
 
@@ -1276,9 +1314,8 @@ bool build_step_graph(
 
     ggml_tensor * kq = ggml_mul_mat(ctx.get(), kv, qv);
     const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
-    kq = ggml_scale(ctx.get(), kq, kq_scale);
     kq = ggml_cont(ctx.get(), kq);
-    kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, 1.0f, 0.0f);
+    kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, kq_scale, 0.0f);
 
     ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
     ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
@@ -1351,6 +1388,7 @@ bool build_step_graph(
     graph.t_hidden_in = t_hidden_in;
     graph.t_tok = t_tok;
     graph.t_pos = t_pos;
+    graph.t_kv_idx = t_kv_idx;
     graph.t_k_past_input = t_k_past_input;
     graph.t_v_past_input = t_v_past_input;
     graph.t_kq_mask = t_kq_mask;
@@ -1546,9 +1584,8 @@ bool build_step_batch_graph(
 
         ggml_tensor * kq = ggml_mul_mat(ctx.get(), kv, qv);
         const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
-        kq = ggml_scale(ctx.get(), kq, kq_scale);
         kq = ggml_cont(ctx.get(), kq);
-        kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, 1.0f, 0.0f);
+        kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, kq_scale, 0.0f);
 
         ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
         ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
@@ -2417,6 +2454,24 @@ bool llama_eagle3_step_batch_from_parents(
     const int32_t n_beams = (int32_t) parent_states.size();
     const bool with_logits = false;
 
+    // The fixed-capacity single-step graph is now reusable and numerically close to the
+    // reference path. The batched step graph is still not exact after the same rewrite, so
+    // keep rollout correctness by using per-beam single-step execution for now.
+    for (size_t i = 0; i < parent_states.size(); ++i) {
+        const llama_eagle3_state * parent = parent_states[i];
+        llama_eagle3_state * out_st = out_states[i];
+        if (!parent || !out_st) {
+            return false;
+        }
+        llama_eagle3_state tmp = *parent;
+        const float * hidden_step = tmp.hidden.empty() ? nullptr : tmp.hidden.data();
+        if (!llama_eagle3_step(model, rt, tmp, hidden_step, hidden_in_dim, input_ids[i], nullptr, nullptr)) {
+            return false;
+        }
+        *out_st = std::move(tmp);
+    }
+    return true;
+
     if (rt.backend_compute && rt.buft_compute) {
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/step_batch");
@@ -2648,7 +2703,7 @@ bool llama_eagle3_step_from_hidden_capture(
     if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
         const int32_t required_len = state.past_len + 1;
         const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
-        const int32_t kv_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
+        const int32_t kv_capacity = choose_step_graph_capacity(required_len, cur_capacity);
         const uint64_t key = make_step_graph_key(kv_capacity, hidden_in_dim, with_logits);
         bool built_graph = false;
         if (rt.step_graph_key != key) {
@@ -2667,7 +2722,7 @@ bool llama_eagle3_step_from_hidden_capture(
             auto & graph = rt.step_graph;
             const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
             const size_t past_bytes = (size_t) state.past_len * block * sizeof(float);
-            if (!set_eagle_kq_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity, state.past_len)) {
+            if (!set_eagle_prefix_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity + 1, state.past_len + 1)) {
                 return false;
             }
 
@@ -2687,6 +2742,8 @@ bool llama_eagle3_step_from_hidden_capture(
 
             ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &input_id, 0, sizeof(input_id));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &state.past_len, 0, sizeof(state.past_len));
+            const int64_t kv_idx = state.past_len;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_kv_idx, &kv_idx, 0, sizeof(kv_idx));
 
             if (graph.t_k_past_input && state.past_len > 0) {
                 if (state.dev && state.dev->t_k && state.dev->kv_capacity >= state.past_len) {
@@ -2836,7 +2893,7 @@ bool llama_eagle3_step(
     if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
         const int32_t required_len = state.past_len + 1;
         const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
-        const int32_t kv_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
+        const int32_t kv_capacity = choose_step_graph_capacity(required_len, cur_capacity);
         const uint64_t key = make_step_graph_key(kv_capacity, hidden_in_dim, with_logits);
         bool built_graph = false;
         if (rt.step_graph_key != key) {
@@ -2855,7 +2912,7 @@ bool llama_eagle3_step(
             auto & graph = rt.step_graph;
             const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
             const size_t past_bytes = (size_t) state.past_len * block * sizeof(float);
-            if (!set_eagle_kq_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity, state.past_len)) {
+            if (!set_eagle_prefix_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity + 1, state.past_len + 1)) {
                 return false;
             }
 
@@ -2868,6 +2925,8 @@ bool llama_eagle3_step(
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &input_id, 0, sizeof(input_id));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &state.past_len, 0, sizeof(state.past_len));
+            const int64_t kv_idx = state.past_len;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_kv_idx, &kv_idx, 0, sizeof(kv_idx));
 
             if (graph.t_k_past_input && state.past_len > 0) {
                 if (state.dev && state.dev->t_k && state.dev->kv_capacity >= state.past_len) {

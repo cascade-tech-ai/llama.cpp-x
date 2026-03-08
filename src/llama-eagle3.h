@@ -112,6 +112,7 @@ struct llama_eagle3_step_graph {
     ggml_tensor * t_hidden_in = nullptr;
     ggml_tensor * t_tok       = nullptr;
     ggml_tensor * t_pos       = nullptr;
+    ggml_tensor * t_kv_idx    = nullptr;
     ggml_tensor * t_k_past_input = nullptr;
     ggml_tensor * t_v_past_input = nullptr;
     ggml_tensor * t_kq_mask      = nullptr;
