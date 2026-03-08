@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_kv_cache
@@ -806,6 +807,27 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ubatch.kv_slot) {
+            std::unordered_set<uint32_t> seen;
+            seen.reserve(n_tokens);
+
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t i = s*n_tokens + ii;
+                const int32_t idx = ubatch.kv_slot[i];
+                if (idx < 0 || (uint32_t) idx >= cells.size()) {
+                    return { };
+                }
+
+                if (!seen.insert((uint32_t) idx).second) {
+                    return { };
+                }
+
+                res.idxs[s].push_back((uint32_t) idx);
+            }
+
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -971,7 +993,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         auto & head = v_heads[sinfo.strm[s]];
 
-        head = sinfo.idxs[s].back() + 1;
+        head = *std::max_element(sinfo.idxs[s].begin(), sinfo.idxs[s].end()) + 1;
     }
 }
 

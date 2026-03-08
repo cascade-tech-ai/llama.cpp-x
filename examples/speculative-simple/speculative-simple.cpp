@@ -369,7 +369,9 @@ int main(int argc, char ** argv) {
     // init the speculator (before prompt eval so EAGLE3 can capture hidden states)
     const auto & params_spec = params.speculative;
 
-    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
+    struct common_speculative * spec = params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE
+        ? common_speculative_init(params.speculative, ctx_tgt)
+        : nullptr;
 
     // eval the prompt
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
