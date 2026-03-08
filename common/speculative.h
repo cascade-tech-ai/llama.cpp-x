@@ -13,12 +13,20 @@ struct common_speculative_tree {
     std::vector<int32_t> parents; // -1 for root nodes
     std::vector<int32_t> depths;
     std::vector<uint32_t> row_indices; // optional explicit target batch row per logical node
+    std::vector<int32_t> first_child;  // compact child chain, -1 if none
+    std::vector<int32_t> next_sibling; // compact sibling chain, -1 if none
+    std::vector<uint32_t> leaf_masks;  // descendant leaf bitmask for each node
+    uint32_t leaf_count = 0;
 
     void clear() {
         tokens.clear();
         parents.clear();
         depths.clear();
         row_indices.clear();
+        first_child.clear();
+        next_sibling.clear();
+        leaf_masks.clear();
+        leaf_count = 0;
         batch_start = 1;
     }
 

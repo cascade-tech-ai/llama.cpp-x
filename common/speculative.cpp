@@ -52,6 +52,49 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
 
+static void common_speculative_tree_build_metadata(common_speculative_tree & tree) {
+    const size_t n_nodes = tree.tokens.size();
+
+    tree.first_child.assign(n_nodes, -1);
+    tree.next_sibling.assign(n_nodes, -1);
+    tree.leaf_masks.assign(n_nodes, 0);
+    tree.leaf_count = 0;
+
+    if (n_nodes == 0) {
+        return;
+    }
+
+    std::vector<int32_t> last_child(n_nodes, -1);
+    for (size_t i = 0; i < n_nodes; ++i) {
+        const int32_t parent = tree.parents[i];
+        if (parent < 0) {
+            continue;
+        }
+        GGML_ASSERT((size_t) parent < n_nodes);
+        if (tree.first_child[(size_t) parent] < 0) {
+            tree.first_child[(size_t) parent] = (int32_t) i;
+        } else {
+            GGML_ASSERT(last_child[(size_t) parent] >= 0);
+            tree.next_sibling[(size_t) last_child[(size_t) parent]] = (int32_t) i;
+        }
+        last_child[(size_t) parent] = (int32_t) i;
+    }
+
+    for (size_t rev = n_nodes; rev-- > 0;) {
+        if (tree.first_child[rev] < 0) {
+            GGML_ASSERT(tree.leaf_count < 32);
+            tree.leaf_masks[rev] = 1u << tree.leaf_count++;
+            continue;
+        }
+
+        uint32_t mask = 0;
+        for (int32_t child = tree.first_child[rev]; child >= 0; child = tree.next_sibling[(size_t) child]) {
+            mask |= tree.leaf_masks[(size_t) child];
+        }
+        tree.leaf_masks[rev] = mask;
+    }
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -1214,6 +1257,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 parent = node_idx;
             }
         }
+
+        common_speculative_tree_build_metadata(last_tree);
 
         draft_tokens = last_tree.tokens;
     }

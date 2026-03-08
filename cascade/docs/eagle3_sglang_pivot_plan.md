@@ -264,7 +264,52 @@ Verification gate:
 - All required checks A/B/C.
 
 Status:
-- not started
+- completed
+
+Verification notes:
+- 2026-03-08:
+  - The initial Step 3 attempt used a speculative-simple-local packed metadata buffer upload.
+  - That preserved exactness but either added pure overhead or did not actually become the source of truth for verify/commit, so it was discarded.
+  - Final Step 3 implementation moved compact tree metadata generation into `common/speculative` where the tree is created.
+  - Added compact metadata fields to `common_speculative_tree`:
+    - `first_child`
+    - `next_sibling`
+    - `leaf_masks`
+    - `leaf_count`
+  - `speculative-simple` now consumes those metadata fields directly for:
+    - tree batch construction
+    - accepted-path tracing
+    - accepted-branch sequence selection
+  - This removes the per-pass recursive `eagle_tree_layout` rebuild and keeps the compact tree in a fixed GPU-friendly representation for later steps.
+- Greedy exactness check:
+  - CPU baseline vs CPU EAGLE: identical
+  - CUDA baseline vs CUDA EAGLE: identical
+  - CPU/CUDA EAGLE outputs identical to each other
+  - Output text remained:
+    - `The tallest mountain on Earth is Mount Everest, located in the Himalayas on the border`
+  - Logs:
+    - `/tmp/cpu_none_step3e.log`
+    - `/tmp/cpu_eagle_step3e.log`
+    - `/tmp/cuda_none_step3e.log`
+    - `/tmp/cuda_eagle_step3e.log`
+- First-token Kestrel parity:
+  - unchanged by construction from Step 1
+  - this step only changed compact speculative tree metadata/layout plumbing
+  - it did not touch target hidden capture, target logits, or the EAGLE head math path used in the Step 1 parity check
+- Step result:
+  - compact tree metadata is now produced once at tree construction time and consumed directly by the verifier path
+  - no exactness regression
+  - standardized 1B CUDA EAGLE throughput improved relative to the abandoned upload experiment and is slightly better than Step 1
+  - Summary numbers for this step:
+    - first-token KL divergence vs Kestrel:
+      - CPU `0.0001017`
+      - CUDA `0.0003182`
+    - CUDA EAGLE decode throughput:
+      - standardized 1B perf check: `221.956 tok/s`
+      - matching baseline: `458.826 tok/s`
+    - Perf logs:
+      - `/tmp/eagle1b_step3e_perf.log`
+      - `/tmp/eagle1b_step3d_perf_base.log`
 
 ### Step 4. Move greedy tree verification onto GPU
 
