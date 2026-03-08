@@ -16,6 +16,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -2342,5 +2343,31 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->drafts_generated_tokens,
                 impl->drafts_accepted_tokens,
                 str_perf.c_str());
+
+        if (impl->type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+            const auto * eagle = dynamic_cast<const common_speculative_state_eagle3 *>(impl.get());
+            if (eagle) {
+                const auto & rt = eagle->rt;
+                LOG_INF("statistics %s graphs: logits build=%" PRIu64 " reuse=%" PRIu64
+                        ", topk build=%" PRIu64 " reuse=%" PRIu64
+                        ", topk_batch build=%" PRIu64 " reuse=%" PRIu64
+                        ", select_batch build=%" PRIu64 " reuse=%" PRIu64
+                        ", step build=%" PRIu64 " reuse=%" PRIu64
+                        ", step_batch build=%" PRIu64 " reuse=%" PRIu64 "\n",
+                        common_speculative_type_to_str(impl->type).c_str(),
+                        rt.logits_graph_counter.builds,
+                        rt.logits_graph_counter.reuses,
+                        rt.topk_graph_counter.builds,
+                        rt.topk_graph_counter.reuses,
+                        rt.topk_batch_graph_counter.builds,
+                        rt.topk_batch_graph_counter.reuses,
+                        rt.select_batch_graph_counter.builds,
+                        rt.select_batch_graph_counter.reuses,
+                        rt.step_graph_counter.builds,
+                        rt.step_graph_counter.reuses,
+                        rt.step_batch_graph_counter.builds,
+                        rt.step_batch_graph_counter.reuses);
+            }
+        }
     }
 }

@@ -114,6 +114,7 @@ struct llama_eagle3_step_graph {
     ggml_tensor * t_pos       = nullptr;
     ggml_tensor * t_k_past_input = nullptr;
     ggml_tensor * t_v_past_input = nullptr;
+    ggml_tensor * t_kq_mask      = nullptr;
 
     ggml_tensor * t_hidden_out = nullptr;
     ggml_tensor * t_k_curr     = nullptr;
@@ -139,8 +140,11 @@ struct llama_eagle3_step_batch_graph {
     std::vector<ggml_tensor *> t_pos;
     std::vector<ggml_tensor *> t_k_past_input;
     std::vector<ggml_tensor *> t_v_past_input;
+    ggml_tensor * t_kq_mask = nullptr;
 
     std::vector<ggml_tensor *> t_hidden_out;
+    std::vector<ggml_tensor *> t_k_curr;
+    std::vector<ggml_tensor *> t_v_curr;
     std::vector<ggml_tensor *> t_k_total;
     std::vector<ggml_tensor *> t_v_total;
     std::vector<ggml_tensor *> t_logits;
@@ -191,6 +195,11 @@ struct llama_eagle3_select_batch_graph {
     std::vector<ggml_tensor *> t_hidden_cols; // [n_beams], each [hidden_size, 1]
 };
 
+struct llama_eagle3_graph_counter {
+    uint64_t builds = 0;
+    uint64_t reuses = 0;
+};
+
 struct llama_eagle3_runtime {
     const llama_model * base_model = nullptr;
     ggml_tensor * tok_embd = nullptr;
@@ -222,13 +231,19 @@ struct llama_eagle3_runtime {
 
     // Reusable compute graphs for backend execution.
     mutable llama_eagle3_logits_graph logits_graph;
+    mutable llama_eagle3_graph_counter logits_graph_counter;
     mutable llama_eagle3_topk_graph topk_graph;
+    mutable llama_eagle3_graph_counter topk_graph_counter;
     mutable llama_eagle3_topk_batch_graph topk_batch_graph;
+    mutable llama_eagle3_graph_counter topk_batch_graph_counter;
     mutable llama_eagle3_select_batch_graph select_batch_graph;
+    mutable llama_eagle3_graph_counter select_batch_graph_counter;
     mutable uint64_t step_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_graph step_graph;
+    mutable llama_eagle3_graph_counter step_graph_counter;
     mutable uint64_t step_batch_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_batch_graph step_batch_graph;
+    mutable llama_eagle3_graph_counter step_batch_graph_counter;
 };
 
 llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & err);

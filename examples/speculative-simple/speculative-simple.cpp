@@ -608,6 +608,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
+    common_speculative_print_stats(spec);
 
     LOG_INF("\n");
     LOG_INF("target:\n\n");

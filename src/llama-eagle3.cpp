@@ -234,18 +234,77 @@ ggml_context_ptr make_ctx_no_alloc(size_t max_nodes) {
     return ggml_context_ptr(ggml_init(params));
 }
 
-uint64_t make_step_graph_key(int32_t past_len, int32_t hidden_in_dim, bool with_logits) {
-    return (uint64_t(uint32_t(past_len)) << 32) |
+uint64_t make_step_graph_key(int32_t kv_capacity, int32_t hidden_in_dim, bool with_logits) {
+    return (uint64_t(uint32_t(kv_capacity)) << 32) |
            (uint64_t(uint32_t(hidden_in_dim)) << 1) |
            (with_logits ? 1ull : 0ull);
 }
 
-uint64_t make_step_batch_graph_key(int32_t past_len, int32_t hidden_in_dim, int32_t n_beams, bool with_logits) {
-    return (uint64_t(uint16_t(past_len & 0xffff)) << 48) |
+uint64_t make_step_batch_graph_key(int32_t kv_capacity, int32_t hidden_in_dim, int32_t n_beams, bool with_logits) {
+    return (uint64_t(uint16_t(kv_capacity & 0xffff)) << 48) |
            (uint64_t(uint16_t(hidden_in_dim & 0xffff)) << 32) |
            (uint64_t(uint16_t(n_beams & 0xffff)) << 1) |
            (with_logits ? 1ull : 0ull);
 }
+
+bool matches_logits_graph(const llama_eagle3_logits_graph & graph) {
+    return graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden && graph.t_logits;
+}
+
+bool matches_topk_graph(const llama_eagle3_topk_graph & graph, int32_t k) {
+    return graph.ctx && graph.buf_compute && graph.gf &&
+           graph.t_hidden && graph.t_probs && graph.t_topk_idx && graph.t_topk_prob &&
+           graph.k == k;
+}
+
+bool matches_topk_batch_graph(const llama_eagle3_topk_batch_graph & graph, int32_t n_beams, int32_t k) {
+    return graph.ctx && graph.buf_compute && graph.gf &&
+           graph.t_hidden && graph.t_probs && graph.t_topk_idx && graph.t_topk_prob &&
+           graph.n_beams == n_beams && graph.k == k &&
+           (int32_t) graph.t_hidden_cols.size() == n_beams;
+}
+
+bool matches_select_batch_graph(const llama_eagle3_select_batch_graph & graph, int32_t n_beams, int32_t k, int32_t n_select) {
+    return graph.ctx && graph.buf_compute && graph.gf &&
+           graph.t_hidden && graph.t_beam_logprob &&
+           graph.t_selected_linear && graph.t_selected_draft && graph.t_selected_logprob &&
+           graph.n_beams == n_beams && graph.k == k && graph.n_select == n_select &&
+           (int32_t) graph.t_hidden_cols.size() == n_beams;
+}
+
+void count_graph_use(llama_eagle3_graph_counter & counter, bool reused) {
+    if (reused) {
+        ++counter.reuses;
+    } else {
+        ++counter.builds;
+    }
+}
+
+bool set_eagle_kq_mask(
+        ggml_backend_t backend,
+        ggml_tensor * t_mask,
+        int32_t kv_capacity,
+        int32_t past_len) {
+    if (!backend || !t_mask || kv_capacity < 0 || past_len < 0 || past_len > kv_capacity) {
+        return false;
+    }
+
+    const int32_t mask_len = kv_capacity + 1;
+    std::vector<float> host((size_t) mask_len, -INFINITY);
+    for (int32_t i = 0; i < past_len; ++i) {
+        host[(size_t) i] = 0.0f;
+    }
+    host[(size_t) kv_capacity] = 0.0f;
+    ggml_backend_tensor_set_async(backend, t_mask, host.data(), 0, host.size() * sizeof(float));
+    return true;
+}
+
+bool tensor_copy_3d_token_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int32_t dst_token_idx);
 
 void maybe_set_backend_threads(ggml_backend_t backend, int32_t n_threads) {
     if (!backend || n_threads <= 0) {
@@ -416,6 +475,27 @@ bool tensor_copy_bytes_async(
     ggml_backend_tensor_get(src, tmp.data(), src_offset, size);
     ggml_backend_tensor_set(dst, tmp.data(), dst_offset, size);
     return true;
+}
+
+bool tensor_copy_3d_token_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int32_t dst_token_idx) {
+    if (!src || !dst || dst_token_idx < 0) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] || src->ne[2] != 1 || dst_token_idx >= dst->ne[2]) {
+        return false;
+    }
+
+    const size_t slice_bytes = (size_t) src->ne[0] * (size_t) src->ne[1] * sizeof(float);
+    const size_t dst_offset = (size_t) dst_token_idx * (size_t) dst->nb[2];
+    return tensor_copy_bytes_async(backend_src, backend_dst, src, 0, dst, dst_offset, slice_bytes);
 }
 
 bool build_hidden_concat_from_capture_host(
@@ -1069,11 +1149,12 @@ bool build_step_ops(
 bool build_step_graph(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
-        int32_t past_len,
+        int32_t kv_capacity,
         int32_t hidden_in_dim,
         bool with_logits,
         llama_eagle3_step_graph & graph) {
-    if (graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden_in && graph.t_hidden_out && graph.t_k_total && graph.t_v_total) {
+    if (graph.ctx && graph.buf_compute && graph.gf && graph.t_hidden_in && graph.t_hidden_out &&
+        graph.t_k_past_input && graph.t_v_past_input && graph.t_kq_mask && graph.t_k_curr && graph.t_v_curr) {
         return true;
     }
 
@@ -1150,20 +1231,16 @@ bool build_step_graph(
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
-    ggml_tensor * t_k_total = t_k;
-    ggml_tensor * t_v_total = t_v;
-    ggml_tensor * t_k_past_input = nullptr;
-    ggml_tensor * t_v_past_input = nullptr;
+    GGML_ASSERT(kv_capacity >= 0);
+    ggml_tensor * t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
+    ggml_tensor * t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
+    ggml_set_input(t_k_past_input);
+    ggml_set_input(t_v_past_input);
 
-    if (past_len > 0) {
-        t_k_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-        t_v_past_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-        ggml_set_input(t_k_past_input);
-        ggml_set_input(t_v_past_input);
-
-        t_k_total = ggml_concat(ctx.get(), t_k_past_input, t_k, 2);
-        t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
-    }
+    ggml_tensor * t_k_total = ggml_concat(ctx.get(), t_k_past_input, t_k, 2);
+    ggml_tensor * t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
+    ggml_tensor * t_kq_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kv_capacity + 1, 1, 1, 1);
+    ggml_set_input(t_kq_mask);
 
     ggml_tensor * t_k_attn = t_k_total;
     ggml_tensor * t_v_attn = t_v_total;
@@ -1201,7 +1278,7 @@ bool build_step_graph(
     const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
     kq = ggml_scale(ctx.get(), kq, kq_scale);
     kq = ggml_cont(ctx.get(), kq);
-    kq = ggml_soft_max(ctx.get(), kq);
+    kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, 1.0f, 0.0f);
 
     ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
     ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
@@ -1253,8 +1330,8 @@ bool build_step_graph(
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_hidden_out);
-    ggml_build_forward_expand(gf, t_k_total_out);
-    ggml_build_forward_expand(gf, t_v_total_out);
+    ggml_build_forward_expand(gf, t_k);
+    ggml_build_forward_expand(gf, t_v);
     if (t_logits) {
         ggml_build_forward_expand(gf, t_logits);
     }
@@ -1276,11 +1353,12 @@ bool build_step_graph(
     graph.t_pos = t_pos;
     graph.t_k_past_input = t_k_past_input;
     graph.t_v_past_input = t_v_past_input;
+    graph.t_kq_mask = t_kq_mask;
     graph.t_hidden_out = t_hidden_out;
     graph.t_k_curr = t_k;
     graph.t_v_curr = t_v;
-    graph.t_k_total = t_k_total_out;
-    graph.t_v_total = t_v_total_out;
+    graph.t_k_total = nullptr;
+    graph.t_v_total = nullptr;
     graph.t_logits = t_logits;
     return true;
 }
@@ -1288,7 +1366,7 @@ bool build_step_graph(
 bool build_step_batch_graph(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
-        int32_t past_len,
+        int32_t kv_capacity,
         int32_t hidden_in_dim,
         int32_t n_beams,
         bool with_logits,
@@ -1297,10 +1375,11 @@ bool build_step_batch_graph(
         graph.n_beams == n_beams &&
         (int32_t) graph.t_hidden_in.size() == n_beams &&
         (int32_t) graph.t_hidden_out.size() == n_beams &&
-        (int32_t) graph.t_k_total.size() == n_beams &&
-        (int32_t) graph.t_v_total.size() == n_beams &&
+        (int32_t) graph.t_k_curr.size() == n_beams &&
+        (int32_t) graph.t_v_curr.size() == n_beams &&
         (int32_t) graph.t_tok.size() == n_beams &&
-        (int32_t) graph.t_pos.size() == n_beams) {
+        (int32_t) graph.t_pos.size() == n_beams &&
+        graph.t_kq_mask) {
         return true;
     }
 
@@ -1331,6 +1410,8 @@ bool build_step_batch_graph(
 
     ggml_tensor * t_pos_b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_beams);
     ggml_set_input(t_pos_b);
+    ggml_tensor * t_kq_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kv_capacity + 1, 1, 1, 1);
+    ggml_set_input(t_kq_mask);
 
     std::vector<ggml_tensor *> t_hidden_in_cols;
     std::vector<ggml_tensor *> t_tok_elems;
@@ -1411,8 +1492,8 @@ bool build_step_batch_graph(
     // Per-beam attention + KV concat, then batch the output projection + FFN.
     std::vector<ggml_tensor *> t_k_past_in((size_t) n_beams, nullptr);
     std::vector<ggml_tensor *> t_v_past_in((size_t) n_beams, nullptr);
-    std::vector<ggml_tensor *> t_k_total_out((size_t) n_beams, nullptr);
-    std::vector<ggml_tensor *> t_v_total_out((size_t) n_beams, nullptr);
+    std::vector<ggml_tensor *> t_k_curr_out((size_t) n_beams, nullptr);
+    std::vector<ggml_tensor *> t_v_curr_out((size_t) n_beams, nullptr);
     std::vector<ggml_tensor *> t_attn_out_cols;
     t_attn_out_cols.reserve((size_t) n_beams);
 
@@ -1422,20 +1503,15 @@ bool build_step_batch_graph(
         ggml_tensor * k_i = ggml_view_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1, t_k->nb[1], t_k->nb[2], (size_t) ib * t_k->nb[2]);
         ggml_tensor * v_i = ggml_view_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1, t_v->nb[1], t_v->nb[2], (size_t) ib * t_v->nb[2]);
 
-        ggml_tensor * k_total = k_i;
-        ggml_tensor * v_total = v_i;
+        ggml_tensor * k_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
+        ggml_tensor * v_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity);
+        ggml_set_input(k_past);
+        ggml_set_input(v_past);
+        t_k_past_in[(size_t) ib] = k_past;
+        t_v_past_in[(size_t) ib] = v_past;
 
-        if (past_len > 0) {
-            ggml_tensor * k_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-            ggml_tensor * v_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-            ggml_set_input(k_past);
-            ggml_set_input(v_past);
-            t_k_past_in[(size_t) ib] = k_past;
-            t_v_past_in[(size_t) ib] = v_past;
-
-            k_total = ggml_concat(ctx.get(), k_past, k_i, 2); // [head_dim, n_kv, past+1]
-            v_total = ggml_concat(ctx.get(), v_past, v_i, 2);
-        }
+        ggml_tensor * k_total = ggml_concat(ctx.get(), k_past, k_i, 2); // [head_dim, n_kv, kv_capacity+1]
+        ggml_tensor * v_total = ggml_concat(ctx.get(), v_past, v_i, 2);
 
         ggml_tensor * k_attn = k_total;
         ggml_tensor * v_attn = v_total;
@@ -1472,7 +1548,7 @@ bool build_step_batch_graph(
         const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
         kq = ggml_scale(ctx.get(), kq, kq_scale);
         kq = ggml_cont(ctx.get(), kq);
-        kq = ggml_soft_max(ctx.get(), kq);
+        kq = ggml_soft_max_ext(ctx.get(), kq, t_kq_mask, 1.0f, 0.0f);
 
         ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
         ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
@@ -1481,9 +1557,8 @@ bool build_step_batch_graph(
 
         t_attn_out_cols.push_back(attn_out);
 
-        // Materialize KV totals for the caller (stored in KV-head space, not repeated-to-heads).
-        t_k_total_out[(size_t) ib] = ggml_cont(ctx.get(), k_total);
-        t_v_total_out[(size_t) ib] = ggml_cont(ctx.get(), v_total);
+        t_k_curr_out[(size_t) ib] = ggml_cont(ctx.get(), k_i);
+        t_v_curr_out[(size_t) ib] = ggml_cont(ctx.get(), v_i);
     }
 
     ggml_tensor * t_attn_out_b = t_attn_out_cols.empty() ? nullptr : t_attn_out_cols[0];
@@ -1557,8 +1632,8 @@ bool build_step_batch_graph(
 
     for (int32_t ib = 0; ib < n_beams; ++ib) {
         ggml_build_forward_expand(gf, t_hidden_out_views[(size_t) ib]);
-        ggml_build_forward_expand(gf, t_k_total_out[(size_t) ib]);
-        ggml_build_forward_expand(gf, t_v_total_out[(size_t) ib]);
+        ggml_build_forward_expand(gf, t_k_curr_out[(size_t) ib]);
+        ggml_build_forward_expand(gf, t_v_curr_out[(size_t) ib]);
         if (t_logits_views[(size_t) ib]) {
             ggml_build_forward_expand(gf, t_logits_views[(size_t) ib]);
         }
@@ -1584,7 +1659,10 @@ bool build_step_batch_graph(
     graph.t_pos.resize((size_t) n_beams);
     graph.t_k_past_input.resize((size_t) n_beams);
     graph.t_v_past_input.resize((size_t) n_beams);
+    graph.t_kq_mask = t_kq_mask;
     graph.t_hidden_out.resize((size_t) n_beams);
+    graph.t_k_curr.resize((size_t) n_beams);
+    graph.t_v_curr.resize((size_t) n_beams);
     graph.t_k_total.resize((size_t) n_beams);
     graph.t_v_total.resize((size_t) n_beams);
     graph.t_logits.resize((size_t) n_beams);
@@ -1596,8 +1674,10 @@ bool build_step_batch_graph(
         graph.t_k_past_input[(size_t) ib] = t_k_past_in[(size_t) ib];
         graph.t_v_past_input[(size_t) ib] = t_v_past_in[(size_t) ib];
         graph.t_hidden_out[(size_t) ib] = t_hidden_out_views[(size_t) ib];
-        graph.t_k_total[(size_t) ib] = t_k_total_out[(size_t) ib];
-        graph.t_v_total[(size_t) ib] = t_v_total_out[(size_t) ib];
+        graph.t_k_curr[(size_t) ib] = t_k_curr_out[(size_t) ib];
+        graph.t_v_curr[(size_t) ib] = t_v_curr_out[(size_t) ib];
+        graph.t_k_total[(size_t) ib] = nullptr;
+        graph.t_v_total[(size_t) ib] = nullptr;
         graph.t_logits[(size_t) ib] = t_logits_views[(size_t) ib];
     }
 
@@ -1878,7 +1958,9 @@ bool llama_eagle3_logits(
     const auto & hp = model.hparams;
 
     if (rt.backend_compute && rt.buft_compute) {
+        const bool reused = matches_logits_graph(rt.logits_graph);
         if (build_logits_graph(model, rt, rt.logits_graph)) {
+            count_graph_use(rt.logits_graph_counter, reused);
             ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.logits_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.logits_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
@@ -1937,7 +2019,9 @@ bool llama_eagle3_topk(
     }
 
     if (rt.backend_compute && rt.buft_compute) {
+        const bool reused = matches_topk_graph(rt.topk_graph, k);
         if (build_topk_graph(model, rt, k, rt.topk_graph)) {
+            count_graph_use(rt.topk_graph_counter, reused);
             ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.topk_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.topk_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
@@ -2002,7 +2086,9 @@ bool llama_eagle3_topk_state(
     }
 
     if (rt.backend_compute && rt.buft_compute && state.dev && state.dev->t_hidden) {
+        const bool reused = matches_topk_graph(rt.topk_graph, k);
         if (build_topk_graph(model, rt, k, rt.topk_graph)) {
+            count_graph_use(rt.topk_graph_counter, reused);
             ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), state.dev->t_hidden, rt.topk_graph.t_hidden);
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.topk_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
@@ -2045,7 +2131,9 @@ bool llama_eagle3_topk_state_batch(
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/topk_state_batch");
 #endif
+        const bool reused = matches_topk_batch_graph(rt.topk_batch_graph, n_beams, k);
         if (build_topk_batch_graph(model, rt, n_beams, k, rt.topk_batch_graph)) {
+            count_graph_use(rt.topk_batch_graph_counter, reused);
             auto & graph = rt.topk_batch_graph;
             if ((int32_t) graph.t_hidden_cols.size() != n_beams) {
                 return false;
@@ -2152,7 +2240,9 @@ bool llama_eagle3_select_state_batch(
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/select_state_batch");
 #endif
+        const bool reused = matches_select_batch_graph(rt.select_batch_graph, n_beams, k, n_select);
         if (build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+            count_graph_use(rt.select_batch_graph_counter, reused);
             auto & graph = rt.select_batch_graph;
             if ((int32_t) graph.t_hidden_cols.size() != n_beams) {
                 return false;
@@ -2341,18 +2431,36 @@ bool llama_eagle3_step_batch_from_parents(
             }
         }
 
-        const uint64_t key = make_step_batch_graph_key(past_len, hidden_in_dim, n_beams, with_logits);
+        int32_t kv_capacity = 0;
+        const int32_t required_len = past_len + 1;
+        for (int32_t ib = 0; ib < n_beams; ++ib) {
+            const llama_eagle3_state * st = parent_states[(size_t) ib];
+            const llama_eagle3_state * out_st = out_states[(size_t) ib];
+            const int32_t cur_capacity = out_st && out_st->dev ? out_st->dev->kv_capacity : (st && st->dev ? st->dev->kv_capacity : 0);
+            kv_capacity = std::max(kv_capacity, choose_kv_capacity(required_len, reserve_kv, cur_capacity));
+        }
+
+        const uint64_t key = make_step_batch_graph_key(kv_capacity, hidden_in_dim, n_beams, with_logits);
+        bool built_graph = false;
         if (rt.step_batch_graph_key != key) {
             rt.step_batch_graph = {};
-            if (build_step_batch_graph(model, rt, past_len, hidden_in_dim, n_beams, with_logits, rt.step_batch_graph)) {
+            if (build_step_batch_graph(model, rt, kv_capacity, hidden_in_dim, n_beams, with_logits, rt.step_batch_graph)) {
                 rt.step_batch_graph_key = key;
+                built_graph = true;
+                count_graph_use(rt.step_batch_graph_counter, false);
             }
         }
 
         if (rt.step_batch_graph_key == key && rt.step_batch_graph.gf) {
+            if (!built_graph) {
+                count_graph_use(rt.step_batch_graph_counter, true);
+            }
             auto & graph = rt.step_batch_graph;
             const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
             const size_t past_bytes = (size_t) past_len * block * sizeof(float);
+            if (!set_eagle_kq_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity, past_len)) {
+                return false;
+            }
 
             {
 #if defined(GGML_USE_CUDA)
@@ -2424,45 +2532,69 @@ bool llama_eagle3_step_batch_from_parents(
 #if defined(GGML_USE_CUDA)
                     ggml_cuda_profiler_scope zone_copy_out(rt.backend_compute.get(), "eagle3/step_batch/copy_outputs");
 #endif
-                    const int32_t required_len = past_len + 1;
                     for (int32_t ib = 0; ib < n_beams; ++ib) {
+                        const llama_eagle3_state * parent_st = parent_states[(size_t) ib];
                         llama_eagle3_state * out_st = out_states[(size_t) ib];
-                        if (!out_st) {
+                        if (!parent_st || !out_st) {
                             return false;
                         }
 
                         const bool can_reuse = out_st->dev &&
                                 out_st->dev.use_count() == 1 &&
                                 out_st->dev->t_hidden &&
-                                out_st->dev->kv_capacity >= required_len + std::max(0, reserve_kv);
+                                out_st->dev->kv_capacity >= kv_capacity;
 
                         std::shared_ptr<llama_eagle3_state::device_state> next_dev = can_reuse ? out_st->dev : nullptr;
                         if (!next_dev) {
-                            const int32_t cur_capacity = out_st->dev ? out_st->dev->kv_capacity : 0;
-                            const int32_t desired_capacity = choose_kv_capacity(required_len, reserve_kv, cur_capacity);
-                            if (!alloc_state_device(model, rt, desired_capacity, next_dev)) {
+                            if (!alloc_state_device(model, rt, kv_capacity, next_dev)) {
                                 return false;
                             }
                         }
 
                         ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out[(size_t) ib], next_dev->t_hidden);
-                        if (next_dev->t_k && next_dev->t_v && graph.t_k_total[(size_t) ib] && graph.t_v_total[(size_t) ib]) {
-                            if (!tensor_copy_3d_prefix_async(
+                        if (next_dev->t_k && next_dev->t_v) {
+                            if (past_len > 0) {
+                                if (parent_st->dev && parent_st->dev->t_k && parent_st->dev->t_v && parent_st->dev->kv_capacity >= past_len) {
+                                    if (!tensor_copy_3d_prefix_async(
+                                                rt.backend_compute.get(),
+                                                parent_st->dev->t_k,
+                                                next_dev->t_k,
+                                                hp.head_dim,
+                                                hp.num_kv_heads,
+                                                past_len)) {
+                                        return false;
+                                    }
+                                    if (!tensor_copy_3d_prefix_async(
+                                                rt.backend_compute.get(),
+                                                parent_st->dev->t_v,
+                                                next_dev->t_v,
+                                                hp.head_dim,
+                                                hp.num_kv_heads,
+                                                past_len)) {
+                                        return false;
+                                    }
+                                } else if (parent_st->k.size() * sizeof(float) >= past_bytes && parent_st->v.size() * sizeof(float) >= past_bytes) {
+                                    ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_k, parent_st->k.data(), 0, past_bytes);
+                                    ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_v, parent_st->v.data(), 0, past_bytes);
+                                } else {
+                                    return false;
+                                }
+                            }
+
+                            if (!tensor_copy_3d_token_async(
                                         rt.backend_compute.get(),
-                                        graph.t_k_total[(size_t) ib],
+                                        rt.backend_compute.get(),
+                                        graph.t_k_curr[(size_t) ib],
                                         next_dev->t_k,
-                                        hp.head_dim,
-                                        hp.num_kv_heads,
-                                        required_len)) {
+                                        past_len)) {
                                 return false;
                             }
-                            if (!tensor_copy_3d_prefix_async(
+                            if (!tensor_copy_3d_token_async(
                                         rt.backend_compute.get(),
-                                        graph.t_v_total[(size_t) ib],
+                                        rt.backend_compute.get(),
+                                        graph.t_v_curr[(size_t) ib],
                                         next_dev->t_v,
-                                        hp.head_dim,
-                                        hp.num_kv_heads,
-                                        required_len)) {
+                                        past_len)) {
                                 return false;
                             }
                         }
@@ -2514,19 +2646,30 @@ bool llama_eagle3_step_from_hidden_capture(
 
     const bool with_logits = logits_out != nullptr;
     if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
-        const uint64_t key = make_step_graph_key(state.past_len, hidden_in_dim, with_logits);
+        const int32_t required_len = state.past_len + 1;
+        const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
+        const int32_t kv_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
+        const uint64_t key = make_step_graph_key(kv_capacity, hidden_in_dim, with_logits);
+        bool built_graph = false;
         if (rt.step_graph_key != key) {
             rt.step_graph = {};
-            if (build_step_graph(model, rt, state.past_len, hidden_in_dim, with_logits, rt.step_graph)) {
+            if (build_step_graph(model, rt, kv_capacity, hidden_in_dim, with_logits, rt.step_graph)) {
                 rt.step_graph_key = key;
+                built_graph = true;
+                count_graph_use(rt.step_graph_counter, false);
             }
         }
 
         if (rt.step_graph_key == key && rt.step_graph.gf) {
+            if (!built_graph) {
+                count_graph_use(rt.step_graph_counter, true);
+            }
             auto & graph = rt.step_graph;
             const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
             const size_t past_bytes = (size_t) state.past_len * block * sizeof(float);
-            const int32_t required_len = state.past_len + 1;
+            if (!set_eagle_kq_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity, state.past_len)) {
+                return false;
+            }
 
             for (int32_t il = 0; il < hp.hidden_concat; ++il) {
                 ggml_tensor * src = const_cast<ggml_tensor *>(hidden_capture[(size_t) il]);
@@ -2585,35 +2728,58 @@ bool llama_eagle3_step_from_hidden_capture(
                 const bool can_reuse = state.dev &&
                         state.dev.use_count() == 1 &&
                         state.dev->t_hidden &&
-                        state.dev->kv_capacity >= required_len;
+                        state.dev->kv_capacity >= kv_capacity;
 
                 std::shared_ptr<llama_eagle3_state::device_state> next_dev = can_reuse ? state.dev : nullptr;
                 if (!next_dev) {
-                    const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
-                    const int32_t desired_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
-                    if (!alloc_state_device(model, rt, desired_capacity, next_dev)) {
+                    if (!alloc_state_device(model, rt, kv_capacity, next_dev)) {
                         return false;
                     }
                 }
 
                 ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out, next_dev->t_hidden);
-                if (next_dev->t_k && next_dev->t_v && graph.t_k_total && graph.t_v_total) {
-                    if (!tensor_copy_3d_prefix_async(
+                if (next_dev->t_k && next_dev->t_v) {
+                    if (state.past_len > 0) {
+                        if (state.dev && state.dev->t_k && state.dev->t_v && state.dev->kv_capacity >= state.past_len) {
+                            if (!tensor_copy_3d_prefix_async(
+                                        rt.backend_compute.get(),
+                                        state.dev->t_k,
+                                        next_dev->t_k,
+                                        hp.head_dim,
+                                        hp.num_kv_heads,
+                                        state.past_len)) {
+                                return false;
+                            }
+                            if (!tensor_copy_3d_prefix_async(
+                                        rt.backend_compute.get(),
+                                        state.dev->t_v,
+                                        next_dev->t_v,
+                                        hp.head_dim,
+                                        hp.num_kv_heads,
+                                        state.past_len)) {
+                                return false;
+                            }
+                        } else if (state.k.size() * sizeof(float) >= past_bytes && state.v.size() * sizeof(float) >= past_bytes) {
+                            ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_k, state.k.data(), 0, past_bytes);
+                            ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_v, state.v.data(), 0, past_bytes);
+                        } else {
+                            return false;
+                        }
+                    }
+                    if (!tensor_copy_3d_token_async(
                                 rt.backend_compute.get(),
-                                graph.t_k_total,
+                                rt.backend_compute.get(),
+                                graph.t_k_curr,
                                 next_dev->t_k,
-                                hp.head_dim,
-                                hp.num_kv_heads,
-                                required_len)) {
+                                state.past_len)) {
                         return false;
                     }
-                    if (!tensor_copy_3d_prefix_async(
+                    if (!tensor_copy_3d_token_async(
                                 rt.backend_compute.get(),
-                                graph.t_v_total,
+                                rt.backend_compute.get(),
+                                graph.t_v_curr,
                                 next_dev->t_v,
-                                hp.head_dim,
-                                hp.num_kv_heads,
-                                required_len)) {
+                                state.past_len)) {
                         return false;
                     }
                 }
@@ -2668,19 +2834,30 @@ bool llama_eagle3_step(
 
     const bool with_logits = logits_out != nullptr;
     if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
-        const uint64_t key = make_step_graph_key(state.past_len, hidden_in_dim, with_logits);
+        const int32_t required_len = state.past_len + 1;
+        const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
+        const int32_t kv_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
+        const uint64_t key = make_step_graph_key(kv_capacity, hidden_in_dim, with_logits);
+        bool built_graph = false;
         if (rt.step_graph_key != key) {
             rt.step_graph = {};
-            if (build_step_graph(model, rt, state.past_len, hidden_in_dim, with_logits, rt.step_graph)) {
+            if (build_step_graph(model, rt, kv_capacity, hidden_in_dim, with_logits, rt.step_graph)) {
                 rt.step_graph_key = key;
+                built_graph = true;
+                count_graph_use(rt.step_graph_counter, false);
             }
         }
 
         if (rt.step_graph_key == key && rt.step_graph.gf) {
+            if (!built_graph) {
+                count_graph_use(rt.step_graph_counter, true);
+            }
             auto & graph = rt.step_graph;
             const size_t block = (size_t) hp.head_dim * hp.num_kv_heads;
             const size_t past_bytes = (size_t) state.past_len * block * sizeof(float);
-            const int32_t required_len = state.past_len + 1;
+            if (!set_eagle_kq_mask(rt.backend_compute.get(), graph.t_kq_mask, kv_capacity, state.past_len)) {
+                return false;
+            }
 
             if (hidden_in) {
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, hidden_in, 0, hidden_in_dim * sizeof(float));
@@ -2732,35 +2909,58 @@ bool llama_eagle3_step(
                 const bool can_reuse = state.dev &&
                         state.dev.use_count() == 1 &&
                         state.dev->t_hidden &&
-                        state.dev->kv_capacity >= required_len;
+                        state.dev->kv_capacity >= kv_capacity;
 
                 std::shared_ptr<llama_eagle3_state::device_state> next_dev = can_reuse ? state.dev : nullptr;
                 if (!next_dev) {
-                    const int32_t cur_capacity = state.dev ? state.dev->kv_capacity : 0;
-                    const int32_t desired_capacity = choose_kv_capacity(required_len, /* reserve_kv = */ 0, cur_capacity);
-                    if (!alloc_state_device(model, rt, desired_capacity, next_dev)) {
+                    if (!alloc_state_device(model, rt, kv_capacity, next_dev)) {
                         return false;
                     }
                 }
 
                 ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out, next_dev->t_hidden);
-                if (next_dev->t_k && next_dev->t_v && graph.t_k_total && graph.t_v_total) {
-                    if (!tensor_copy_3d_prefix_async(
+                if (next_dev->t_k && next_dev->t_v) {
+                    if (state.past_len > 0) {
+                        if (state.dev && state.dev->t_k && state.dev->t_v && state.dev->kv_capacity >= state.past_len) {
+                            if (!tensor_copy_3d_prefix_async(
+                                        rt.backend_compute.get(),
+                                        state.dev->t_k,
+                                        next_dev->t_k,
+                                        hp.head_dim,
+                                        hp.num_kv_heads,
+                                        state.past_len)) {
+                                return false;
+                            }
+                            if (!tensor_copy_3d_prefix_async(
+                                        rt.backend_compute.get(),
+                                        state.dev->t_v,
+                                        next_dev->t_v,
+                                        hp.head_dim,
+                                        hp.num_kv_heads,
+                                        state.past_len)) {
+                                return false;
+                            }
+                        } else if (state.k.size() * sizeof(float) >= past_bytes && state.v.size() * sizeof(float) >= past_bytes) {
+                            ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_k, state.k.data(), 0, past_bytes);
+                            ggml_backend_tensor_set_async(rt.backend_compute.get(), next_dev->t_v, state.v.data(), 0, past_bytes);
+                        } else {
+                            return false;
+                        }
+                    }
+                    if (!tensor_copy_3d_token_async(
                                 rt.backend_compute.get(),
-                                graph.t_k_total,
+                                rt.backend_compute.get(),
+                                graph.t_k_curr,
                                 next_dev->t_k,
-                                hp.head_dim,
-                                hp.num_kv_heads,
-                                required_len)) {
+                                state.past_len)) {
                         return false;
                     }
-                    if (!tensor_copy_3d_prefix_async(
+                    if (!tensor_copy_3d_token_async(
                                 rt.backend_compute.get(),
-                                graph.t_v_total,
+                                rt.backend_compute.get(),
+                                graph.t_v_curr,
                                 next_dev->t_v,
-                                hp.head_dim,
-                                hp.num_kv_heads,
-                                required_len)) {
+                                state.past_len)) {
                         return false;
                     }
                 }
