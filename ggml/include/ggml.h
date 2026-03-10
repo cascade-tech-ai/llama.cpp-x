@@ -540,6 +540,7 @@ extern "C" {
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
         GGML_OP_TOP_K,
+        GGML_OP_TOP_K_THRESHOLD,
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
@@ -2304,6 +2305,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    GGML_API struct ggml_tensor * ggml_top_k_threshold(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            float                 threshold);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

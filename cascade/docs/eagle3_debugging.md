@@ -80,7 +80,7 @@ CASCADE_EAGLE_DUMP_DIR=/tmp/eagle_llama CASCADE_EAGLE_VERBOSE=1 \
     -m /home/alvion/models/Llama-3.2-1B-Instruct-Q8_0.gguf \
     --model-draft /home/alvion/models/llama3-1b_eagle_001.gguf \
     --spec-type eagle3 \
-    --eagle-max-depth 1 --eagle-max-proposals 8 --eagle-beam-width 8 --eagle-prob-threshold 0 \
+    --eagle-max-depth 1 --eagle-max-proposals 8 --eagle-beam-width 8 --eagle-per-beam-topk-candidates 0 \
     -p "0, 1, 2, 3, 4, 5, 6, " \
     -n 1 -ngl -1 --temp 0 --top-k 1
 ```

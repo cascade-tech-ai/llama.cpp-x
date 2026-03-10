@@ -51,6 +51,109 @@ struct ggml_cuda_profiler_scope {
 };
 #endif
 
+void log_eagle_flash_attn_once(
+        const llama_eagle3_runtime & rt,
+        bool & logged_flag,
+        const char * graph_name,
+        const char * status) {
+    if (logged_flag) {
+        return;
+    }
+
+    logged_flag = true;
+
+    const char * backend_name = rt.backend_compute ? ggml_backend_name(rt.backend_compute.get()) : "none";
+    LLAMA_LOG_INFO("%s: eagle %s attention %s (backend = %s)\n", __func__, graph_name, status, backend_name);
+}
+
+ggml_tensor * build_eagle_attn_output(
+        ggml_context * ctx,
+        const llama_eagle3_hparams & hp,
+        const llama_eagle3_runtime & rt,
+        ggml_tensor * t_q,
+        ggml_tensor * t_k_total,
+        ggml_tensor * t_v_total,
+        const char * graph_name,
+        bool & logged_flag) {
+    ggml_tensor * qv = ggml_view_4d(ctx, t_q, t_q->ne[0], t_q->ne[1], t_q->ne[2], 1,
+                                    t_q->nb[1], t_q->nb[2], t_q->nb[3], 0);
+    ggml_tensor * kv = ggml_view_4d(ctx, t_k_total, t_k_total->ne[0], t_k_total->ne[1], t_k_total->ne[2], 1,
+                                    t_k_total->nb[1], t_k_total->nb[2], t_k_total->nb[3], 0);
+    ggml_tensor * vv = ggml_view_4d(ctx, t_v_total, t_v_total->ne[0], t_v_total->ne[1], t_v_total->ne[2], 1,
+                                    t_v_total->nb[1], t_v_total->nb[2], t_v_total->nb[3], 0);
+
+    qv = ggml_permute(ctx, qv, 0, 2, 1, 3);
+    kv = ggml_permute(ctx, kv, 0, 2, 1, 3);
+    vv = ggml_permute(ctx, vv, 0, 2, 1, 3);
+
+    const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
+
+    if (rt.flash_attn && rt.backend_compute) {
+        ggml_tensor * kv_fa = kv;
+        ggml_tensor * vv_fa = vv;
+
+        if (kv_fa->type == GGML_TYPE_F32) {
+            kv_fa = ggml_cast(ctx, kv_fa, GGML_TYPE_F16);
+        }
+
+        if (vv_fa->type == GGML_TYPE_F32) {
+            vv_fa = ggml_cast(ctx, vv_fa, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * fattn = ggml_flash_attn_ext(ctx, qv, kv_fa, vv_fa, nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fattn, GGML_PREC_F32);
+
+        if (ggml_backend_supports_op(rt.backend_compute.get(), fattn)) {
+            log_eagle_flash_attn_once(rt, logged_flag, graph_name, "using ggml_flash_attn_ext");
+            return ggml_reshape_2d(ctx, fattn, fattn->ne[0] * fattn->ne[1], fattn->ne[2] * fattn->ne[3]);
+        }
+
+        log_eagle_flash_attn_once(rt, logged_flag, graph_name, "requested ggml_flash_attn_ext but fell back to generic attention");
+    } else {
+        log_eagle_flash_attn_once(rt, logged_flag, graph_name, "using generic attention");
+    }
+
+    ggml_tensor * t_k_attn = t_k_total;
+    ggml_tensor * t_v_attn = t_v_total;
+
+    if (hp.num_kv_heads != hp.num_heads) {
+        const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
+
+        ggml_tensor * k4 = ggml_reshape_4d(ctx, t_k_attn, hp.head_dim, hp.num_kv_heads, t_k_attn->ne[2], 1);
+        ggml_tensor * v4 = ggml_reshape_4d(ctx, t_v_attn, hp.head_dim, hp.num_kv_heads, t_v_attn->ne[2], 1);
+
+        k4 = ggml_permute(ctx, k4, 0, 2, 3, 1);
+        v4 = ggml_permute(ctx, v4, 0, 2, 3, 1);
+
+        k4 = ggml_repeat_4d(ctx, k4, hp.head_dim, n_rep, hp.num_kv_heads, t_k_attn->ne[2]);
+        v4 = ggml_repeat_4d(ctx, v4, hp.head_dim, n_rep, hp.num_kv_heads, t_v_attn->ne[2]);
+
+        k4 = ggml_cont(ctx, k4);
+        v4 = ggml_cont(ctx, v4);
+
+        t_k_attn = ggml_reshape_3d(ctx, k4, hp.head_dim, hp.num_heads, t_k_attn->ne[2]);
+        t_v_attn = ggml_reshape_3d(ctx, v4, hp.head_dim, hp.num_heads, t_v_attn->ne[2]);
+    }
+
+    kv = ggml_view_4d(ctx, t_k_attn, t_k_attn->ne[0], t_k_attn->ne[1], t_k_attn->ne[2], 1,
+                      t_k_attn->nb[1], t_k_attn->nb[2], t_k_attn->nb[3], 0);
+    vv = ggml_view_4d(ctx, t_v_attn, t_v_attn->ne[0], t_v_attn->ne[1], t_v_attn->ne[2], 1,
+                      t_v_attn->nb[1], t_v_attn->nb[2], t_v_attn->nb[3], 0);
+
+    kv = ggml_permute(ctx, kv, 0, 2, 1, 3);
+    vv = ggml_permute(ctx, vv, 0, 2, 1, 3);
+
+    ggml_tensor * kq = ggml_mul_mat(ctx, kv, qv);
+    kq = ggml_scale(ctx, kq, kq_scale);
+    kq = ggml_cont(ctx, kq);
+    kq = ggml_soft_max(ctx, kq);
+
+    ggml_tensor * vv_t = ggml_cont(ctx, ggml_transpose(ctx, vv));
+    ggml_tensor * kqv = ggml_mul_mat(ctx, vv_t, kq);
+    ggml_tensor * attn_out = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+    return ggml_cont_2d(ctx, attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]);
+}
+
 constexpr const char * EAGLE3_ARCH = "eagle3";
 
 constexpr const char * EAGLE3_KEY_HIDDEN_SIZE        = "eagle3.hidden_size";
@@ -743,11 +846,13 @@ bool build_select_batch_graph(
         int32_t n_beams,
         int32_t k,
         int32_t n_select,
+        float prob_threshold,
         llama_eagle3_select_batch_graph & graph) {
     if (graph.ctx && graph.buf_compute && graph.gf &&
         graph.t_hidden && graph.t_beam_logprob &&
         graph.t_selected_linear && graph.t_selected_draft && graph.t_selected_logprob &&
         graph.n_beams == n_beams && graph.k == k && graph.n_select == n_select &&
+        graph.prob_threshold == prob_threshold &&
         (int32_t) graph.t_hidden_cols.size() == n_beams) {
         return true;
     }
@@ -787,13 +892,18 @@ bool build_select_batch_graph(
     ggml_tensor * t_probs = ggml_soft_max(ctx.get(), t_logits);
     t_probs = ggml_cont(ctx.get(), t_probs);
 
-    ggml_tensor * t_topk_idx = ggml_top_k(ctx.get(), t_probs, k);
+    ggml_tensor * t_topk_idx = ggml_top_k_threshold(ctx.get(), t_probs, k, prob_threshold);
     t_topk_idx = ggml_cont(ctx.get(), t_topk_idx);
 
-    ggml_tensor * t_probs_flat = ggml_reshape_2d(ctx.get(), t_probs, 1, hp.draft_vocab_size * n_beams);
+    ggml_tensor * t_probs_zero = ggml_view_2d(ctx.get(), t_probs, 1, n_beams, t_probs->nb[1], 0);
+    t_probs_zero = ggml_scale(ctx.get(), t_probs_zero, 0.0f);
+    ggml_tensor * t_probs_ext = ggml_concat(ctx.get(), t_probs, t_probs_zero, 0);
+    t_probs_ext = ggml_cont(ctx.get(), t_probs_ext);
+
+    ggml_tensor * t_probs_flat = ggml_reshape_2d(ctx.get(), t_probs_ext, 1, (hp.draft_vocab_size + 1) * n_beams);
 
     ggml_tensor * t_beam = ggml_arange(ctx.get(), 0.0f, (float) n_beams, 1.0f);
-    t_beam = ggml_scale(ctx.get(), t_beam, (float) hp.draft_vocab_size);
+    t_beam = ggml_scale(ctx.get(), t_beam, (float) (hp.draft_vocab_size + 1));
     t_beam = ggml_reshape_2d(ctx.get(), t_beam, 1, n_beams);
 
     ggml_tensor * t_topk_idx_f = ggml_cast(ctx.get(), t_topk_idx, GGML_TYPE_F32);
@@ -852,6 +962,7 @@ bool build_select_batch_graph(
     graph.k = k;
     graph.n_beams = n_beams;
     graph.n_select = n_select;
+    graph.prob_threshold = prob_threshold;
     graph.t_hidden = t_hidden;
     graph.t_beam_logprob = t_beam_logprob;
     graph.t_selected_linear = t_selected_linear;
@@ -1165,48 +1276,8 @@ bool build_step_graph(
         t_v_total = ggml_concat(ctx.get(), t_v_past_input, t_v, 2);
     }
 
-    ggml_tensor * t_k_attn = t_k_total;
-    ggml_tensor * t_v_attn = t_v_total;
-
-    if (hp.num_kv_heads != hp.num_heads) {
-        const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
-
-        ggml_tensor * k4 = ggml_reshape_4d(ctx.get(), t_k_attn, hp.head_dim, hp.num_kv_heads, t_k_attn->ne[2], 1);
-        ggml_tensor * v4 = ggml_reshape_4d(ctx.get(), t_v_attn, hp.head_dim, hp.num_kv_heads, t_v_attn->ne[2], 1);
-
-        k4 = ggml_permute(ctx.get(), k4, 0, 2, 3, 1);
-        v4 = ggml_permute(ctx.get(), v4, 0, 2, 3, 1);
-
-        k4 = ggml_repeat_4d(ctx.get(), k4, hp.head_dim, n_rep, hp.num_kv_heads, t_k_attn->ne[2]);
-        v4 = ggml_repeat_4d(ctx.get(), v4, hp.head_dim, n_rep, hp.num_kv_heads, t_v_attn->ne[2]);
-
-        k4 = ggml_cont(ctx.get(), k4);
-        v4 = ggml_cont(ctx.get(), v4);
-
-        t_k_attn = ggml_reshape_3d(ctx.get(), k4, hp.head_dim, hp.num_heads, t_k_attn->ne[2]);
-        t_v_attn = ggml_reshape_3d(ctx.get(), v4, hp.head_dim, hp.num_heads, t_v_attn->ne[2]);
-    }
-
-    ggml_tensor * qv = ggml_view_4d(ctx.get(), t_q, t_q->ne[0], t_q->ne[1], t_q->ne[2], 1, t_q->nb[1], t_q->nb[2], t_q->nb[3], 0);
-    ggml_tensor * kv = ggml_view_4d(ctx.get(), t_k_attn, t_k_attn->ne[0], t_k_attn->ne[1], t_k_attn->ne[2], 1,
-                                    t_k_attn->nb[1], t_k_attn->nb[2], t_k_attn->nb[3], 0);
-    ggml_tensor * vv = ggml_view_4d(ctx.get(), t_v_attn, t_v_attn->ne[0], t_v_attn->ne[1], t_v_attn->ne[2], 1,
-                                    t_v_attn->nb[1], t_v_attn->nb[2], t_v_attn->nb[3], 0);
-
-    qv = ggml_permute(ctx.get(), qv, 0, 2, 1, 3);
-    kv = ggml_permute(ctx.get(), kv, 0, 2, 1, 3);
-    vv = ggml_permute(ctx.get(), vv, 0, 2, 1, 3);
-
-    ggml_tensor * kq = ggml_mul_mat(ctx.get(), kv, qv);
-    const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
-    kq = ggml_scale(ctx.get(), kq, kq_scale);
-    kq = ggml_cont(ctx.get(), kq);
-    kq = ggml_soft_max(ctx.get(), kq);
-
-    ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
-    ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
-    ggml_tensor * attn_out = ggml_permute(ctx.get(), kqv, 0, 2, 1, 3);
-    attn_out = ggml_cont_2d(ctx.get(), attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]);
+    ggml_tensor * attn_out = build_eagle_attn_output(
+            ctx.get(), hp, rt, t_q, t_k_total, t_v_total, "step", rt.flash_attn_logged_step);
 
     ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), tensors.attn_o_w, attn_out);
     if (tensors.attn_o_b) {
@@ -1437,47 +1508,8 @@ bool build_step_batch_graph(
             v_total = ggml_concat(ctx.get(), v_past, v_i, 2);
         }
 
-        ggml_tensor * k_attn = k_total;
-        ggml_tensor * v_attn = v_total;
-
-        if (hp.num_kv_heads != hp.num_heads) {
-            const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
-            ggml_tensor * k4 = ggml_reshape_4d(ctx.get(), k_attn, hp.head_dim, hp.num_kv_heads, k_attn->ne[2], 1);
-            ggml_tensor * v4 = ggml_reshape_4d(ctx.get(), v_attn, hp.head_dim, hp.num_kv_heads, v_attn->ne[2], 1);
-
-            k4 = ggml_permute(ctx.get(), k4, 0, 2, 3, 1);
-            v4 = ggml_permute(ctx.get(), v4, 0, 2, 3, 1);
-
-            k4 = ggml_repeat_4d(ctx.get(), k4, hp.head_dim, n_rep, hp.num_kv_heads, k_attn->ne[2]); // [head_dim, n_rep, n_kv, seq]
-            v4 = ggml_repeat_4d(ctx.get(), v4, hp.head_dim, n_rep, hp.num_kv_heads, v_attn->ne[2]);
-
-            k4 = ggml_cont(ctx.get(), k4);
-            v4 = ggml_cont(ctx.get(), v4);
-
-            k_attn = ggml_reshape_3d(ctx.get(), k4, hp.head_dim, hp.num_heads, k_attn->ne[2]);
-            v_attn = ggml_reshape_3d(ctx.get(), v4, hp.head_dim, hp.num_heads, v_attn->ne[2]);
-        }
-
-        ggml_tensor * qv = ggml_view_4d(ctx.get(), q_i, q_i->ne[0], q_i->ne[1], q_i->ne[2], 1, q_i->nb[1], q_i->nb[2], q_i->nb[3], 0);
-        ggml_tensor * kv = ggml_view_4d(ctx.get(), k_attn, k_attn->ne[0], k_attn->ne[1], k_attn->ne[2], 1,
-                                        k_attn->nb[1], k_attn->nb[2], k_attn->nb[3], 0);
-        ggml_tensor * vv = ggml_view_4d(ctx.get(), v_attn, v_attn->ne[0], v_attn->ne[1], v_attn->ne[2], 1,
-                                        v_attn->nb[1], v_attn->nb[2], v_attn->nb[3], 0);
-
-        qv = ggml_permute(ctx.get(), qv, 0, 2, 1, 3);
-        kv = ggml_permute(ctx.get(), kv, 0, 2, 1, 3);
-        vv = ggml_permute(ctx.get(), vv, 0, 2, 1, 3);
-
-        ggml_tensor * kq = ggml_mul_mat(ctx.get(), kv, qv);
-        const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
-        kq = ggml_scale(ctx.get(), kq, kq_scale);
-        kq = ggml_cont(ctx.get(), kq);
-        kq = ggml_soft_max(ctx.get(), kq);
-
-        ggml_tensor * vv_t = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vv));
-        ggml_tensor * kqv = ggml_mul_mat(ctx.get(), vv_t, kq);
-        ggml_tensor * attn_out = ggml_permute(ctx.get(), kqv, 0, 2, 1, 3);
-        attn_out = ggml_cont_2d(ctx.get(), attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]); // [hidden, 1]
+        ggml_tensor * attn_out = build_eagle_attn_output(
+                ctx.get(), hp, rt, q_i, k_total, v_total, "step_batch", rt.flash_attn_logged_step_batch);
 
         t_attn_out_cols.push_back(attn_out);
 
@@ -1797,6 +1829,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
 
     rt.base_model     = llama_get_model(const_cast<llama_context *>(ctx_tgt));
     rt.tok_embd       = rt.base_model ? rt.base_model->tok_embd : nullptr;
+    rt.flash_attn     = cparams.flash_attn;
     rt.target_backend = ctx_impl->primary_backend();
     // The EAGLE head is exported from HF Transformers and uses the same RoPE convention as
     // transformers' LlamaRotaryEmbedding/apply_rotary_pos_emb, which corresponds to GGML_ROPE_TYPE_NEOX
@@ -2129,6 +2162,7 @@ bool llama_eagle3_select_state_batch(
         const std::vector<const llama_eagle3_state *> & states,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         std::vector<int32_t> & selected_linear_out,
         std::vector<int32_t> & selected_draft_idx_out,
         std::vector<float> & selected_logprob_out) {
@@ -2152,7 +2186,7 @@ bool llama_eagle3_select_state_batch(
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/select_state_batch");
 #endif
-        if (build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+        if (build_select_batch_graph(model, rt, n_beams, k, n_select, prob_threshold, rt.select_batch_graph)) {
             auto & graph = rt.select_batch_graph;
             if ((int32_t) graph.t_hidden_cols.size() != n_beams) {
                 return false;
@@ -2263,6 +2297,7 @@ bool llama_eagle3_select_state_batch_device(
         const std::vector<const llama_eagle3_state *> & states,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         llama_eagle3_select_batch_device_result & out) {
     out = {};
 
@@ -2286,7 +2321,7 @@ bool llama_eagle3_select_state_batch_device(
         return false;
     }
 
-    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, prob_threshold, rt.select_batch_graph)) {
         return false;
     }
 
@@ -2344,6 +2379,7 @@ bool llama_eagle3_select_state_slots_device(
         const std::vector<uint8_t> & active_mask,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         llama_eagle3_select_batch_device_result & out) {
     out = {};
 
@@ -2367,7 +2403,7 @@ bool llama_eagle3_select_state_slots_device(
         return false;
     }
 
-    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, rt.select_batch_graph)) {
+    if (!build_select_batch_graph(model, rt, n_beams, k, n_select, prob_threshold, rt.select_batch_graph)) {
         return false;
     }
 
@@ -2427,6 +2463,7 @@ bool llama_eagle3_select_state_slots(
         const std::vector<uint8_t> & active_mask,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         std::vector<int32_t> & selected_linear_out,
         std::vector<int32_t> & selected_draft_idx_out,
         std::vector<float> & selected_logprob_out) {
@@ -2448,7 +2485,7 @@ bool llama_eagle3_select_state_slots(
 
     if (rt.backend_compute && rt.buft_compute) {
         llama_eagle3_select_batch_device_result device_out;
-        if (llama_eagle3_select_state_slots_device(model, rt, states, active_mask, beam_logprob, k, device_out)) {
+        if (llama_eagle3_select_state_slots_device(model, rt, states, active_mask, beam_logprob, k, prob_threshold, device_out)) {
             selected_linear_out.resize((size_t) n_select);
             selected_draft_idx_out.resize((size_t) n_select);
             selected_logprob_out.resize((size_t) n_select);
@@ -2506,7 +2543,7 @@ bool llama_eagle3_select_state_slots(
     std::vector<int32_t> active_linear;
     std::vector<int32_t> active_draft_idx;
     std::vector<float> active_selected_logprob;
-    if (!llama_eagle3_select_state_batch(model, rt, active_states, active_logprob, k, active_linear, active_draft_idx, active_selected_logprob)) {
+    if (!llama_eagle3_select_state_batch(model, rt, active_states, active_logprob, k, prob_threshold, active_linear, active_draft_idx, active_selected_logprob)) {
         return false;
     }
 

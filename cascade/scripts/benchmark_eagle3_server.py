@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eagle-max-depth", type=int, default=None)
     parser.add_argument("--eagle-max-proposals", type=int, default=None)
     parser.add_argument("--eagle-beam-width", type=int, default=None)
-    parser.add_argument("--eagle-prob-threshold", type=float, default=None)
+    parser.add_argument("--eagle-per-beam-topk-candidates", type=int, default=None)
 
     args = parser.parse_args()
     if args.num_prompts <= 0:
@@ -278,7 +278,7 @@ def build_payload(args: argparse.Namespace, messages: List[Dict[str, Any]], mode
             "speculative.eagle_max_depth": args.eagle_max_depth,
             "speculative.eagle_max_proposals": args.eagle_max_proposals,
             "speculative.eagle_beam_width": args.eagle_beam_width,
-            "speculative.eagle_prob_threshold": args.eagle_prob_threshold,
+            "speculative.eagle_per_beam_topk_candidates": args.eagle_per_beam_topk_candidates,
         }
         for key, value in optional.items():
             if value is not None:

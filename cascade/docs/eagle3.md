@@ -78,7 +78,7 @@ Open design decisions (need confirmation)
 6) CLI shape
    - Decision: Fit llama.cpp’s existing speculative decoding flags. Reuse --model-draft + --spec-type eagle3.
    - Layer selection is read from the EAGLE3 GGUF (no CLI flag).
-   - Add rollout control flags matching speculators eval mode: --eagle-max-depth, --eagle-max-proposals, --eagle-prob-threshold.
+   - Add rollout control flags matching speculators eval mode: --eagle-max-depth, --eagle-max-proposals, --eagle-per-beam-topk-candidates.
 
 Proposed GGUF schema for EAGLE3 head (draft)
 - general.architecture = "eagle3" (new arch string)
@@ -107,7 +107,7 @@ Phase 0: Align on format and semantics
 - Confirm which Kestrel export format will be used (Kestrel vs speculators).
 - Decide on GGUF schema and whether to store embeddings in the head GGUF.
 - Decide draft vocab requirements (full vocab only vs subset w/ d2t).
-- Confirm rollout CLI parameters and names (use --eagle-max-depth, --eagle-max-proposals, --eagle-prob-threshold).
+- Confirm rollout CLI parameters and names (use --eagle-max-depth, --eagle-max-proposals, --eagle-per-beam-topk-candidates).
 
 Phase 1: Hidden state capture in llama.cpp
 - Add a config path for "capture hidden states for layers X" that is controlled by EAGLE3 GGUF metadata.
@@ -169,7 +169,7 @@ Phase 3: Speculative decoding integration
 Implementation sketch
 - Extend common_params_speculative with:
   - mparams_eagle (path/hf repo) OR reuse mparams_dft + new type enum
-  - eagle_max_depth, eagle_max_proposals, eagle_prob_threshold (match speculators eval; CLI: --eagle-max-depth/--eagle-max-proposals/--eagle-prob-threshold)
+  - eagle_max_depth, eagle_max_proposals, eagle_per_beam_topk_candidates (CLI: --eagle-max-depth/--eagle-max-proposals/--eagle-per-beam-topk-candidates)
 - In common_speculative_init:
   - detect eagle3 head file, build eagle3 state
 - In common_speculative_state_eagle3::draft:
@@ -217,5 +217,5 @@ Risks and mitigations
 Outstanding questions for you
 - Do you want to require full vocab draft heads (no d2t), at least for MVP?
 - Should the head GGUF include token embeddings, or always reuse the base model embeddings?
-- Confirm the exact names/defaults for the three rollout CLI params (use --eagle-max-depth, --eagle-max-proposals, --eagle-prob-threshold).
+- Confirm the exact names/defaults for the three rollout CLI params (use --eagle-max-depth, --eagle-max-proposals, --eagle-per-beam-topk-candidates).
 - Do you want a new CLI flag (e.g. --model-eagle3) or reuse --model-draft with --spec-type eagle3?

@@ -82,7 +82,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.eagle_max_depth", speculative.eagle_max_depth},
             {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
             {"speculative.eagle_beam_width", speculative.eagle_beam_width},
-            {"speculative.eagle_prob_threshold", speculative.eagle_prob_threshold},
+            {"speculative.eagle_per_beam_topk_candidates", speculative.eagle_per_beam_topk_candidates},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
             {"speculative.ngram_size_n",  speculative.ngram_size_n},
             {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -150,7 +150,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.eagle_max_depth", speculative.eagle_max_depth},
         {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
         {"speculative.eagle_beam_width", speculative.eagle_beam_width},
-        {"speculative.eagle_prob_threshold", speculative.eagle_prob_threshold},
+        {"speculative.eagle_per_beam_topk_candidates", speculative.eagle_per_beam_topk_candidates},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
         {"speculative.ngram_size_n",  speculative.ngram_size_n},
         {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -261,7 +261,7 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.eagle_max_depth = json_value(data, "speculative.eagle_max_depth", defaults.speculative.eagle_max_depth);
     params.speculative.eagle_max_proposals = json_value(data, "speculative.eagle_max_proposals", defaults.speculative.eagle_max_proposals);
     params.speculative.eagle_beam_width = json_value(data, "speculative.eagle_beam_width", defaults.speculative.eagle_beam_width);
-    params.speculative.eagle_prob_threshold = json_value(data, "speculative.eagle_prob_threshold", defaults.speculative.eagle_prob_threshold);
+    params.speculative.eagle_per_beam_topk_candidates = json_value(data, "speculative.eagle_per_beam_topk_candidates", defaults.speculative.eagle_per_beam_topk_candidates);
 
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
@@ -272,9 +272,7 @@ task_params server_task::params_from_json_cmpl(
     if (params.speculative.eagle_beam_width > params.speculative.eagle_max_proposals) {
         params.speculative.eagle_beam_width = params.speculative.eagle_max_proposals;
     }
-    if (params.speculative.eagle_prob_threshold < 0.0f) {
-        params.speculative.eagle_prob_threshold = 0.0f;
-    }
+    params.speculative.eagle_per_beam_topk_candidates = std::max(params.speculative.eagle_per_beam_topk_candidates, 0);
 
     params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
 

@@ -228,7 +228,7 @@ For the ful list of features, please refer to [server's changelog](https://githu
 | `--eagle-max-depth N` | EAGLE3 max draft depth (default: 16) |
 | `--eagle-max-proposals N` | EAGLE3 max proposals / beam width (default: 16) |
 | `--eagle-beam-width N` | EAGLE3 beam width (default: 0 = use --eagle-max-proposals) |
-| `--eagle-prob-threshold P` | EAGLE3 min draft prob to expand a node (default: 0.0001) |
+| `--eagle-per-beam-topk-candidates N` | EAGLE3 keep tokens with `p >= 1/N` before per-beam top-k (default: 128, `0` disables) |
 | `-cd, --ctx-size-draft N` | size of the prompt context for the draft model (default: 0, 0 = loaded from model)<br/>(env: LLAMA_ARG_CTX_SIZE_DRAFT) |
 | `-devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `-ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |

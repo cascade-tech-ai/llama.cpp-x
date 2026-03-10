@@ -181,6 +181,7 @@ struct llama_eagle3_select_batch_graph {
     int32_t                 k = 0;
     int32_t                 n_beams = 0;
     int32_t                 n_select = 0;
+    float                   prob_threshold = 0.0f;
 
     ggml_tensor * t_hidden            = nullptr; // [hidden_size, n_beams]
     ggml_tensor * t_beam_logprob      = nullptr; // [n_beams]
@@ -194,6 +195,9 @@ struct llama_eagle3_select_batch_graph {
 struct llama_eagle3_runtime {
     const llama_model * base_model = nullptr;
     ggml_tensor * tok_embd = nullptr;
+    bool flash_attn = false;
+    mutable bool flash_attn_logged_step = false;
+    mutable bool flash_attn_logged_step_batch = false;
 
     llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
     float rope_freq_base  = 10000.0f;
@@ -305,6 +309,7 @@ bool llama_eagle3_select_state_batch(
         const std::vector<const llama_eagle3_state *> & states,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         std::vector<int32_t> & selected_linear_out,
         std::vector<int32_t> & selected_draft_idx_out,
         std::vector<float> & selected_logprob_out);
@@ -315,6 +320,7 @@ bool llama_eagle3_select_state_batch_device(
         const std::vector<const llama_eagle3_state *> & states,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         llama_eagle3_select_batch_device_result & out);
 
 bool llama_eagle3_select_state_slots(
@@ -324,6 +330,7 @@ bool llama_eagle3_select_state_slots(
         const std::vector<uint8_t> & active_mask,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         std::vector<int32_t> & selected_linear_out,
         std::vector<int32_t> & selected_draft_idx_out,
         std::vector<float> & selected_logprob_out);
@@ -335,6 +342,7 @@ bool llama_eagle3_select_state_slots_device(
         const std::vector<uint8_t> & active_mask,
         const std::vector<float> & beam_logprob,
         int32_t k,
+        float prob_threshold,
         llama_eagle3_select_batch_device_result & out);
 
 bool llama_eagle3_state_has_hidden(const llama_eagle3_state & state);

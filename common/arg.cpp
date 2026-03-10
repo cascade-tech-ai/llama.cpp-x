@@ -3379,10 +3379,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
-        {"--eagle-prob-threshold"}, "P",
-        string_format("EAGLE3 min draft prob to expand a node (default: %.4g)", (double)params.speculative.eagle_prob_threshold),
-        [](common_params & params, const std::string & value) {
-            params.speculative.eagle_prob_threshold = std::stof(value);
+        {"--eagle-per-beam-topk-candidates"}, "N",
+        string_format("EAGLE3 keep tokens with p >= 1/N before per-beam top-k (default: %d, 0 = disable)", params.speculative.eagle_per_beam_topk_candidates),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("eagle per-beam top-k candidates must be >= 0");
+            }
+            params.speculative.eagle_per_beam_topk_candidates = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(

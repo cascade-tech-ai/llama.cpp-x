@@ -607,7 +607,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     const bool profile;
     const bool profile_gpu;
     const std::string dump_dir;
-
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
     common_speculative_tree last_tree;
@@ -891,7 +890,9 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         const int beam_width = params.eagle_beam_width > 0
             ? std::min(params.eagle_beam_width, max_proposals)
             : max_proposals;
-        const float prob_threshold = params.eagle_prob_threshold;
+        const float prob_threshold = params.eagle_per_beam_topk_candidates > 0
+            ? 1.0f / (float) params.eagle_per_beam_topk_candidates
+            : 0.0f;
         const float inactive_beam_logprob = -1e30f;
 
         struct beam_state {
@@ -923,7 +924,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         std::vector<proposal_path> all_nodes;
         std::map<llama_tokens, llama_eagle3_state> prefix_states;
-
         for (int depth = 0; depth < max_depth; ++depth) {
             auto & beams_cur = (depth & 1) ? beams_b : beams_a;
             auto & beams_nxt = (depth & 1) ? beams_a : beams_b;
@@ -971,6 +971,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         active_cur,
                         beam_logprob_cur,
                         k,
+                        prob_threshold,
                         selected_linear,
                         selected_draft_idx,
                         selected_logprob);
@@ -1587,6 +1588,7 @@ private:
     }
 
     bool prefill_to(const llama_tokens & prompt_tgt, llama_seq_id seq_id) {
+        GGML_UNUSED(seq_id);
         if (prompt_tgt.size() < cached_prompt_len) {
             cached_prompt_len = 0;
             base_state = {};
