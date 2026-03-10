@@ -647,6 +647,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     std::vector<uint8_t> rollout_active_b;
     std::vector<float> rollout_beam_logprob_a;
     std::vector<float> rollout_beam_logprob_b;
+    std::shared_ptr<llama_eagle3_rollout_batch> rollout_batch_a;
+    std::shared_ptr<llama_eagle3_rollout_batch> rollout_batch_b;
 
     static std::string escape_token_piece(const std::string & input) {
         std::string out;
@@ -697,6 +699,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             active[i] = 0;
             beam_logprob[i] = inactive_beam_logprob;
         }
+    }
+
+    bool ensure_rollout_batches(int32_t beam_width, int32_t kv_capacity) {
+        if (!rt.backend_compute || !rt.buft_compute) {
+            return false;
+        }
+        if (!rollout_batch_a) {
+            rollout_batch_a = std::make_shared<llama_eagle3_rollout_batch>();
+        }
+        if (!rollout_batch_b) {
+            rollout_batch_b = std::make_shared<llama_eagle3_rollout_batch>();
+        }
+        return llama_eagle3_rollout_batch_ensure(*model, rt, beam_width, kv_capacity, *rollout_batch_a) &&
+               llama_eagle3_rollout_batch_ensure(*model, rt, beam_width, kv_capacity, *rollout_batch_b);
     }
 
     common_speculative_state_eagle3(
@@ -946,9 +962,29 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         };
 
         ensure_rollout_storage(beam_width);
+        const int32_t round_kv_capacity = root_state.past_len + std::max(0, max_depth);
+        if (rt.backend_compute && rt.buft_compute) {
+            if (!ensure_rollout_batches(beam_width, round_kv_capacity)) {
+                return;
+            }
+            for (int32_t i = 0; i < beam_width; ++i) {
+                if (!llama_eagle3_rollout_batch_bind_slot(*model, rollout_batch_a, i, rollout_beams_a[(size_t) i].state, root_state.past_len)) {
+                    return;
+                }
+                if (!llama_eagle3_rollout_batch_bind_slot(*model, rollout_batch_b, i, rollout_beams_b[(size_t) i].state, root_state.past_len)) {
+                    return;
+                }
+            }
+        }
         clear_rollout_slots(rollout_beams_a, rollout_active_a, rollout_beam_logprob_a, inactive_beam_logprob);
         clear_rollout_slots(rollout_beams_b, rollout_active_b, rollout_beam_logprob_b, inactive_beam_logprob);
-        rollout_beams_a[0].state = root_state;
+        if (rt.backend_compute && rt.buft_compute) {
+            if (!llama_eagle3_rollout_batch_copy_state_to_slot(*model, rt, root_state, rollout_batch_a, 0, rollout_beams_a[0].state)) {
+                return;
+            }
+        } else {
+            rollout_beams_a[0].state = root_state;
+        }
         rollout_active_a[0] = 1;
         rollout_beam_logprob_a[0] = 0.0f;
 

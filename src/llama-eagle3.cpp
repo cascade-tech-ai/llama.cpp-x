@@ -27,6 +27,8 @@ struct llama_eagle3_state::device_state {
     ggml_tensor *           t_v = nullptr;
     int32_t                 past_len = 0;
     int32_t                 kv_capacity = 0;
+    std::shared_ptr<llama_eagle3_rollout_batch> rollout_batch;
+    int32_t                 rollout_slot = -1;
 };
 
 namespace {
@@ -385,6 +387,23 @@ const llama_eagle3_tensors & get_host_tensors(const llama_eagle3_model & model) 
     return model.tensors;
 }
 
+bool tensor_copy_3d_prefix_async(
+        ggml_backend_t backend,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t n0,
+        int64_t n1,
+        int32_t len);
+
+bool tensor_copy_bytes_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        ggml_tensor * src,
+        size_t src_offset,
+        ggml_tensor * dst,
+        size_t dst_offset,
+        size_t size);
+
 bool alloc_state_device(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
@@ -425,7 +444,7 @@ bool alloc_state_device(
     return true;
 }
 
-bool llama_eagle3_rollout_batch_ensure(
+bool llama_eagle3_rollout_batch_ensure_impl(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         int32_t n_beams,
@@ -473,6 +492,134 @@ bool llama_eagle3_rollout_batch_ensure(
     return true;
 }
 
+bool llama_eagle3_rollout_batch_bind_slot_impl(
+        const llama_eagle3_model & model,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & state,
+        int32_t past_len) {
+    if (!batch || slot < 0 || slot >= batch->n_beams) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 16);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_view_2d(
+            ctx.get(),
+            batch->t_hidden,
+            hp.hidden_size,
+            1,
+            batch->t_hidden->nb[1],
+            (size_t) slot * batch->t_hidden->nb[1]);
+
+    ggml_tensor * t_k = ggml_view_3d(
+            ctx.get(),
+            batch->t_k,
+            hp.head_dim,
+            hp.num_kv_heads,
+            batch->kv_capacity,
+            batch->t_k->nb[1],
+            batch->t_k->nb[2],
+            (size_t) slot * batch->t_k->nb[3]);
+
+    ggml_tensor * t_v = ggml_view_3d(
+            ctx.get(),
+            batch->t_v,
+            hp.head_dim,
+            hp.num_kv_heads,
+            batch->kv_capacity,
+            batch->t_v->nb[1],
+            batch->t_v->nb[2],
+            (size_t) slot * batch->t_v->nb[3]);
+
+    auto dev = std::make_shared<llama_eagle3_state::device_state>();
+    dev->ctx = std::move(ctx);
+    dev->t_hidden = t_hidden;
+    dev->t_k = t_k;
+    dev->t_v = t_v;
+    dev->past_len = past_len;
+    dev->kv_capacity = batch->kv_capacity;
+    dev->rollout_batch = std::move(batch);
+    dev->rollout_slot = slot;
+
+    state.dev = std::move(dev);
+    state.past_len = past_len;
+    return true;
+}
+
+bool llama_eagle3_rollout_batch_copy_state_to_slot_impl(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & src,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & dst_state) {
+    if (!batch || !rt.backend_compute || slot < 0 || slot >= batch->n_beams) {
+        return false;
+    }
+
+    llama_eagle3_state dst;
+    if (!llama_eagle3_rollout_batch_bind_slot_impl(model, batch, slot, dst, src.past_len)) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+    const size_t hidden_bytes = (size_t) hp.hidden_size * sizeof(float);
+    const size_t kv_bytes = (size_t) src.past_len * hp.head_dim * hp.num_kv_heads * sizeof(float);
+
+    if (src.dev && src.dev->t_hidden) {
+        if (!tensor_copy_bytes_async(
+                    rt.backend_compute.get(),
+                    rt.backend_compute.get(),
+                    src.dev->t_hidden,
+                    0,
+                    dst.dev->t_hidden,
+                    0,
+                    hidden_bytes)) {
+            return false;
+        }
+    } else if (!src.hidden.empty()) {
+        ggml_backend_tensor_set_async(rt.backend_compute.get(), dst.dev->t_hidden, src.hidden.data(), 0, hidden_bytes);
+    } else {
+        return false;
+    }
+
+    if (src.past_len > 0) {
+        if (src.dev && src.dev->t_k && src.dev->t_v && src.dev->kv_capacity >= src.past_len) {
+            if (!tensor_copy_3d_prefix_async(
+                        rt.backend_compute.get(),
+                        src.dev->t_k,
+                        dst.dev->t_k,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        src.past_len)) {
+                return false;
+            }
+            if (!tensor_copy_3d_prefix_async(
+                        rt.backend_compute.get(),
+                        src.dev->t_v,
+                        dst.dev->t_v,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        src.past_len)) {
+                return false;
+            }
+        } else if (src.k.size() * sizeof(float) >= kv_bytes && src.v.size() * sizeof(float) >= kv_bytes) {
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst.dev->t_k, src.k.data(), 0, kv_bytes);
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst.dev->t_v, src.v.data(), 0, kv_bytes);
+        } else {
+            return false;
+        }
+    }
+
+    dst_state = std::move(dst);
+    return true;
+}
+
 int32_t choose_kv_capacity(int32_t required_len, int32_t reserve_kv, int32_t current_capacity) {
     const int32_t min_capacity = required_len + std::max(0, reserve_kv);
     if (current_capacity >= min_capacity) {
@@ -510,16 +657,16 @@ bool tensor_copy_3d_prefix_async(
         return false;
     }
 
-    if (src_len == len && dst_len == len) {
-        ggml_backend_tensor_copy_async(backend, backend, src, dst);
-        return true;
-    }
-
 #if defined(GGML_USE_CUDA)
     if (ggml_backend_is_cuda(backend)) {
         return ggml_backend_cuda_tensor_copy_3d_prefix_async(backend, src, dst, len);
     }
 #endif
+
+    if (src_len == len && dst_len == len) {
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+        return true;
+    }
 
     const size_t n_bytes = (size_t) n0 * (size_t) n1 * (size_t) len * sizeof(float);
     std::memcpy(dst->data, src->data, n_bytes);
@@ -1686,6 +1833,34 @@ bool build_step_batch_graph(
 
 } // namespace
 
+bool llama_eagle3_rollout_batch_ensure(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_beams,
+        int32_t kv_capacity,
+        llama_eagle3_rollout_batch & batch) {
+    return llama_eagle3_rollout_batch_ensure_impl(model, rt, n_beams, kv_capacity, batch);
+}
+
+bool llama_eagle3_rollout_batch_bind_slot(
+        const llama_eagle3_model & model,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & state,
+        int32_t past_len) {
+    return llama_eagle3_rollout_batch_bind_slot_impl(model, std::move(batch), slot, state, past_len);
+}
+
+bool llama_eagle3_rollout_batch_copy_state_to_slot(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & src,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & dst_state) {
+    return llama_eagle3_rollout_batch_copy_state_to_slot_impl(model, rt, src, std::move(batch), slot, dst_state);
+}
+
 llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & err) {
     try {
         ggml_context * ctx_meta = nullptr;
@@ -2084,7 +2259,16 @@ bool llama_eagle3_topk_state(
 
     if (rt.backend_compute && rt.buft_compute && state.dev && state.dev->t_hidden) {
         if (build_topk_graph(model, rt, k, rt.topk_graph)) {
-            ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), state.dev->t_hidden, rt.topk_graph.t_hidden);
+            if (!tensor_copy_bytes_async(
+                        rt.backend_compute.get(),
+                        rt.backend_compute.get(),
+                        state.dev->t_hidden,
+                        0,
+                        rt.topk_graph.t_hidden,
+                        0,
+                        (size_t) hp.hidden_size * sizeof(float))) {
+                return false;
+            }
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.topk_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
                 topk_idx_out.resize(k);
@@ -2150,7 +2334,16 @@ bool llama_eagle3_topk_state_batch(
                     if (!st->hidden.empty()) {
                         ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
                     } else if (st->dev && st->dev->t_hidden) {
-                        ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+                        if (!tensor_copy_bytes_async(
+                                    rt.backend_compute.get(),
+                                    rt.backend_compute.get(),
+                                    st->dev->t_hidden,
+                                    0,
+                                    dst,
+                                    0,
+                                    (size_t) hp.hidden_size * sizeof(float))) {
+                            return false;
+                        }
                     } else {
                         return false;
                     }
@@ -2254,7 +2447,16 @@ bool llama_eagle3_select_state_batch(
                 if (!st->hidden.empty()) {
                     ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
                 } else if (st->dev && st->dev->t_hidden) {
-                    ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+                    if (!tensor_copy_bytes_async(
+                                rt.backend_compute.get(),
+                                rt.backend_compute.get(),
+                                st->dev->t_hidden,
+                                0,
+                                dst,
+                                0,
+                                (size_t) hp.hidden_size * sizeof(float))) {
+                        return false;
+                    }
                 } else {
                     return false;
                 }
@@ -2392,7 +2594,16 @@ bool llama_eagle3_select_state_batch_device(
         if (!st->hidden.empty()) {
             ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
         } else if (st->dev && st->dev->t_hidden) {
-            ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+            if (!tensor_copy_bytes_async(
+                        rt.backend_compute.get(),
+                        rt.backend_compute.get(),
+                        st->dev->t_hidden,
+                        0,
+                        dst,
+                        0,
+                        (size_t) hp.hidden_size * sizeof(float))) {
+                return false;
+            }
         } else {
             return false;
         }
@@ -2473,7 +2684,16 @@ bool llama_eagle3_select_state_slots_device(
         }
 
         if (active && st && st->dev && st->dev->t_hidden) {
-            ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, dst);
+            if (!tensor_copy_bytes_async(
+                        rt.backend_compute.get(),
+                        rt.backend_compute.get(),
+                        st->dev->t_hidden,
+                        0,
+                        dst,
+                        0,
+                        (size_t) hp.hidden_size * sizeof(float))) {
+                return false;
+            }
         } else if (active && st && !st->hidden.empty()) {
             ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
         } else {
@@ -2733,7 +2953,16 @@ bool llama_eagle3_step_batch_from_parents(
                     }
 
                     if (st->dev && st->dev->t_hidden) {
-                        ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), st->dev->t_hidden, graph.t_hidden_in[(size_t) ib]);
+                        if (!tensor_copy_bytes_async(
+                                    rt.backend_compute.get(),
+                                    rt.backend_compute.get(),
+                                    st->dev->t_hidden,
+                                    0,
+                                    graph.t_hidden_in[(size_t) ib],
+                                    0,
+                                    (size_t) hidden_in_dim * sizeof(float))) {
+                            return false;
+                        }
                     } else if (!st->hidden.empty()) {
                         ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in[(size_t) ib], st->hidden.data(), 0, (size_t) hidden_in_dim * sizeof(float));
                     } else {
@@ -2803,7 +3032,16 @@ bool llama_eagle3_step_batch_from_parents(
                             }
                         }
 
-                        ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out[(size_t) ib], next_dev->t_hidden);
+                        if (!tensor_copy_bytes_async(
+                                    rt.backend_compute.get(),
+                                    rt.backend_compute.get(),
+                                    graph.t_hidden_out[(size_t) ib],
+                                    0,
+                                    next_dev->t_hidden,
+                                    0,
+                                    (size_t) hp.hidden_size * sizeof(float))) {
+                            return false;
+                        }
                         if (next_dev->t_k && next_dev->t_v && graph.t_k_total[(size_t) ib] && graph.t_v_total[(size_t) ib]) {
                             if (!tensor_copy_3d_prefix_async(
                                         rt.backend_compute.get(),
@@ -2954,7 +3192,16 @@ bool llama_eagle3_step_from_hidden_capture(
                     }
                 }
 
-                ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out, next_dev->t_hidden);
+                if (!tensor_copy_bytes_async(
+                            rt.backend_compute.get(),
+                            rt.backend_compute.get(),
+                            graph.t_hidden_out,
+                            0,
+                            next_dev->t_hidden,
+                            0,
+                            (size_t) hp.hidden_size * sizeof(float))) {
+                    return false;
+                }
                 if (next_dev->t_k && next_dev->t_v && graph.t_k_total && graph.t_v_total) {
                     if (!tensor_copy_3d_prefix_async(
                                 rt.backend_compute.get(),
@@ -3043,7 +3290,16 @@ bool llama_eagle3_step(
             if (hidden_in) {
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, hidden_in, 0, hidden_in_dim * sizeof(float));
             } else if (state.dev && state.dev->t_hidden) {
-                ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), state.dev->t_hidden, graph.t_hidden_in);
+                if (!tensor_copy_bytes_async(
+                            rt.backend_compute.get(),
+                            rt.backend_compute.get(),
+                            state.dev->t_hidden,
+                            0,
+                            graph.t_hidden_in,
+                            0,
+                            (size_t) hidden_in_dim * sizeof(float))) {
+                    return false;
+                }
             } else {
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, state.hidden.data(), 0, hidden_in_dim * sizeof(float));
             }
@@ -3101,7 +3357,16 @@ bool llama_eagle3_step(
                     }
                 }
 
-                ggml_backend_tensor_copy_async(rt.backend_compute.get(), rt.backend_compute.get(), graph.t_hidden_out, next_dev->t_hidden);
+                if (!tensor_copy_bytes_async(
+                            rt.backend_compute.get(),
+                            rt.backend_compute.get(),
+                            graph.t_hidden_out,
+                            0,
+                            next_dev->t_hidden,
+                            0,
+                            (size_t) hp.hidden_size * sizeof(float))) {
+                    return false;
+                }
                 if (next_dev->t_k && next_dev->t_v && graph.t_k_total && graph.t_v_total) {
                     if (!tensor_copy_3d_prefix_async(
                                 rt.backend_compute.get(),

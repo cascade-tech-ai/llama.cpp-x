@@ -372,6 +372,21 @@ bool llama_eagle3_rollout_batch_ensure(
         int32_t kv_capacity,
         llama_eagle3_rollout_batch & batch);
 
+bool llama_eagle3_rollout_batch_bind_slot(
+        const llama_eagle3_model & model,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & state,
+        int32_t past_len);
+
+bool llama_eagle3_rollout_batch_copy_state_to_slot(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & src,
+        std::shared_ptr<llama_eagle3_rollout_batch> batch,
+        int32_t slot,
+        llama_eagle3_state & dst_state);
+
 bool llama_eagle3_step_batch(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
