@@ -213,6 +213,10 @@ struct common_speculative_state {
         out.clear();
         return false;
     }
+
+    virtual void set_tree(const common_speculative_tree & tree) {
+        GGML_UNUSED(tree);
+    }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -1418,6 +1422,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return;
         }
 
+        const auto row_for_node = [&](int32_t node_idx) -> size_t {
+            if (node_idx < 0) {
+                return std::numeric_limits<size_t>::max();
+            }
+            const size_t idx = (size_t) node_idx;
+            if (idx >= last_tree.tokens.size()) {
+                return std::numeric_limits<size_t>::max();
+            }
+            if (last_tree.row_indices.size() == last_tree.tokens.size()) {
+                return (size_t) last_tree.row_indices[idx];
+            }
+            return (size_t) last_tree.batch_start + idx;
+        };
+
         if (accepted_nodes.empty()) {
             set_prefix_frontier(last_root_state, 0);
         } else {
@@ -1425,7 +1443,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             if ((size_t) deepest >= last_tree_states.size()) {
                 return;
             }
-            const size_t row_idx = (size_t) last_tree.batch_start + (size_t) deepest;
+            const size_t row_idx = row_for_node(deepest);
             if (row_idx >= n_tokens) {
                 return;
             }
@@ -1443,6 +1461,17 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     bool get_trace(common_speculative_trace & out) const override {
         out = last_trace;
         return true;
+    }
+
+    void set_tree(const common_speculative_tree & tree) override {
+        if (tree.tokens != last_tree.tokens ||
+            tree.parents != last_tree.parents ||
+            tree.depths != last_tree.depths) {
+            return;
+        }
+
+        last_tree.batch_start = tree.batch_start;
+        last_tree.row_indices = tree.row_indices;
     }
 
 private:
@@ -2439,6 +2468,14 @@ bool common_speculative_get_tree(common_speculative * spec, common_speculative_t
     }
 
     return spec->curr_impl->get_tree(out);
+}
+
+void common_speculative_set_tree(common_speculative * spec, const common_speculative_tree & tree) {
+    if (spec == nullptr || spec->curr_impl == nullptr) {
+        return;
+    }
+
+    spec->curr_impl->set_tree(tree);
 }
 
 bool common_speculative_get_trace(common_speculative * spec, common_speculative_trace & out) {

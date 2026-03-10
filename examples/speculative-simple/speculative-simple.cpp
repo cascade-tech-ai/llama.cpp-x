@@ -497,6 +497,7 @@ int main(int argc, char ** argv) {
                 }
                 const llama_pos tree_base_pos = n_past++;
                 build_eagle_tree_batch(batch_tgt, id_last, tree_base_pos, params_spec.eagle_max_proposals, tree);
+                common_speculative_set_tree(spec, tree);
             } else {
                 common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
                 for (size_t i = 0; i < draft.size(); ++i) {

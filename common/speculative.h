@@ -85,6 +85,9 @@ bool common_speculative_get_tree(common_speculative * spec, common_speculative_t
 // retrieve the latest speculative proposal trace, if available
 bool common_speculative_get_trace(common_speculative * spec, common_speculative_trace & out);
 
+// propagate external tree metadata (for example target-batch row indices) back into the active impl
+void common_speculative_set_tree(common_speculative * spec, const common_speculative_tree & tree);
+
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
