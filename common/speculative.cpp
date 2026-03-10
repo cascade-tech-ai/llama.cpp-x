@@ -208,6 +208,11 @@ struct common_speculative_state {
         out.clear();
         return false;
     }
+
+    virtual bool get_trace(common_speculative_trace & out) const {
+        out.clear();
+        return false;
+    }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -618,6 +623,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
     common_speculative_tree last_tree;
+    common_speculative_trace last_trace;
     std::vector<llama_eagle3_state> last_tree_states;
     llama_eagle3_state last_root_state;
     bool has_last_root_state = false;
@@ -808,6 +814,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_tokens & draft_tokens) override {
         draft_tokens.clear();
         last_tree.clear();
+        last_trace.clear();
         last_tree_states.clear();
         has_last_root_state = false;
 
@@ -1005,6 +1012,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             std::vector<beam_expansion> expansions;
             expansions.reserve((size_t) beam_width * (size_t) beam_width);
+            std::vector<common_speculative_trace_node> depth_nodes;
+            depth_nodes.reserve((size_t) beam_width);
 
             int32_t n_active = 0;
             for (uint8_t active : active_cur) {
@@ -1115,10 +1124,16 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     /* beam_idx = */ beam_idx,
                     /* token    = */ base_id,
                 });
+                depth_nodes.push_back({
+                    /* token    = */ base_id,
+                    /* prob     = */ prob,
+                    /* cum_prob = */ std::exp(total_logprob),
+                });
                 if ((int) expansions.size() >= beam_width) {
                     break;
                 }
             }
+            last_trace.proposal_graph.push_back(depth_nodes);
             const double depth_score = (ggml_time_us() - t_scoring_start) / 1000.0;
             t_scoring_us += (int64_t) (depth_score * 1000.0);
             depth_score_ms.push_back(depth_score);
@@ -1217,6 +1232,11 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         if ((int) all_nodes.size() > max_proposals) {
             all_nodes.resize(max_proposals);
+        }
+
+        last_trace.proposal_paths.reserve(all_nodes.size());
+        for (const auto & entry : all_nodes) {
+            last_trace.proposal_paths.push_back(entry.tokens);
         }
 
         if (profile) {
@@ -1417,6 +1437,11 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
     bool get_tree(common_speculative_tree & out) const override {
         out = last_tree;
+        return true;
+    }
+
+    bool get_trace(common_speculative_trace & out) const override {
+        out = last_trace;
         return true;
     }
 
@@ -2414,6 +2439,15 @@ bool common_speculative_get_tree(common_speculative * spec, common_speculative_t
     }
 
     return spec->curr_impl->get_tree(out);
+}
+
+bool common_speculative_get_trace(common_speculative * spec, common_speculative_trace & out) {
+    out.clear();
+    if (spec == nullptr || spec->curr_impl == nullptr) {
+        return false;
+    }
+
+    return spec->curr_impl->get_trace(out);
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {

@@ -35,6 +35,22 @@ struct common_speculative_tree {
     }
 };
 
+struct common_speculative_trace_node {
+    llama_token token = LLAMA_TOKEN_NULL;
+    float prob = 0.0f;
+    float cum_prob = 0.0f;
+};
+
+struct common_speculative_trace {
+    std::vector<llama_tokens> proposal_paths;
+    std::vector<std::vector<common_speculative_trace_node>> proposal_graph;
+
+    void clear() {
+        proposal_paths.clear();
+        proposal_graph.clear();
+    }
+};
+
 struct common_speculative;
 
 // comma separated list of all types
@@ -65,6 +81,9 @@ llama_tokens common_speculative_draft(
 
 // retrieve the latest speculative tree (if the current implementation supports it)
 bool common_speculative_get_tree(common_speculative * spec, common_speculative_tree & out);
+
+// retrieve the latest speculative proposal trace, if available
+bool common_speculative_get_trace(common_speculative * spec, common_speculative_trace & out);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

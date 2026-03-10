@@ -9,14 +9,21 @@
 #include "llama.h"
 #include "ggml-cuda.h"
 
+#define JSON_ASSERT GGML_ASSERT
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
 
 namespace {
+using json = nlohmann::ordered_json;
+
 struct scoped_prof {
     bool enabled = false;
     const char * name = nullptr;
@@ -163,6 +170,72 @@ static void build_eagle_tree_batch(
             common_batch_add(batch_tgt, id_last, pad_pos, { pad_seq_id }, true);
         }
     }
+}
+
+static std::string trace_token_text(llama_context * ctx, llama_token tok) {
+    return common_token_to_piece(ctx, tok);
+}
+
+static json trace_top_candidates_json(
+        llama_context * ctx,
+        const std::vector<common_sampler_trace_candidate> & candidates) {
+    json out = json::array();
+    for (const auto & cand : candidates) {
+        out.push_back({
+            {"token", (int) cand.token},
+            {"text_escaped", trace_token_text(ctx, cand.token)},
+            {"prob", cand.p},
+        });
+    }
+    return out;
+}
+
+static float trace_find_draft_prob(
+        const common_speculative_trace & trace,
+        size_t depth,
+        llama_token tok) {
+    if (depth >= trace.proposal_graph.size()) {
+        return 0.0f;
+    }
+
+    float best = 0.0f;
+    for (const auto & node : trace.proposal_graph[depth]) {
+        if (node.token == tok && node.prob > best) {
+            best = node.prob;
+        }
+    }
+    return best;
+}
+
+static json trace_proposal_graph_json(
+        llama_context * ctx,
+        const common_speculative_trace & trace) {
+    json graph = json::array();
+    for (const auto & depth_nodes : trace.proposal_graph) {
+        json depth = json::array();
+        for (const auto & node : depth_nodes) {
+            depth.push_back({
+                {"token", (int) node.token},
+                {"text_escaped", trace_token_text(ctx, node.token)},
+                {"prob", node.prob},
+                {"cum_prob", node.cum_prob},
+            });
+        }
+        graph.push_back(std::move(depth));
+    }
+    return graph;
+}
+
+static json trace_proposal_paths_json(const common_speculative_trace & trace) {
+    json paths = json::array();
+    for (const auto & path : trace.proposal_paths) {
+        json seq = json::array();
+        for (llama_token tok : path) {
+            seq.push_back((int) tok);
+        }
+        paths.push_back(std::move(seq));
+    }
+    return paths;
 }
 }
 
@@ -327,6 +400,13 @@ int main(int argc, char ** argv) {
 
     // init the speculator (before prompt eval so EAGLE3 can capture hidden states)
     const auto & params_spec = params.speculative;
+    const bool trace_enabled = !params_spec.eagle_trace_yaml.empty();
+    const float trace_prob_threshold = params_spec.eagle_per_beam_topk_candidates > 0
+        ? 1.0f / (float) params_spec.eagle_per_beam_topk_candidates
+        : 0.0f;
+    json trace_tokens = json::array();
+    json trace_cycles = json::array();
+    int trace_emitted_idx = 0;
 
     struct common_speculative * spec = params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE
         ? common_speculative_init(params.speculative, ctx_tgt)
@@ -381,7 +461,9 @@ int main(int argc, char ** argv) {
             t_eagle_total_us += (int64_t) (pass_eagle_ms * 1000.0);
         }
         common_speculative_tree tree;
+        common_speculative_trace spec_trace;
         const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
+        const bool has_trace = spec ? common_speculative_get_trace(spec, spec_trace) : false;
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
@@ -439,8 +521,11 @@ int main(int argc, char ** argv) {
         //
         scoped_prof zone_target_sampling(profile_spec, "spec/target_pass/sampling");
         const int64_t t_sampling_start = ggml_time_us();
+        std::vector<common_sampler_tree_trace_pass> trace_passes;
         const auto ids = use_tree
-            ? common_sampler_sample_and_accept_tree(smpl, ctx_tgt, 0, tree)
+            ? (trace_enabled
+                ? common_sampler_sample_and_accept_tree_trace(smpl, ctx_tgt, 0, tree, trace_passes)
+                : common_sampler_sample_and_accept_tree(smpl, ctx_tgt, 0, tree))
             : common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
         llama_tokens ids_limited = ids;
         if (params.n_predict >= 0) {
@@ -496,6 +581,48 @@ int main(int argc, char ** argv) {
                 const llama_seq_id seq_id = (llama_seq_id) (1 + i);
                 llama_memory_seq_rm(mem, seq_id, -1, -1);
             }
+        }
+
+        if (trace_enabled) {
+            json cycle = {
+                {"cycle", pass_idx + 1},
+                {"context_len", (int) prompt_tgt.size() + 1},
+                {"proposal_count", use_tree && has_trace ? (int) spec_trace.proposal_paths.size() : 0},
+                {"accepted_count", (int) ids_limited.size() - 1},
+                {"proposal_paths", use_tree && has_trace ? trace_proposal_paths_json(spec_trace) : json::array()},
+                {"proposal_graph", use_tree && has_trace ? trace_proposal_graph_json(ctx_tgt, spec_trace) : json::array()},
+                {"passes", json::array()},
+                {"appended_tokens", json::array()},
+            };
+
+            for (const auto & pass : trace_passes) {
+                cycle["passes"].push_back({
+                    {"pass", pass.pass},
+                    {"sampled_token", (int) pass.sampled_token},
+                    {"sampled_text_escaped", trace_token_text(ctx_tgt, pass.sampled_token)},
+                    {"sampled_target_prob", pass.sampled_prob},
+                    {"sampled_draft_prob", use_tree && has_trace ? trace_find_draft_prob(spec_trace, (size_t) pass.pass, pass.sampled_token) : 0.0f},
+                    {"accepted", pass.accepted},
+                    {"reason", pass.reason},
+                    {"target_top10", trace_top_candidates_json(ctx_tgt, pass.target_top_candidates)},
+                });
+            }
+
+            const int accepted_count = std::max(0, (int) ids_limited.size() - 1);
+            for (size_t i = 0; i < ids_limited.size(); ++i) {
+                cycle["appended_tokens"].push_back((int) ids_limited[i]);
+
+                const char * kind = (int) i < accepted_count ? "accepted" : (use_tree ? "rejected" : "fallback");
+                trace_tokens.push_back({
+                    {"index", trace_emitted_idx++},
+                    {"cycle", pass_idx + 1},
+                    {"token", (int) ids_limited[i]},
+                    {"text_escaped", trace_token_text(ctx_tgt, ids_limited[i])},
+                    {"kind", kind},
+                });
+            }
+
+            trace_cycles.push_back(std::move(cycle));
         }
 
         // process the accepted tokens and update contexts
@@ -563,6 +690,43 @@ int main(int argc, char ** argv) {
                 t_target_fwd_us / 1000.0,
                 t_target_sampling_us / 1000.0,
                 t_eagle_total_us / 1000.0);
+    }
+
+    if (trace_enabled) {
+        json payload = {
+            {"base_model", params.model.path},
+            {"head_model", params_spec.mparams_dft.path},
+            {"prompt", prompt},
+            {"chat", params.conversation_mode != COMMON_CONVERSATION_MODE_DISABLED},
+            {"input_source", {{"type", "prompt"}}},
+            {"reference_response", nullptr},
+            {"seed", (int64_t) common_sampler_get_seed(smpl)},
+            {"max_depth", params_spec.eagle_max_depth},
+            {"max_proposals", params_spec.eagle_max_proposals},
+            {"prob_threshold", trace_prob_threshold},
+            {"temp", params.sampling.temp},
+            {"top_k", params.sampling.top_k},
+            {"prompt_tokens", json::array()},
+            {"generated_count", n_predict},
+            {"tokens", std::move(trace_tokens)},
+            {"cycles", std::move(trace_cycles)},
+        };
+
+        for (llama_token tok : inp) {
+            payload["prompt_tokens"].push_back((int) tok);
+        }
+
+        std::filesystem::path out_path(params_spec.eagle_trace_yaml);
+        if (out_path.has_parent_path()) {
+            std::filesystem::create_directories(out_path.parent_path());
+        }
+        std::ofstream out(out_path);
+        if (!out) {
+            LOG_ERR("%s: failed to open eagle trace path '%s'\n", __func__, params_spec.eagle_trace_yaml.c_str());
+            return 1;
+        }
+        out << payload.dump(2) << "\n";
+        LOG_INF("wrote eagle trace: %s\n", params_spec.eagle_trace_yaml.c_str());
     }
 
     LOG_INF("\n");

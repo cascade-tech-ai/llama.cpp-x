@@ -627,6 +627,108 @@ std::vector<llama_token> common_sampler_sample_and_accept_tree(
     return result;
 }
 
+std::vector<llama_token> common_sampler_sample_and_accept_tree_trace(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx_last,
+        const common_speculative_tree & tree,
+        std::vector<common_sampler_tree_trace_pass> & passes,
+        int top_n,
+        bool grammar_first) {
+    passes.clear();
+
+    std::vector<llama_token> result;
+
+    const size_t n_nodes = tree.tokens.size();
+    if (n_nodes == 0) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idx_last, grammar_first);
+        auto * cand = common_sampler_get_candidates(gsmpl, true);
+
+        common_sampler_tree_trace_pass pass;
+        pass.pass = 0;
+        pass.row_idx = idx_last;
+        pass.sampled_token = id;
+        pass.accepted = false;
+        pass.reason = "no_matching_paths";
+        if (cand && cand->selected >= 0 && (size_t) cand->selected < cand->size) {
+            pass.sampled_prob = cand->data[cand->selected].p;
+            for (size_t i = 0; i < std::min<size_t>((size_t) top_n, cand->size); ++i) {
+                pass.target_top_candidates.push_back({ cand->data[i].id, cand->data[i].p });
+            }
+        }
+        passes.push_back(std::move(pass));
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return result;
+    }
+
+    std::vector<int32_t> roots;
+    std::vector<std::vector<int32_t>> children(n_nodes);
+    roots.reserve(n_nodes);
+
+    for (size_t i = 0; i < n_nodes; ++i) {
+        const int32_t parent = tree.parents[i];
+        if (parent < 0) {
+            roots.push_back((int32_t) i);
+        } else if ((size_t) parent < n_nodes) {
+            children[parent].push_back((int32_t) i);
+        }
+    }
+
+    const auto find_token = [&](const std::vector<int32_t> & list, llama_token tok) -> int32_t {
+        for (int32_t idx : list) {
+            if (tree.tokens[idx] == tok) {
+                return idx;
+            }
+        }
+        return -1;
+    };
+
+    int32_t node = -1;
+    int pass_idx = 0;
+    int row_idx = idx_last;
+
+    while (true) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, row_idx, grammar_first);
+        auto * cand = common_sampler_get_candidates(gsmpl, true);
+
+        common_sampler_tree_trace_pass pass;
+        pass.pass = pass_idx;
+        pass.row_idx = row_idx;
+        pass.sampled_token = id;
+        if (cand && cand->selected >= 0 && (size_t) cand->selected < cand->size) {
+            pass.sampled_prob = cand->data[cand->selected].p;
+            for (size_t i = 0; i < std::min<size_t>((size_t) top_n, cand->size); ++i) {
+                pass.target_top_candidates.push_back({ cand->data[i].id, cand->data[i].p });
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        const int32_t next_node = node < 0 ? find_token(roots, id) : find_token(children[(size_t) node], id);
+        pass.matched_node = next_node;
+        if (next_node < 0) {
+            pass.accepted = false;
+            pass.reason = "prefix_not_in_proposals";
+            passes.push_back(std::move(pass));
+            break;
+        }
+
+        pass.accepted = true;
+        passes.push_back(std::move(pass));
+        node = next_node;
+        ++pass_idx;
+
+        row_idx = tree.row_indices.size() == n_nodes
+            ? (int) tree.row_indices[(size_t) node]
+            : (int) tree.batch_start + node;
+    }
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
