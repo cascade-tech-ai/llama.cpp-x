@@ -590,6 +590,12 @@ static bool write_npy_i32(
 } // namespace
 
 struct common_speculative_state_eagle3 : public common_speculative_state {
+    struct rollout_beam_slot {
+        float logprob = 0.0f;
+        std::vector<llama_token> tokens;
+        llama_eagle3_state state;
+    };
+
     llama_context * ctx_tgt = nullptr;
     std::unique_ptr<llama_eagle3_model, void (*)(llama_eagle3_model *)> model;
     llama_eagle3_runtime rt{};
@@ -635,6 +641,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     std::vector<float> dump_head_hidden_after_step; // [n_steps, hidden_size]
     std::vector<float> dump_root_logits_draft; // [draft_vocab_size]
 
+    std::vector<rollout_beam_slot> rollout_beams_a;
+    std::vector<rollout_beam_slot> rollout_beams_b;
+    std::vector<uint8_t> rollout_active_a;
+    std::vector<uint8_t> rollout_active_b;
+    std::vector<float> rollout_beam_logprob_a;
+    std::vector<float> rollout_beam_logprob_b;
+
     static std::string escape_token_piece(const std::string & input) {
         std::string out;
         out.reserve(input.size());
@@ -661,6 +674,29 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     void set_prefix_frontier(const llama_eagle3_state & state, size_t tail_capture_idx) {
         prefix_state = state;
         prefix_tail_capture_idx = tail_capture_idx;
+    }
+
+    void ensure_rollout_storage(int32_t beam_width) {
+        const size_t n = (size_t) std::max(1, beam_width);
+        rollout_beams_a.resize(n);
+        rollout_beams_b.resize(n);
+        rollout_active_a.resize(n, 0);
+        rollout_active_b.resize(n, 0);
+        rollout_beam_logprob_a.resize(n, 0.0f);
+        rollout_beam_logprob_b.resize(n, 0.0f);
+    }
+
+    void clear_rollout_slots(
+            std::vector<rollout_beam_slot> & beams,
+            std::vector<uint8_t> & active,
+            std::vector<float> & beam_logprob,
+            float inactive_beam_logprob) {
+        for (size_t i = 0; i < beams.size(); ++i) {
+            beams[i].logprob = 0.0f;
+            beams[i].tokens.clear();
+            active[i] = 0;
+            beam_logprob[i] = inactive_beam_logprob;
+        }
     }
 
     common_speculative_state_eagle3(
@@ -903,27 +939,18 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             : 0.0f;
         const float inactive_beam_logprob = -1e30f;
 
-        struct beam_state {
-            float logprob = 0.0f;
-            std::vector<llama_token> tokens;
-            llama_eagle3_state state;
-        };
-
         struct beam_expansion {
             float logprob = 0.0f;
             size_t beam_idx = 0;
             llama_token token = LLAMA_TOKEN_NULL;
         };
 
-        std::vector<beam_state> beams_a((size_t) std::max(1, beam_width));
-        std::vector<beam_state> beams_b((size_t) std::max(1, beam_width));
-        std::vector<uint8_t> active_a((size_t) std::max(1, beam_width), 0);
-        std::vector<uint8_t> active_b((size_t) std::max(1, beam_width), 0);
-        std::vector<float> beam_logprob_a((size_t) std::max(1, beam_width), inactive_beam_logprob);
-        std::vector<float> beam_logprob_b((size_t) std::max(1, beam_width), inactive_beam_logprob);
-        beams_a[0] = {0.0f, {}, root_state};
-        active_a[0] = 1;
-        beam_logprob_a[0] = 0.0f;
+        ensure_rollout_storage(beam_width);
+        clear_rollout_slots(rollout_beams_a, rollout_active_a, rollout_beam_logprob_a, inactive_beam_logprob);
+        clear_rollout_slots(rollout_beams_b, rollout_active_b, rollout_beam_logprob_b, inactive_beam_logprob);
+        rollout_beams_a[0].state = root_state;
+        rollout_active_a[0] = 1;
+        rollout_beam_logprob_a[0] = 0.0f;
 
         struct proposal_path {
             float logprob = 0.0f;
@@ -933,12 +960,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         std::vector<proposal_path> all_nodes;
         std::map<llama_tokens, llama_eagle3_state> prefix_states;
         for (int depth = 0; depth < max_depth; ++depth) {
-            auto & beams_cur = (depth & 1) ? beams_b : beams_a;
-            auto & beams_nxt = (depth & 1) ? beams_a : beams_b;
-            auto & active_cur = (depth & 1) ? active_b : active_a;
-            auto & active_nxt = (depth & 1) ? active_a : active_b;
-            auto & beam_logprob_cur = (depth & 1) ? beam_logprob_b : beam_logprob_a;
-            auto & beam_logprob_nxt = (depth & 1) ? beam_logprob_a : beam_logprob_b;
+            auto & beams_cur = (depth & 1) ? rollout_beams_b : rollout_beams_a;
+            auto & beams_nxt = (depth & 1) ? rollout_beams_a : rollout_beams_b;
+            auto & active_cur = (depth & 1) ? rollout_active_b : rollout_active_a;
+            auto & active_nxt = (depth & 1) ? rollout_active_a : rollout_active_b;
+            auto & beam_logprob_cur = (depth & 1) ? rollout_beam_logprob_b : rollout_beam_logprob_a;
+            auto & beam_logprob_nxt = (depth & 1) ? rollout_beam_logprob_a : rollout_beam_logprob_b;
 
             std::vector<beam_expansion> expansions;
             expansions.reserve((size_t) beam_width * (size_t) beam_width);
@@ -1077,7 +1104,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 const auto & expansion = expansions[(size_t) i];
                 const auto & parent = beams_cur[expansion.beam_idx];
 
-                beam_state & child = beams_nxt[(size_t) i];
+                rollout_beam_slot & child = beams_nxt[(size_t) i];
                 child.logprob = expansion.logprob;
                 child.tokens = parent.tokens;
                 child.tokens.push_back(expansion.token);
@@ -1090,7 +1117,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 
             for (int32_t i = n_next; i < beam_width; ++i) {
-                beams_nxt[(size_t) i] = {};
+                beams_nxt[(size_t) i].logprob = 0.0f;
+                beams_nxt[(size_t) i].tokens.clear();
                 active_nxt[(size_t) i] = 0;
                 beam_logprob_nxt[(size_t) i] = inactive_beam_logprob;
             }
