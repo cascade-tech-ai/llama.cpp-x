@@ -425,6 +425,54 @@ bool alloc_state_device(
     return true;
 }
 
+bool llama_eagle3_rollout_batch_ensure(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_beams,
+        int32_t kv_capacity,
+        llama_eagle3_rollout_batch & batch) {
+    if (!rt.buft_compute || n_beams <= 0 || kv_capacity < 0) {
+        return false;
+    }
+
+    if (batch.ctx && batch.buf &&
+        batch.n_beams == n_beams &&
+        batch.kv_capacity == kv_capacity &&
+        batch.t_hidden &&
+        batch.t_k &&
+        batch.t_v &&
+        batch.t_mask) {
+        return true;
+    }
+
+    const auto & hp = model.hparams;
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 32);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hp.hidden_size, n_beams);
+    ggml_tensor * t_k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity, n_beams);
+    ggml_tensor * t_v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity, n_beams);
+    ggml_tensor * t_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kv_capacity, 1, 1, n_beams);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    if (!buf) {
+        return false;
+    }
+
+    batch = {};
+    batch.ctx = std::move(ctx);
+    batch.buf = std::move(buf);
+    batch.t_hidden = t_hidden;
+    batch.t_k = t_k;
+    batch.t_v = t_v;
+    batch.t_mask = t_mask;
+    batch.n_beams = n_beams;
+    batch.kv_capacity = kv_capacity;
+    return true;
+}
+
 int32_t choose_kv_capacity(int32_t required_len, int32_t reserve_kv, int32_t current_capacity) {
     const int32_t min_capacity = required_len + std::max(0, reserve_kv);
     if (current_capacity >= min_capacity) {

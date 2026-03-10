@@ -235,6 +235,19 @@ struct llama_eagle3_runtime {
     mutable llama_eagle3_step_batch_graph step_batch_graph;
 };
 
+struct llama_eagle3_rollout_batch {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+
+    ggml_tensor * t_hidden = nullptr; // [hidden_size, n_beams]
+    ggml_tensor * t_k = nullptr;      // [head_dim, n_kv_heads, kv_capacity, n_beams]
+    ggml_tensor * t_v = nullptr;      // [head_dim, n_kv_heads, kv_capacity, n_beams]
+    ggml_tensor * t_mask = nullptr;   // [kv_capacity, 1, 1, n_beams]
+
+    int32_t n_beams = 0;
+    int32_t kv_capacity = 0;
+};
+
 struct llama_eagle3_select_batch_device_result {
     ggml_backend_t backend = nullptr; // non-owning
     const ggml_tensor * t_selected_linear = nullptr;
@@ -351,6 +364,13 @@ bool llama_eagle3_state_get_hidden(
         const llama_eagle3_runtime & rt,
         llama_eagle3_state & state,
         std::vector<float> & hidden_out);
+
+bool llama_eagle3_rollout_batch_ensure(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_beams,
+        int32_t kv_capacity,
+        llama_eagle3_rollout_batch & batch);
 
 bool llama_eagle3_step_batch(
         const llama_eagle3_model & model,
