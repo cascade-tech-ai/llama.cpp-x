@@ -101,6 +101,16 @@ def lookup_id_set(nodes: list[dict[str, Any] | None]) -> set[int]:
     return {id(node) for node in nodes if node is not None}
 
 
+def ordered_nodes(nodes: list[dict[str, Any]], correct_ids: set[int] | None = None) -> list[dict[str, Any]]:
+    def key(node: dict[str, Any]) -> tuple[int, int]:
+        return (
+            0 if correct_ids and id(node) in correct_ids else 1,
+            0 if bool(node.get("selected")) else 1,
+        )
+
+    return sorted(nodes, key=key)
+
+
 def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str, correct_ids: set[int] | None = None) -> str:
     tree = proposal_tree(cycle)
     if not tree:
@@ -117,20 +127,20 @@ def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str, cor
         cur = node
         while cur:
             chain.append(cur)
-            children = list(cur.get("children") or [])
+            children = ordered_nodes(list(cur.get("children") or []), correct_ids)
             cur = children[0] if children else None
         rows.append((depth, chain))
 
         cur = node
         cur_depth = depth
         while cur:
-            children = list(cur.get("children") or [])
+            children = ordered_nodes(list(cur.get("children") or []), correct_ids)
             for alt in children[1:]:
                 walk(alt, cur_depth + 1)
             cur = children[0] if children else None
             cur_depth += 1
 
-    for root in tree:
+    for root in ordered_nodes(tree, correct_ids):
         walk(root, 0)
 
     max_cols = 0
