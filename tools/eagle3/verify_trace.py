@@ -62,13 +62,13 @@ def target_tokens(cycle: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def token_cell_html(token: dict[str, Any] | None, *, extra: str = "") -> str:
+def token_cell_html(token: dict[str, Any] | None, *, extra: str = "", show_prob: bool = True) -> str:
     if not token:
         return "<div class=\"token empty\">-</div>"
     text = html.escape(str(token.get("text_escaped", "")))
     prob = token.get("prob")
     prob_html = ""
-    if prob is not None:
+    if show_prob and prob is not None:
         prob_html = f"<div class=\"prob\">p={float(prob):.4g}</div>"
     extra_html = f"<div class=\"extra\">{extra}</div>" if extra else ""
     return (
@@ -97,7 +97,11 @@ def tree_lookup_path(
     return out
 
 
-def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str) -> str:
+def lookup_id_set(nodes: list[dict[str, Any] | None]) -> set[int]:
+    return {id(node) for node in nodes if node is not None}
+
+
+def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str, correct_ids: set[int] | None = None) -> str:
     tree = proposal_tree(cycle)
     if not tree:
         return (
@@ -151,9 +155,13 @@ def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str) -> 
                 continue
             node = chain[rel]
             cls = "graph-greedy" if row_idx == 0 else "graph-node"
+            if correct_ids and id(node) in correct_ids:
+                cls += " graph-correct"
             if node.get("selected"):
                 cls += " graph-selected"
             extra = f"cp={float(node.get('cum_prob', 0.0)):.4g}"
+            if correct_ids and id(node) in correct_ids:
+                extra += " correct"
             if node.get("selected"):
                 extra += " selected"
             if node.get("accepted"):
@@ -246,6 +254,8 @@ def render_cycle_pair_table(
     truth_tokens = [int(tok["token"]) for tok in truth if tok]
     lookup_a = tree_lookup_path(proposal_tree(cycle_a or {}), truth_tokens)
     lookup_b = tree_lookup_path(proposal_tree(cycle_b or {}), truth_tokens)
+    correct_a = lookup_id_set(lookup_a)
+    correct_b = lookup_id_set(lookup_b)
 
     parts: list[str] = [
         f"<section><h3>Cycle {cycle_idx + 1}</h3>",
@@ -263,7 +273,7 @@ def render_cycle_pair_table(
         for j in range(cols):
             token = truth[j] if j < len(truth) else None
             cls = "anchor" if j == 0 else "truth"
-            parts.append(f"<td class=\"{cls}\">{token_cell_html(token)}</td>")
+            parts.append(f"<td class=\"{cls}\">{token_cell_html(token, show_prob=False)}</td>")
         parts.append("</tr>")
 
     def add_status_row(
@@ -296,13 +306,13 @@ def render_cycle_pair_table(
                 cell = {
                     "token": int(expect["token"]),
                     "text_escaped": expect.get("text_escaped", ""),
-                    "prob": expect.get("prob"),
+                    "prob": float(node.get("prob", 0.0)),
                 }
             if j == 0 and cls == "missing":
                 cls = "missing anchor"
             elif j == 0:
                 cls += " anchor"
-            parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra)}</td>")
+            parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra, show_prob=node is not None)}</td>")
         parts.append("</tr>")
 
     add_truth_row()
@@ -310,8 +320,8 @@ def render_cycle_pair_table(
     add_status_row(label_b, "trace-b", cycle_b, lookup_b)
     parts.append("</table>")
     parts.append("<div class=\"graph-foldouts\">")
-    parts.append(render_graph_foldout(label_a, cycle_a or {}, f"graph-{cycle_idx}-{label_a}"))
-    parts.append(render_graph_foldout(label_b, cycle_b or {}, f"graph-{cycle_idx}-{label_b}"))
+    parts.append(render_graph_foldout(label_a, cycle_a or {}, f"graph-{cycle_idx}-{label_a}", correct_a))
+    parts.append(render_graph_foldout(label_b, cycle_b or {}, f"graph-{cycle_idx}-{label_b}", correct_b))
     parts.append("</div></section>")
     return "".join(parts)
 
@@ -327,6 +337,7 @@ def render_cycle_single_table(
     cols = 8
     truth_tokens = [int(tok["token"]) for tok in truth if tok]
     lookup = tree_lookup_path(proposal_tree(cycle or {}), truth_tokens)
+    correct = lookup_id_set(lookup)
 
     parts: list[str] = [
         f"<section><h3>Cycle {cycle_idx + 1}</h3>",
@@ -343,7 +354,7 @@ def render_cycle_single_table(
     for j in range(cols):
         token = truth[j] if j < len(truth) else None
         cls = "anchor" if j == 0 else "truth"
-        parts.append(f"<td class=\"{cls}\">{token_cell_html(token)}</td>")
+        parts.append(f"<td class=\"{cls}\">{token_cell_html(token, show_prob=False)}</td>")
     parts.append("</tr>")
 
     accepted = int((cycle or {}).get("accepted_count", 0))
@@ -370,17 +381,17 @@ def render_cycle_single_table(
             cell = {
                 "token": int(expect["token"]),
                 "text_escaped": expect.get("text_escaped", ""),
-                "prob": expect.get("prob"),
+                "prob": float(node.get("prob", 0.0)),
             }
         if j == 0 and cls == "missing":
             cls = "missing anchor"
         elif j == 0:
             cls += " anchor"
-        parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra)}</td>")
+        parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra, show_prob=node is not None)}</td>")
     parts.append("</tr>")
     parts.append("</table>")
     parts.append("<div class=\"graph-foldouts\">")
-    parts.append(render_graph_foldout(label, cycle or {}, f"graph-{cycle_idx}-{label}"))
+    parts.append(render_graph_foldout(label, cycle or {}, f"graph-{cycle_idx}-{label}", correct))
     parts.append("</div></section>")
     return "".join(parts)
 
@@ -409,8 +420,9 @@ def report_style() -> str:
     .graph-details { min-width: 420px; }
     .graph-table { width: auto; }
     .graph-table th { text-align: center; min-width: 140px; }
-    .graph-greedy { background: #eaf6e4; }
+    .graph-greedy { background: #fafafa; }
     .graph-node { background: #fafafa; }
+    .graph-correct { background: #dff2d8; }
     .graph-selected { outline: 2px solid #2e7d32; outline-offset: -2px; }
     .graph-empty { background: #fff; color: #aaa; text-align: center; }
     .trace-name { font-weight: 700; }
