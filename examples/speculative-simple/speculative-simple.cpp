@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -194,48 +195,57 @@ static float trace_find_draft_prob(
         const common_speculative_trace & trace,
         size_t depth,
         llama_token tok) {
-    if (depth >= trace.proposal_graph.size()) {
-        return 0.0f;
+    std::vector<const common_speculative_trace_node *> level;
+    for (const auto & root : trace.proposal_tree) {
+        level.push_back(&root);
+    }
+
+    for (size_t d = 0; d < depth; ++d) {
+        std::vector<const common_speculative_trace_node *> next;
+        for (const auto * node : level) {
+            for (const auto & child : node->children) {
+                next.push_back(&child);
+            }
+        }
+        level.swap(next);
+        if (level.empty()) {
+            return 0.0f;
+        }
     }
 
     float best = 0.0f;
-    for (const auto & node : trace.proposal_graph[depth]) {
-        if (node.token == tok && node.prob > best) {
-            best = node.prob;
+    for (const auto * node : level) {
+        if (node->token == tok && node->prob > best) {
+            best = node->prob;
         }
     }
     return best;
 }
 
-static json trace_proposal_graph_json(
+static json trace_proposal_tree_json(
         llama_context * ctx,
         const common_speculative_trace & trace) {
-    json graph = json::array();
-    for (const auto & depth_nodes : trace.proposal_graph) {
-        json depth = json::array();
-        for (const auto & node : depth_nodes) {
-            depth.push_back({
-                {"token", (int) node.token},
-                {"text_escaped", trace_token_text(ctx, node.token)},
-                {"prob", node.prob},
-                {"cum_prob", node.cum_prob},
-            });
+    std::function<json(const common_speculative_trace_node &)> encode =
+            [&](const common_speculative_trace_node & node) -> json {
+        json out = {
+            {"token", (int) node.token},
+            {"text_escaped", trace_token_text(ctx, node.token)},
+            {"prob", node.prob},
+            {"cum_prob", node.cum_prob},
+            {"accepted", node.accepted},
+            {"children", json::array()},
+        };
+        for (const auto & child : node.children) {
+            out["children"].push_back(encode(child));
         }
-        graph.push_back(std::move(depth));
-    }
-    return graph;
-}
+        return out;
+    };
 
-static json trace_proposal_paths_json(const common_speculative_trace & trace) {
-    json paths = json::array();
-    for (const auto & path : trace.proposal_paths) {
-        json seq = json::array();
-        for (llama_token tok : path) {
-            seq.push_back((int) tok);
-        }
-        paths.push_back(std::move(seq));
+    json tree = json::array();
+    for (const auto & root : trace.proposal_tree) {
+        tree.push_back(encode(root));
     }
-    return paths;
+    return tree;
 }
 }
 
@@ -463,7 +473,7 @@ int main(int argc, char ** argv) {
         common_speculative_tree tree;
         common_speculative_trace spec_trace;
         const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
-        const bool has_trace = spec ? common_speculative_get_trace(spec, spec_trace) : false;
+        bool has_trace = spec ? common_speculative_get_trace(spec, spec_trace) : false;
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty();
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
@@ -567,6 +577,10 @@ int main(int argc, char ** argv) {
         }
         common_speculative_accept(spec, ids_limited.size() - 1);
 
+        if (use_tree && trace_enabled) {
+            has_trace = spec ? common_speculative_get_trace(spec, spec_trace) : false;
+        }
+
         std::vector<int32_t> accepted_nodes;
         if (use_tree) {
             accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
@@ -588,10 +602,9 @@ int main(int argc, char ** argv) {
             json cycle = {
                 {"cycle", pass_idx + 1},
                 {"context_len", (int) prompt_tgt.size() + 1},
-                {"proposal_count", use_tree && has_trace ? (int) spec_trace.proposal_paths.size() : 0},
+                {"proposal_count", use_tree && has_trace ? (int) spec_trace.proposal_count : 0},
                 {"accepted_count", (int) ids_limited.size() - 1},
-                {"proposal_paths", use_tree && has_trace ? trace_proposal_paths_json(spec_trace) : json::array()},
-                {"proposal_graph", use_tree && has_trace ? trace_proposal_graph_json(ctx_tgt, spec_trace) : json::array()},
+                {"proposal_tree", use_tree && has_trace ? trace_proposal_tree_json(ctx_tgt, spec_trace) : json::array()},
                 {"passes", json::array()},
                 {"appended_tokens", json::array()},
             };

@@ -95,6 +95,60 @@ static void common_speculative_tree_build_metadata(common_speculative_tree & tre
     }
 }
 
+static common_speculative_trace_node * common_speculative_trace_find_child(
+        std::vector<common_speculative_trace_node> & nodes,
+        llama_token token) {
+    for (auto & node : nodes) {
+        if (node.token == token) {
+            return &node;
+        }
+    }
+    return nullptr;
+}
+
+static common_speculative_trace_node & common_speculative_trace_insert_path(
+        std::vector<common_speculative_trace_node> & roots,
+        const llama_tokens & path,
+        float prob,
+        float cum_prob) {
+    GGML_ASSERT(!path.empty());
+
+    std::vector<common_speculative_trace_node> * level = &roots;
+    common_speculative_trace_node * node = nullptr;
+    for (size_t i = 0; i < path.size(); ++i) {
+        node = common_speculative_trace_find_child(*level, path[i]);
+        if (!node) {
+            level->push_back({ path[i], 0.0f, 0.0f, false, {} });
+            node = &level->back();
+        }
+        if (i + 1 == path.size()) {
+            node->prob = prob;
+            node->cum_prob = cum_prob;
+        }
+        level = &node->children;
+    }
+
+    return *node;
+}
+
+static void common_speculative_trace_mark_accepted(
+        std::vector<common_speculative_trace_node> & roots,
+        const llama_tokens & accepted_tokens) {
+    if (accepted_tokens.empty()) {
+        return;
+    }
+
+    std::vector<common_speculative_trace_node> * level = &roots;
+    for (llama_token token : accepted_tokens) {
+        common_speculative_trace_node * node = common_speculative_trace_find_child(*level, token);
+        if (!node) {
+            return;
+        }
+        node->accepted = true;
+        level = &node->children;
+    }
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -1016,8 +1070,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             std::vector<beam_expansion> expansions;
             expansions.reserve((size_t) beam_width * (size_t) beam_width);
-            std::vector<common_speculative_trace_node> depth_nodes;
-            depth_nodes.reserve((size_t) beam_width);
 
             int32_t n_active = 0;
             for (uint8_t active : active_cur) {
@@ -1128,16 +1180,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     /* beam_idx = */ beam_idx,
                     /* token    = */ base_id,
                 });
-                depth_nodes.push_back({
-                    /* token    = */ base_id,
-                    /* prob     = */ prob,
-                    /* cum_prob = */ std::exp(total_logprob),
-                });
                 if ((int) expansions.size() >= beam_width) {
                     break;
                 }
             }
-            last_trace.proposal_graph.push_back(depth_nodes);
             const double depth_score = (ggml_time_us() - t_scoring_start) / 1000.0;
             t_scoring_us += (int64_t) (depth_score * 1000.0);
             depth_score_ms.push_back(depth_score);
@@ -1222,6 +1268,11 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             for (int32_t i = 0; i < n_next; ++i) {
                 const auto & cand = beams_nxt[(size_t) i];
+                common_speculative_trace_insert_path(
+                        last_trace.proposal_tree,
+                        cand.tokens,
+                        std::exp(cand.logprob - beam_logprob_cur[expansions[(size_t) i].beam_idx]),
+                        std::exp(cand.logprob));
                 prefix_states[cand.tokens] = cand.state;
                 all_nodes.push_back({cand.logprob, cand.tokens});
             }
@@ -1238,10 +1289,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             all_nodes.resize(max_proposals);
         }
 
-        last_trace.proposal_paths.reserve(all_nodes.size());
-        for (const auto & entry : all_nodes) {
-            last_trace.proposal_paths.push_back(entry.tokens);
-        }
+        last_trace.proposal_count = (int32_t) all_nodes.size();
 
         if (profile) {
             const int64_t t_total_us = ggml_time_us() - t_draft_start;
@@ -1414,6 +1462,12 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
             const llama_token next_tok = ids[accepted_nodes.size()];
             node = find_token(children[(size_t) node], next_tok);
+        }
+
+        const size_t accepted_count = ids.size() > 0 ? ids.size() - 1 : 0;
+        if (accepted_count > 0) {
+            llama_tokens accepted_tokens(ids.begin(), ids.begin() + (ptrdiff_t) accepted_count);
+            common_speculative_trace_mark_accepted(last_trace.proposal_tree, accepted_tokens);
         }
 
         size_t n_tokens = 0;

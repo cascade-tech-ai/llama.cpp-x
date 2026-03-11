@@ -39,15 +39,17 @@ struct common_speculative_trace_node {
     llama_token token = LLAMA_TOKEN_NULL;
     float prob = 0.0f;
     float cum_prob = 0.0f;
+    bool accepted = false;
+    std::vector<common_speculative_trace_node> children;
 };
 
 struct common_speculative_trace {
-    std::vector<llama_tokens> proposal_paths;
-    std::vector<std::vector<common_speculative_trace_node>> proposal_graph;
+    int32_t proposal_count = 0;
+    std::vector<common_speculative_trace_node> proposal_tree;
 
     void clear() {
-        proposal_paths.clear();
-        proposal_graph.clear();
+        proposal_count = 0;
+        proposal_tree.clear();
     }
 };
 
