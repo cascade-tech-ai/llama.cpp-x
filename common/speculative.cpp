@@ -1555,6 +1555,7 @@ private:
             size_t & n_tokens) const {
         tensors.clear();
         n_tokens = 0;
+        llama_eagle3_synchronize_hidden_capture(ctx_tgt);
 
         for (int32_t layer_id : layer_ids) {
             size_t n_layer_tokens = 0;

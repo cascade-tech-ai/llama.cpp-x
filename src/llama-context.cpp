@@ -23,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_context
@@ -864,6 +865,19 @@ void llama_context::eagle3_capture_clear() {
         layer.tensor = nullptr;
         layer.capacity = 0;
         layer.host_cache.clear();
+    }
+}
+
+void llama_context::eagle3_capture_synchronize() const {
+    std::unordered_set<ggml_backend_t> synced;
+    for (const auto & layer : eagle3_capture) {
+        if (!layer.tensor || !layer.backend) {
+            continue;
+        }
+        if (!synced.insert(layer.backend).second) {
+            continue;
+        }
+        ggml_backend_synchronize(layer.backend);
     }
 }
 
@@ -3550,6 +3564,13 @@ const ggml_tensor * llama_eagle3_get_hidden_capture(
     }
 
     return ctx->eagle3_get_hidden_capture(layer_id, *n_tokens);
+}
+
+void llama_eagle3_synchronize_hidden_capture(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_capture_synchronize();
 }
 
 void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {

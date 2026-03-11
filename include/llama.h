@@ -1041,6 +1041,9 @@ extern "C" {
             int32_t layer_id,
             size_t * n_tokens);
 
+    // Ensure the backend-resident capture buffers are ready to be consumed by EAGLE3.
+    LLAMA_API void llama_eagle3_synchronize_hidden_capture(struct llama_context * ctx);
+
     //
     // Speculative tree attention mask [EXPERIMENTAL]
     //
