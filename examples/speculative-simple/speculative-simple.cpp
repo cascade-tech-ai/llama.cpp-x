@@ -696,7 +696,7 @@ int main(int argc, char ** argv) {
     LOG_INF("n_predict = %d\n", n_predict);
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
-    LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? (100.0f * n_accept / n_drafted) : 0.0f);
 
     if (profile_spec) {
         LOG_INF("spec profile total: target_passes=%d target_total=%.3fms target_forward=%.3fms target_sampling=%.3fms eagle_total=%.3fms\n",

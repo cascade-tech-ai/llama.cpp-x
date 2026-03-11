@@ -68,19 +68,6 @@ def parse_llama_spec_stdout(text: str) -> dict[str, Any]:
     }
 
 
-def parse_llama_base_stdout(text: str, n_predict: int) -> dict[str, Any]:
-    speed = re.search(r"Generation:\s+([0-9.]+)\s+t/s", text)
-    if not speed:
-        raise ValueError("could not parse llama-cli generation speed")
-    return {
-        "generated_count": n_predict,
-        "decode_seconds": None,
-        "generation_tps": float(speed.group(1)),
-        "n_accept": None,
-        "n_drafted": None,
-    }
-
-
 def run_llama_spec(args: argparse.Namespace, prompt_info: dict[str, Any], persist_trace_path: Path | None) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="eagle-trace-") as tmpdir:
         trace_path = Path(tmpdir) / "llama_trace.yaml"
@@ -124,20 +111,21 @@ def run_llama_spec(args: argparse.Namespace, prompt_info: dict[str, Any], persis
 
 def run_llama_base(args: argparse.Namespace, prompt_info: dict[str, Any]) -> dict[str, Any]:
     cmd = [
-        args.llama_base_binary,
+        args.llama_spec_binary,
         "-m", args.base_model_gguf,
+        "--spec-type", "none",
         "--override-kv", "tokenizer.ggml.add_bos_token=bool:false",
         "-fa", args.flash_attn,
         "--temp", str(args.temp),
         "--top-k", str(args.top_k),
         "-n", str(args.max_new_tokens),
-        "--single-turn",
+        "--no-conversation",
         "--prompt", prompt_info["prompt"],
     ]
     proc = subprocess.run(cmd, cwd=args.llama_cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stdout[-4000:])
-    parsed = parse_llama_base_stdout(proc.stdout, args.max_new_tokens)
+    parsed = parse_llama_spec_stdout(proc.stdout)
     return {
         **parsed,
         "acceptance_len": None,
@@ -245,7 +233,6 @@ def main() -> None:
     ap.add_argument("--head-model-gguf", default="/home/alvion/projects/kestrel/models/llama3-1b_eagle.bf16.gguf")
     ap.add_argument("--llama-cwd", default=".")
     ap.add_argument("--llama-spec-binary", default="./build-cuda/bin/llama-speculative-simple")
-    ap.add_argument("--llama-base-binary", default="./build-cuda/bin/llama-cli")
     ap.add_argument("--kestrel-train", default="/home/alvion/projects/kestrel/train.py")
     ap.add_argument("--max-depth", type=int, default=7)
     ap.add_argument("--max-proposals", type=int, default=16)
