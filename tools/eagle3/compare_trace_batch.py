@@ -29,6 +29,9 @@ def render_summary_html(path: Path, summary: dict[str, Any]) -> None:
         rows.append(
             "<tr>"
             f"<td>{row['dataset_entry']}</td>"
+            f"<td>{row['kestrel_accept_len']:.3f}</td>"
+            f"<td>{row['llama_accept_len']:.3f}</td>"
+            f"<td>{row['accept_len_delta']:+.3f}</td>"
             f"<td>{row['cycles_compared']}</td>"
             f"<td>{row['exact_cycles']}</td>"
             f"<td>{row['avg_prefix']:.3f}</td>"
@@ -58,6 +61,9 @@ def render_summary_html(path: Path, summary: dict[str, Any]) -> None:
 <body>
   <h1>EAGLE Trace Batch Compare</h1>
   <p>count={summary['count']}<br>
+     kestrel_accept_len_avg={summary['kestrel_accept_len_avg']:.3f}<br>
+     llama_accept_len_avg={summary['llama_accept_len_avg']:.3f}<br>
+     accept_len_delta_avg={summary['accept_len_delta_avg']:+.3f}<br>
      divergent_positions={summary['divergent_positions_total']}<br>
      mean_prob_delta={summary['mean_prob_delta']:.6f}<br>
      min_prob_delta={summary['min_prob_delta']:.6f}<br>
@@ -65,6 +71,9 @@ def render_summary_html(path: Path, summary: dict[str, Any]) -> None:
   <table>
     <tr>
       <th>entry</th>
+      <th>kestrel acc len</th>
+      <th>llama acc len</th>
+      <th>delta</th>
       <th>cycles</th>
       <th>exact</th>
       <th>avg prefix</th>
@@ -123,6 +132,14 @@ def divergence_stats(trace_a: dict[str, Any], trace_b: dict[str, Any]) -> dict[s
         "min_prob_delta": min(deltas),
         "max_prob_delta": max(deltas),
     }
+
+
+def acceptance_len(trace: dict[str, Any]) -> float:
+    cycles = trace.get("cycles") or []
+    if not cycles:
+        return 0.0
+    total_accepted = sum(int(cycle.get("accepted_count", 0)) for cycle in cycles)
+    return total_accepted / len(cycles)
 
 
 def main() -> None:
@@ -233,6 +250,8 @@ def main() -> None:
         llama_trace = load_trace(llama_yaml)
         stats = compare_greedy(kestrel_trace, llama_trace)
         div = divergence_stats(llama_trace, kestrel_trace)
+        kestrel_accept_len = acceptance_len(kestrel_trace)
+        llama_accept_len = acceptance_len(llama_trace)
         write_report(report_file, "kestrel", kestrel_trace, "llama.cpp", llama_trace, stats)
 
         total_divergent_positions += div["divergent_positions"]
@@ -250,6 +269,9 @@ def main() -> None:
 
         row = {
             "dataset_entry": idx,
+            "kestrel_accept_len": kestrel_accept_len,
+            "llama_accept_len": llama_accept_len,
+            "accept_len_delta": llama_accept_len - kestrel_accept_len,
             "cycles_compared": stats["cycles_compared"],
             "exact_cycles": stats["exact_cycles"],
             "avg_prefix": stats["avg_prefix"],
@@ -270,6 +292,9 @@ def main() -> None:
 
     summary = {
         "count": len(rows),
+        "kestrel_accept_len_avg": mean([row["kestrel_accept_len"] for row in rows]) if rows else 0.0,
+        "llama_accept_len_avg": mean([row["llama_accept_len"] for row in rows]) if rows else 0.0,
+        "accept_len_delta_avg": mean([row["accept_len_delta"] for row in rows]) if rows else 0.0,
         "divergent_positions_total": total_divergent_positions,
         "mean_prob_delta": mean(all_deltas),
         "min_prob_delta": min(all_deltas),
