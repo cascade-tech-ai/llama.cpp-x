@@ -39,6 +39,7 @@ struct common_speculative_trace_node {
     llama_token token = LLAMA_TOKEN_NULL;
     float prob = 0.0f;
     float cum_prob = 0.0f;
+    bool selected = false;
     bool accepted = false;
     std::vector<common_speculative_trace_node> children;
 };

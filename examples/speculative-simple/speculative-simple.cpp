@@ -232,6 +232,7 @@ static json trace_proposal_tree_json(
             {"text_escaped", trace_token_text(ctx, node.token)},
             {"prob", node.prob},
             {"cum_prob", node.cum_prob},
+            {"selected", node.selected},
             {"accepted", node.accepted},
             {"children", json::array()},
         };

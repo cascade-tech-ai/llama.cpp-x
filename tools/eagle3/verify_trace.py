@@ -20,78 +20,29 @@ def load_trace(path: Path) -> dict[str, Any]:
         return json.loads(text)
 
 
-def best_graph_node(cycle: dict[str, Any], depth: int, token: int) -> dict[str, Any]:
-    graph = cycle.get("proposal_graph") or []
-    if depth >= len(graph):
-        return {}
-    best: dict[str, Any] = {}
-    best_cum = -1.0
-    for node in graph[depth] or []:
-        if int(node.get("token", -1)) != token:
-            continue
-        cum = float(node.get("cum_prob", 0.0))
-        if cum > best_cum:
-            best = node
-            best_cum = cum
-    return best
-
-
 def proposal_tree(cycle: dict[str, Any]) -> list[dict[str, Any]]:
     return list(cycle.get("proposal_tree") or [])
 
 
-def greedy_tokens_from_paths(cycle: dict[str, Any]) -> list[int]:
-    paths = cycle.get("proposal_paths") or []
-    if not paths:
-        return []
-
-    current = [int(tok) for tok in (paths[0] or [])]
-    if not current:
-        return []
-
-    for raw in paths[1:]:
-        path = [int(tok) for tok in (raw or [])]
-        if len(path) != len(current) + 1:
-            break
-        if path[: len(current)] != current:
-            break
-        current = path
-
-    return current
-
-
 def greedy_path(cycle: dict[str, Any]) -> list[dict[str, Any]]:
     tree = proposal_tree(cycle)
-    if tree:
-        result: list[dict[str, Any]] = []
-        node = tree[0] if tree else None
-        while node:
-            result.append(
-                {
-                    "token": int(node.get("token", -1)),
-                    "text_escaped": node.get("text_escaped", ""),
-                    "prob": float(node.get("prob", 0.0)),
-                    "cum_prob": float(node.get("cum_prob", 0.0)),
-                }
-            )
-            children = node.get("children") or []
-            node = children[0] if children else None
-        return result
-
-    tokens = greedy_tokens_from_paths(cycle)
-    if not tokens:
+    if not tree:
         return []
     result: list[dict[str, Any]] = []
-    for depth, token in enumerate(tokens):
-        node = best_graph_node(cycle, depth, int(token))
+    node = tree[0]
+    while node:
         result.append(
             {
-                "token": int(token),
+                "token": int(node.get("token", -1)),
                 "text_escaped": node.get("text_escaped", ""),
                 "prob": float(node.get("prob", 0.0)),
                 "cum_prob": float(node.get("cum_prob", 0.0)),
+                "selected": bool(node.get("selected", False)),
+                "accepted": bool(node.get("accepted", False)),
             }
         )
+        children = list(node.get("children") or [])
+        node = children[0] if children else None
     return result
 
 
@@ -130,70 +81,30 @@ def token_cell_html(token: dict[str, Any] | None, *, extra: str = "") -> str:
     )
 
 
-def graph_node_key(node: dict[str, Any]) -> tuple[int, float]:
-    return (int(node.get("token", -1)), float(node.get("cum_prob", 0.0)))
-
-
-def ordered_graph_columns(cycle: dict[str, Any]) -> list[list[dict[str, Any]]]:
-    graph = cycle.get("proposal_graph") or []
-    greedy = greedy_path(cycle)
-    columns: list[list[dict[str, Any]]] = []
-    for depth, nodes in enumerate(graph):
-        col = list(nodes or [])
-        if depth < len(greedy):
-            picked = best_graph_node(cycle, depth, int(greedy[depth]["token"]))
-            if picked:
-                picked_key = graph_node_key(picked)
-                rest = [node for node in col if graph_node_key(node) != picked_key]
-                col = [picked] + rest
-        columns.append(col)
-    return columns
+def tree_lookup_path(
+    roots: list[dict[str, Any]],
+    tokens: list[int],
+) -> list[dict[str, Any] | None]:
+    out: list[dict[str, Any] | None] = []
+    level = roots
+    for token in tokens:
+        node = next((child for child in level if int(child.get("token", -1)) == int(token)), None)
+        out.append(node)
+        if node is None:
+            level = []
+            continue
+        level = list(node.get("children") or [])
+    return out
 
 
 def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str) -> str:
     tree = proposal_tree(cycle)
     if not tree:
-        columns = ordered_graph_columns(cycle)
-        max_rows = max((len(col) for col in columns), default=0)
-        if not columns:
-            return (
-                f"<details id=\"{details_id}\" class=\"graph-details\">"
-                f"<summary>{html.escape(label)} graph</summary>"
-                "<p>No proposal graph.</p></details>"
-            )
-
-        parts: list[str] = [
-            f"<details id=\"{details_id}\" class=\"graph-details\">",
-            f"<summary>{html.escape(label)} graph</summary>",
-            "<table class=\"graph-table\"><tr>",
-        ]
-        for depth in range(len(columns)):
-            parts.append(f"<th>d{depth}</th>")
-        parts.append("</tr>")
-
-        for row in range(max_rows):
-            parts.append("<tr>")
-            for depth, col in enumerate(columns):
-                node = col[row] if row < len(col) else None
-                if node is None:
-                    parts.append("<td class=\"graph-empty\">-</td>")
-                    continue
-                cls = "graph-greedy" if row == 0 else "graph-node"
-                node_token = {
-                    "token": int(node.get("token", -1)),
-                    "text_escaped": node.get("text_escaped", ""),
-                    "prob": float(node.get("prob", 0.0)),
-                }
-                extra = f"cp={float(node.get('cum_prob', 0.0)):.4g}"
-                parts.append(
-                    f"<td class=\"{cls}\">"
-                    f"{token_cell_html(node_token, extra=extra)}"
-                    "</td>"
-                )
-            parts.append("</tr>")
-
-        parts.append("</table></details>")
-        return "".join(parts)
+        return (
+            f"<details id=\"{details_id}\" class=\"graph-details\">"
+            f"<summary>{html.escape(label)} graph</summary>"
+            "<p>No proposal tree.</p></details>"
+        )
 
     rows: list[tuple[int, list[dict[str, Any]]]] = []
 
@@ -240,7 +151,11 @@ def render_graph_foldout(label: str, cycle: dict[str, Any], details_id: str) -> 
                 continue
             node = chain[rel]
             cls = "graph-greedy" if row_idx == 0 else "graph-node"
+            if node.get("selected"):
+                cls += " graph-selected"
             extra = f"cp={float(node.get('cum_prob', 0.0)):.4g}"
+            if node.get("selected"):
+                extra += " selected"
             if node.get("accepted"):
                 extra += " accepted"
             parts.append(
@@ -326,15 +241,11 @@ def render_cycle_pair_table(
     label_b: str,
     cycle_b: dict[str, Any] | None,
 ) -> str:
-    greedy_a = greedy_path(cycle_a or {})
-    greedy_b = greedy_path(cycle_b or {})
-    target_a = target_tokens(cycle_a or {})
-    target_b = target_tokens(cycle_b or {})
-
-    shown_a = (greedy_a[1:] if greedy_a else [])[:7]
-    shown_b = (greedy_b[1:] if greedy_b else [])[:7]
     truth = truth_stream[truth_offset : truth_offset + 8]
     cols = 8
+    truth_tokens = [int(tok["token"]) for tok in truth if tok]
+    lookup_a = tree_lookup_path(proposal_tree(cycle_a or {}), truth_tokens)
+    lookup_b = tree_lookup_path(proposal_tree(cycle_b or {}), truth_tokens)
 
     parts: list[str] = [
         f"<section><h3>Cycle {cycle_idx + 1}</h3>",
@@ -355,7 +266,12 @@ def render_cycle_pair_table(
             parts.append(f"<td class=\"{cls}\">{token_cell_html(token)}</td>")
         parts.append("</tr>")
 
-    def add_row(label: str, greedy: list[dict[str, Any]], row_class: str, cycle: dict[str, Any] | None) -> None:
+    def add_status_row(
+        label: str,
+        row_class: str,
+        cycle: dict[str, Any] | None,
+        looked_up: list[dict[str, Any] | None],
+    ) -> None:
         accepted = int((cycle or {}).get("accepted_count", 0))
         proposals = int((cycle or {}).get("proposal_count", 0))
         parts.append(
@@ -363,29 +279,35 @@ def render_cycle_pair_table(
             f"<th class=\"row-label\"><div class=\"trace-name\">{html.escape(label)}</div>"
             f"<div class=\"trace-meta\">accepted={accepted}<br>proposals={proposals}</div></th>"
         )
-        anchor = greedy_a[0] if (label == label_a and greedy_a) else greedy_b[0] if (label == label_b and greedy_b) else None
-        parts.append(f"<td class=\"anchor\">{token_cell_html(anchor)}</td>")
-        for j in range(1, cols):
-            draft = greedy[j - 1] if (j - 1) < len(greedy) else None
+        for j in range(cols):
             expect = truth[j] if j < len(truth) else None
-            if draft is None:
-                cls = "empty"
-                extra = ""
-            elif expect is None:
+            node = looked_up[j] if j < len(looked_up) else None
+            if expect is None:
                 cls = "beyond"
                 extra = "no future target"
+                cell = None
+            elif node is None:
+                cls = "missing"
+                extra = "missing from tree"
+                cell = expect
             else:
-                matched = int(draft["token"]) == int(expect["token"])
-                cls = "match" if matched else "miss"
-                extra = (
-                    f"expect {int(expect['token'])} {html.escape(str(expect.get('text_escaped', '')))}"
-                )
-            parts.append(f"<td class=\"{cls}\">{token_cell_html(draft, extra=extra)}</td>")
+                cls = "selected" if bool(node.get("selected")) else "present"
+                extra = f"tree p={float(node.get('prob', 0.0)):.4g} cp={float(node.get('cum_prob', 0.0)):.4g}"
+                cell = {
+                    "token": int(expect["token"]),
+                    "text_escaped": expect.get("text_escaped", ""),
+                    "prob": expect.get("prob"),
+                }
+            if j == 0 and cls == "missing":
+                cls = "missing anchor"
+            elif j == 0:
+                cls += " anchor"
+            parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra)}</td>")
         parts.append("</tr>")
 
     add_truth_row()
-    add_row(label_a, shown_a, "trace-a", cycle_a)
-    add_row(label_b, shown_b, "trace-b", cycle_b)
+    add_status_row(label_a, "trace-a", cycle_a, lookup_a)
+    add_status_row(label_b, "trace-b", cycle_b, lookup_b)
     parts.append("</table>")
     parts.append("<div class=\"graph-foldouts\">")
     parts.append(render_graph_foldout(label_a, cycle_a or {}, f"graph-{cycle_idx}-{label_a}"))
@@ -428,8 +350,10 @@ def write_report(path: Path, label_a: str, trace_a: dict[str, Any], label_b: str
     .draft-col {{ text-align: center; min-width: 150px; }}
     td.anchor {{ background: #eef3f8; }}
     td.truth {{ background: #f7f7f7; }}
-    td.match {{ background: #dff2d8; }}
-    td.miss {{ background: #f8d7da; }}
+    td.selected {{ background: #dff2d8; }}
+    td.present {{ background: #f8d7da; }}
+    td.missing {{ background: #8b1e1e; color: #fff; }}
+    td.missing .prob, td.missing .extra, td.missing .tokid {{ color: #f9d8d8; }}
     td.beyond {{ background: #f2f2f2; color: #666; }}
     td.empty {{ background: #fafafa; color: #999; }}
     tr.trace-truth > th.row-label {{ background: #ececec; }}
@@ -441,6 +365,7 @@ def write_report(path: Path, label_a: str, trace_a: dict[str, Any], label_b: str
     .graph-table th {{ text-align: center; min-width: 140px; }}
     .graph-greedy {{ background: #eaf6e4; }}
     .graph-node {{ background: #fafafa; }}
+    .graph-selected {{ outline: 2px solid #2e7d32; outline-offset: -2px; }}
     .graph-empty {{ background: #fff; color: #aaa; text-align: center; }}
     .trace-name {{ font-weight: 700; }}
     .trace-meta {{ font-weight: 400; font-size: 12px; color: #555; margin-top: 6px; }}

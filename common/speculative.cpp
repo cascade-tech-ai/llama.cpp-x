@@ -118,7 +118,7 @@ static common_speculative_trace_node & common_speculative_trace_insert_path(
     for (size_t i = 0; i < path.size(); ++i) {
         node = common_speculative_trace_find_child(*level, path[i]);
         if (!node) {
-            level->push_back({ path[i], 0.0f, 0.0f, false, {} });
+            level->push_back({ path[i], 0.0f, 0.0f, false, false, {} });
             node = &level->back();
         }
         if (i + 1 == path.size()) {
@@ -129,6 +129,24 @@ static common_speculative_trace_node & common_speculative_trace_insert_path(
     }
 
     return *node;
+}
+
+static void common_speculative_trace_mark_selected(
+        std::vector<common_speculative_trace_node> & roots,
+        const llama_tokens & selected_tokens) {
+    if (selected_tokens.empty()) {
+        return;
+    }
+
+    std::vector<common_speculative_trace_node> * level = &roots;
+    for (llama_token token : selected_tokens) {
+        common_speculative_trace_node * node = common_speculative_trace_find_child(*level, token);
+        if (!node) {
+            return;
+        }
+        node->selected = true;
+        level = &node->children;
+    }
 }
 
 static void common_speculative_trace_mark_accepted(
@@ -1290,6 +1308,9 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         }
 
         last_trace.proposal_count = (int32_t) all_nodes.size();
+        for (const auto & node : all_nodes) {
+            common_speculative_trace_mark_selected(last_trace.proposal_tree, node.tokens);
+        }
 
         if (profile) {
             const int64_t t_total_us = ggml_time_us() - t_draft_start;
