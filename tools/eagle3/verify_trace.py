@@ -316,6 +316,112 @@ def render_cycle_pair_table(
     return "".join(parts)
 
 
+def render_cycle_single_table(
+    cycle_idx: int,
+    truth_stream: list[dict[str, Any]],
+    truth_offset: int,
+    label: str,
+    cycle: dict[str, Any] | None,
+) -> str:
+    truth = truth_stream[truth_offset : truth_offset + 8]
+    cols = 8
+    truth_tokens = [int(tok["token"]) for tok in truth if tok]
+    lookup = tree_lookup_path(proposal_tree(cycle or {}), truth_tokens)
+
+    parts: list[str] = [
+        f"<section><h3>Cycle {cycle_idx + 1}</h3>",
+        "<table class=\"cycle-table\">",
+        "<tr><th class=\"row-label\">trace</th>",
+    ]
+    parts.append("<th class=\"target-label\">t0</th>")
+    for j in range(1, cols):
+        parts.append(f"<th class=\"draft-col\">d{j}</th>")
+    parts.append("</tr>")
+
+    parts.append("<tr class=\"trace-truth\">")
+    parts.append("<th class=\"row-label\"><div class=\"trace-name\">target</div></th>")
+    for j in range(cols):
+        token = truth[j] if j < len(truth) else None
+        cls = "anchor" if j == 0 else "truth"
+        parts.append(f"<td class=\"{cls}\">{token_cell_html(token)}</td>")
+    parts.append("</tr>")
+
+    accepted = int((cycle or {}).get("accepted_count", 0))
+    proposals = int((cycle or {}).get("proposal_count", 0))
+    parts.append(
+        "<tr class=\"trace-a\">"
+        f"<th class=\"row-label\"><div class=\"trace-name\">{html.escape(label)}</div>"
+        f"<div class=\"trace-meta\">accepted={accepted}<br>proposals={proposals}</div></th>"
+    )
+    for j in range(cols):
+        expect = truth[j] if j < len(truth) else None
+        node = lookup[j] if j < len(lookup) else None
+        if expect is None:
+            cls = "beyond"
+            extra = "no future target"
+            cell = None
+        elif node is None:
+            cls = "missing"
+            extra = "missing from tree"
+            cell = expect
+        else:
+            cls = "selected" if bool(node.get("selected")) else "present"
+            extra = f"tree p={float(node.get('prob', 0.0)):.4g} cp={float(node.get('cum_prob', 0.0)):.4g}"
+            cell = {
+                "token": int(expect["token"]),
+                "text_escaped": expect.get("text_escaped", ""),
+                "prob": expect.get("prob"),
+            }
+        if j == 0 and cls == "missing":
+            cls = "missing anchor"
+        elif j == 0:
+            cls += " anchor"
+        parts.append(f"<td class=\"{cls}\">{token_cell_html(cell, extra=extra)}</td>")
+    parts.append("</tr>")
+    parts.append("</table>")
+    parts.append("<div class=\"graph-foldouts\">")
+    parts.append(render_graph_foldout(label, cycle or {}, f"graph-{cycle_idx}-{label}"))
+    parts.append("</div></section>")
+    return "".join(parts)
+
+
+def report_style() -> str:
+    return """
+    body { font-family: sans-serif; margin: 24px; }
+    table { border-collapse: collapse; margin-bottom: 24px; width: 100%; }
+    th, td { border: 1px solid #bbb; padding: 6px; vertical-align: top; }
+    th { background: #f4f4f4; }
+    .cycle-table .row-label { width: 150px; }
+    .cycle-table .target-label { width: 220px; }
+    .draft-col { text-align: center; min-width: 150px; }
+    td.anchor { background: #eef3f8; }
+    td.truth { background: #f7f7f7; }
+    td.selected { background: #dff2d8; }
+    td.present { background: #f8d7da; }
+    td.missing { background: #8b1e1e; color: #fff; }
+    td.missing .prob, td.missing .extra, td.missing .tokid { color: #f9d8d8; }
+    td.beyond { background: #f2f2f2; color: #666; }
+    td.empty { background: #fafafa; color: #999; }
+    tr.trace-truth > th.row-label { background: #ececec; }
+    tr.trace-a > th.row-label { background: #e8f1fb; }
+    tr.trace-b > th.row-label { background: #f5ead7; }
+    .graph-foldouts { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+    .graph-details { min-width: 420px; }
+    .graph-table { width: auto; }
+    .graph-table th { text-align: center; min-width: 140px; }
+    .graph-greedy { background: #eaf6e4; }
+    .graph-node { background: #fafafa; }
+    .graph-selected { outline: 2px solid #2e7d32; outline-offset: -2px; }
+    .graph-empty { background: #fff; color: #aaa; text-align: center; }
+    .trace-name { font-weight: 700; }
+    .trace-meta { font-weight: 400; font-size: 12px; color: #555; margin-top: 6px; }
+    .token .tokid { font-weight: 700; font-family: monospace; }
+    .token .toktext { margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+    .token .prob, .token .extra { margin-top: 4px; font-size: 12px; color: #555; white-space: pre-wrap; word-break: break-word; }
+    section { margin-bottom: 32px; }
+    """
+
+
 def write_report(path: Path, label_a: str, trace_a: dict[str, Any], label_b: str, trace_b: dict[str, Any], stats: dict[str, Any]) -> None:
     first = stats.get("first_mismatch")
     mismatch_html = "<p>No mismatch.</p>"
@@ -341,38 +447,7 @@ def write_report(path: Path, label_a: str, trace_a: dict[str, Any], label_b: str
   <meta charset="utf-8">
   <title>EAGLE Trace Report</title>
   <style>
-    body {{ font-family: sans-serif; margin: 24px; }}
-    table {{ border-collapse: collapse; margin-bottom: 24px; width: 100%; }}
-    th, td {{ border: 1px solid #bbb; padding: 6px; vertical-align: top; }}
-    th {{ background: #f4f4f4; }}
-    .cycle-table .row-label {{ width: 150px; }}
-    .cycle-table .target-label {{ width: 220px; }}
-    .draft-col {{ text-align: center; min-width: 150px; }}
-    td.anchor {{ background: #eef3f8; }}
-    td.truth {{ background: #f7f7f7; }}
-    td.selected {{ background: #dff2d8; }}
-    td.present {{ background: #f8d7da; }}
-    td.missing {{ background: #8b1e1e; color: #fff; }}
-    td.missing .prob, td.missing .extra, td.missing .tokid {{ color: #f9d8d8; }}
-    td.beyond {{ background: #f2f2f2; color: #666; }}
-    td.empty {{ background: #fafafa; color: #999; }}
-    tr.trace-truth > th.row-label {{ background: #ececec; }}
-    tr.trace-a > th.row-label {{ background: #e8f1fb; }}
-    tr.trace-b > th.row-label {{ background: #f5ead7; }}
-    .graph-foldouts {{ display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }}
-    .graph-details {{ min-width: 420px; }}
-    .graph-table {{ width: auto; }}
-    .graph-table th {{ text-align: center; min-width: 140px; }}
-    .graph-greedy {{ background: #eaf6e4; }}
-    .graph-node {{ background: #fafafa; }}
-    .graph-selected {{ outline: 2px solid #2e7d32; outline-offset: -2px; }}
-    .graph-empty {{ background: #fff; color: #aaa; text-align: center; }}
-    .trace-name {{ font-weight: 700; }}
-    .trace-meta {{ font-weight: 400; font-size: 12px; color: #555; margin-top: 6px; }}
-    .token .tokid {{ font-weight: 700; font-family: monospace; }}
-    .token .toktext {{ margin-top: 4px; white-space: pre-wrap; word-break: break-word; }}
-    .token .prob, .token .extra {{ margin-top: 4px; font-size: 12px; color: #555; white-space: pre-wrap; word-break: break-word; }}
-    section {{ margin-bottom: 32px; }}
+    {report_style()}
   </style>
 </head>
 <body>
@@ -382,6 +457,33 @@ def write_report(path: Path, label_a: str, trace_a: dict[str, Any], label_b: str
      Average shared greedy prefix: {stats['avg_prefix']:.3f}<br>
      Greedy token match rate: {stats['token_match_rate']:.3%}</p>
   {mismatch_html}
+  {cycle_html}
+</body>
+</html>
+"""
+    path.write_text(doc, encoding="utf-8")
+
+
+def write_single_report(path: Path, label: str, trace: dict[str, Any]) -> None:
+    cycles = trace.get("cycles") or []
+    truth_stream, truth_offsets = flatten_target_stream(trace)
+    cycle_html = "".join(
+        render_cycle_single_table(i, truth_stream, truth_offsets[i], label, cycles[i])
+        for i in range(len(cycles))
+    )
+
+    doc = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(label)} EAGLE Trace Report</title>
+  <style>
+    {report_style()}
+  </style>
+</head>
+<body>
+  <h1>{html.escape(label)} EAGLE Trace Report</h1>
+  <p>Cycles: {len(cycles)}</p>
   {cycle_html}
 </body>
 </html>
