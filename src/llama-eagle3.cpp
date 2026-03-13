@@ -3329,9 +3329,6 @@ bool llama_eagle3_step_batch_from_parents(
 #if defined(GGML_USE_CUDA)
                     ggml_cuda_profiler_scope zone_copy_out(rt.backend_compute.get(), "eagle3/step_batch/copy_outputs");
 #endif
-                    if (dbg_step_batch) {
-                        fprintf(stderr, "eagle step_batch: copy_outputs begin\n");
-                    }
                     const int32_t required_len = past_len + 1;
                     for (int32_t ib = 0; ib < n_beams; ++ib) {
                         llama_eagle3_state * out_st = out_states[(size_t) ib];
@@ -3390,9 +3387,6 @@ bool llama_eagle3_step_batch_from_parents(
                         out_st->k.clear();
                         out_st->v.clear();
                         out_st->past_len = required_len;
-                    }
-                    if (dbg_step_batch) {
-                        fprintf(stderr, "eagle step_batch: copy_outputs done\n");
                     }
                 }
                 return true;
