@@ -133,6 +133,7 @@ struct llama_eagle3_step_batch_graph {
     ggml_tensor * t_hidden_in_b = nullptr; // [hidden_in_dim, n_beams]
     ggml_tensor * t_tok_b       = nullptr; // [n_beams]
     ggml_tensor * t_pos_b       = nullptr; // [n_beams]
+    ggml_tensor * t_attn_mask   = nullptr; // [n_beams * (past_len + 1), n_beams, n_heads, 1]
 
     std::vector<ggml_tensor *> t_hidden_in;
     std::vector<ggml_tensor *> t_tok;
@@ -242,12 +243,20 @@ struct llama_eagle3_rollout_batch {
     ggml_backend_buffer_ptr buf;
 
     ggml_tensor * t_hidden = nullptr; // [hidden_size, n_beams]
+
+    // Persistent full-length rollout state.
     ggml_tensor * t_k = nullptr;      // [head_dim, n_kv_heads, kv_capacity, n_beams]
     ggml_tensor * t_v = nullptr;      // [head_dim, n_kv_heads, kv_capacity, n_beams]
     ggml_tensor * t_mask = nullptr;   // [kv_capacity, 1, 1, n_beams]
 
+    // Temporary speculative-suffix workspace used for parent/child remap without alias clobbering.
+    ggml_tensor * t_k_work = nullptr;    // [head_dim, n_kv_heads, work_capacity, n_beams]
+    ggml_tensor * t_v_work = nullptr;    // [head_dim, n_kv_heads, work_capacity, n_beams]
+    ggml_tensor * t_mask_work = nullptr; // [work_capacity, 1, 1, n_beams]
+
     int32_t n_beams = 0;
     int32_t kv_capacity = 0;
+    int32_t work_capacity = 0;
 };
 
 struct llama_eagle3_select_batch_device_result {

@@ -68,6 +68,36 @@ void log_eagle_flash_attn_once(
     LLAMA_LOG_INFO("%s: eagle %s attention %s (backend = %s)\n", __func__, graph_name, status, backend_name);
 }
 
+bool eagle_backend_is_cpu(ggml_backend_t backend) {
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+ggml_tensor * build_eagle_kv_attn_single_4d(
+        ggml_context * ctx,
+        const llama_eagle3_hparams & hp,
+        ggml_tensor * t_kv_total) {
+    GGML_ASSERT(t_kv_total != nullptr);
+
+    ggml_tensor * t_kv_attn = t_kv_total;
+
+    if (hp.num_kv_heads != hp.num_heads) {
+        const int32_t n_rep = hp.num_heads / hp.num_kv_heads;
+
+        ggml_tensor * kv4 = ggml_reshape_4d(ctx, t_kv_attn, hp.head_dim, hp.num_kv_heads, t_kv_attn->ne[2], 1);
+        kv4 = ggml_permute(ctx, kv4, 0, 2, 3, 1); // [head_dim, 1, n_kv, seq]
+        kv4 = ggml_repeat_4d(ctx, kv4, hp.head_dim, n_rep, hp.num_kv_heads, t_kv_attn->ne[2]);
+        kv4 = ggml_cont(ctx, kv4);
+        t_kv_attn = ggml_reshape_3d(ctx, kv4, hp.head_dim, hp.num_heads, t_kv_attn->ne[2]);
+    }
+
+    ggml_tensor * out = ggml_reshape_4d(ctx, t_kv_attn, hp.head_dim, hp.num_heads, t_kv_attn->ne[2], 1);
+    return ggml_cont(ctx, out);
+}
+
 ggml_tensor * build_eagle_attn_output(
         ggml_context * ctx,
         const llama_eagle3_hparams & hp,
@@ -154,6 +184,73 @@ ggml_tensor * build_eagle_attn_output(
     ggml_tensor * kqv = ggml_mul_mat(ctx, vv_t, kq);
     ggml_tensor * attn_out = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     return ggml_cont_2d(ctx, attn_out, attn_out->ne[0]*attn_out->ne[1], attn_out->ne[2]*attn_out->ne[3]);
+}
+
+ggml_tensor * build_eagle_attn_output_packed_masked(
+        ggml_context * ctx,
+        const llama_eagle3_hparams & hp,
+        const llama_eagle3_runtime & rt,
+        ggml_tensor * t_q,
+        ggml_tensor * t_k_total,
+        ggml_tensor * t_v_total,
+        ggml_tensor * t_mask,
+        const char * graph_name,
+        bool & logged_flag) {
+    if (!t_q || !t_k_total || !t_v_total || !t_mask) {
+        return nullptr;
+    }
+
+    ggml_tensor * qv = ggml_view_4d(ctx, t_q, t_q->ne[0], t_q->ne[1], t_q->ne[2], 1,
+                                    t_q->nb[1], t_q->nb[2], t_q->nb[3], 0);
+    ggml_tensor * kv = ggml_view_4d(ctx, t_k_total, t_k_total->ne[0], t_k_total->ne[1], t_k_total->ne[2], 1,
+                                    t_k_total->nb[1], t_k_total->nb[2], t_k_total->nb[3], 0);
+    ggml_tensor * vv = ggml_view_4d(ctx, t_v_total, t_v_total->ne[0], t_v_total->ne[1], t_v_total->ne[2], 1,
+                                    t_v_total->nb[1], t_v_total->nb[2], t_v_total->nb[3], 0);
+
+    qv = ggml_permute(ctx, qv, 0, 2, 1, 3);
+    kv = ggml_permute(ctx, kv, 0, 2, 1, 3);
+    vv = ggml_permute(ctx, vv, 0, 2, 1, 3);
+
+    const float kq_scale = 1.0f / std::sqrt(float(hp.head_dim));
+
+    if (rt.flash_attn && rt.backend_compute && !eagle_backend_is_cpu(rt.backend_compute.get())) {
+        ggml_tensor * kv_fa = kv;
+        ggml_tensor * vv_fa = vv;
+        ggml_tensor * mask_fa = t_mask;
+
+        if (kv_fa->type == GGML_TYPE_F32) {
+            kv_fa = ggml_cast(ctx, kv_fa, GGML_TYPE_F16);
+        }
+
+        if (vv_fa->type == GGML_TYPE_F32) {
+            vv_fa = ggml_cast(ctx, vv_fa, GGML_TYPE_F16);
+        }
+
+        if (mask_fa->type == GGML_TYPE_F32) {
+            mask_fa = ggml_cast(ctx, mask_fa, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * fattn = ggml_flash_attn_ext(ctx, qv, kv_fa, vv_fa, mask_fa, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fattn, GGML_PREC_F32);
+
+        if (ggml_backend_supports_op(rt.backend_compute.get(), fattn)) {
+            log_eagle_flash_attn_once(rt, logged_flag, graph_name, "using packed masked ggml_flash_attn_ext");
+            return ggml_reshape_2d(ctx, fattn, fattn->ne[0] * fattn->ne[1], fattn->ne[2] * fattn->ne[3]);
+        }
+    }
+
+    log_eagle_flash_attn_once(rt, logged_flag, graph_name, "using packed masked generic attention");
+
+    ggml_tensor * kq = ggml_mul_mat(ctx, kv, qv);
+    kq = ggml_scale(ctx, kq, kq_scale);
+    kq = ggml_add(ctx, kq, t_mask);
+    kq = ggml_cont(ctx, kq);
+    kq = ggml_soft_max(ctx, kq);
+
+    ggml_tensor * vv_t = ggml_cont(ctx, ggml_transpose(ctx, vv));
+    ggml_tensor * kqv = ggml_mul_mat(ctx, vv_t, kq);
+    ggml_tensor * attn_out = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+    return ggml_cont_2d(ctx, attn_out, attn_out->ne[0] * attn_out->ne[1], attn_out->ne[2] * attn_out->ne[3]);
 }
 
 constexpr const char * EAGLE3_ARCH = "eagle3";
@@ -458,9 +555,13 @@ bool llama_eagle3_rollout_batch_ensure_impl(
         int32_t n_beams,
         int32_t kv_capacity,
         llama_eagle3_rollout_batch & batch) {
+    static constexpr int32_t k_rollout_work_capacity_default = 8;
+
     if (!rt.buft_compute || n_beams <= 0 || kv_capacity < 0) {
         return false;
     }
+
+    const int32_t work_capacity = std::min(kv_capacity, k_rollout_work_capacity_default);
 
     if (batch.ctx && batch.buf &&
         batch.n_beams == n_beams &&
@@ -468,7 +569,11 @@ bool llama_eagle3_rollout_batch_ensure_impl(
         batch.t_hidden &&
         batch.t_k &&
         batch.t_v &&
-        batch.t_mask) {
+        batch.t_mask &&
+        batch.work_capacity == work_capacity &&
+        batch.t_k_work &&
+        batch.t_v_work &&
+        batch.t_mask_work) {
         return true;
     }
 
@@ -482,6 +587,9 @@ bool llama_eagle3_rollout_batch_ensure_impl(
     ggml_tensor * t_k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity, n_beams);
     ggml_tensor * t_v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, kv_capacity, n_beams);
     ggml_tensor * t_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kv_capacity, 1, 1, n_beams);
+    ggml_tensor * t_k_work = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, work_capacity, n_beams);
+    ggml_tensor * t_v_work = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, work_capacity, n_beams);
+    ggml_tensor * t_mask_work = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, work_capacity, 1, 1, n_beams);
 
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
     if (!buf) {
@@ -495,8 +603,12 @@ bool llama_eagle3_rollout_batch_ensure_impl(
     batch.t_k = t_k;
     batch.t_v = t_v;
     batch.t_mask = t_mask;
+    batch.t_k_work = t_k_work;
+    batch.t_v_work = t_v_work;
+    batch.t_mask_work = t_mask_work;
     batch.n_beams = n_beams;
     batch.kv_capacity = kv_capacity;
+    batch.work_capacity = work_capacity;
     return true;
 }
 
@@ -1590,12 +1702,14 @@ bool build_step_batch_graph(
         return true;
     }
 
-    if (!rt.tok_embd || n_beams <= 0) {
+    ggml_tensor * tok_embd = get_runtime_tok_embd(rt);
+    if (!tok_embd || n_beams <= 0) {
         return false;
     }
 
     const auto & hp = model.hparams;
     const auto & tensors = get_runtime_tensors(model, rt);
+    ggml_tensor * rope_factors = get_runtime_rope_factors_compute(rt);
 
     // This graph is executed frequently for small n_beams. The per-beam implementation
     // (duplicating the full block N times) tends to fall back to GEMV-heavy execution on CUDA.
@@ -1629,11 +1743,13 @@ bool build_step_batch_graph(
         t_hidden_in_cols.push_back(ggml_view_2d(
                 ctx.get(), t_hidden_in_b, hidden_in_dim, 1, t_hidden_in_b->nb[1], (size_t) ib * t_hidden_in_b->nb[1]));
         t_tok_elems.push_back(ggml_view_1d(ctx.get(), t_tok_b, 1, (size_t) ib * sizeof(int32_t)));
-        t_pos_elems.push_back(ggml_view_1d(ctx.get(), t_pos_b, 1, (size_t) ib * sizeof(int32_t)));
+        ggml_tensor * t_pos_i = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        ggml_set_input(t_pos_i);
+        t_pos_elems.push_back(t_pos_i);
     }
 
     // Token embeddings for all beams.
-    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok_b); // [hidden, n_beams]
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), tok_embd, t_tok_b); // [hidden, n_beams]
     t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
 
     // Teacher/prev hidden for all beams.
@@ -1675,69 +1791,203 @@ bool build_step_batch_graph(
         t_v = ggml_add(ctx.get(), t_v, t_v_b);
     }
 
-    // Reshape into [head_dim, n_head, n_beams] / [head_dim, n_kv, n_beams] and apply RoPE for the current token.
-    t_q = ggml_reshape_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, n_beams);
-    t_k = ggml_reshape_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, n_beams);
-    t_v = ggml_reshape_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, n_beams);
+    // Reshape into [head_dim, n_head, n_beams] / [head_dim, n_kv, n_beams].
+    t_q = ggml_cont(ctx.get(), ggml_reshape_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, n_beams));
+    t_k = ggml_cont(ctx.get(), ggml_reshape_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, n_beams));
+    t_v = ggml_cont(ctx.get(), ggml_reshape_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, n_beams));
 
-    t_q = ggml_rope_ext(
-            ctx.get(), t_q, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
-            rt.rope_freq_base, rt.rope_freq_scale,
-            rt.yarn_ext_factor, rt.yarn_attn_factor,
-            rt.yarn_beta_fast, rt.yarn_beta_slow);
+    // Keep RoPE per-beam for now. The optimization target here is batched attention; batched
+    // RoPE on CUDA is still failing separately.
+    ggml_tensor * t_q_roped = nullptr;
+    ggml_tensor * t_k_roped = nullptr;
+    for (int32_t ib = 0; ib < n_beams; ++ib) {
+        ggml_tensor * q_i = ggml_view_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, 1, t_q->nb[1], t_q->nb[2], (size_t) ib * t_q->nb[2]);
+        ggml_tensor * k_i = ggml_view_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1, t_k->nb[1], t_k->nb[2], (size_t) ib * t_k->nb[2]);
+        q_i = ggml_cont(ctx.get(), q_i);
+        k_i = ggml_cont(ctx.get(), k_i);
 
-    t_k = ggml_rope_ext(
-            ctx.get(), t_k, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
-            rt.rope_freq_base, rt.rope_freq_scale,
-            rt.yarn_ext_factor, rt.yarn_attn_factor,
-            rt.yarn_beta_fast, rt.yarn_beta_slow);
+        q_i = ggml_rope_ext(
+                ctx.get(), q_i, t_pos_elems[(size_t) ib], rope_factors,
+                hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+                rt.rope_freq_base, rt.rope_freq_scale,
+                rt.yarn_ext_factor, rt.yarn_attn_factor,
+                rt.yarn_beta_fast, rt.yarn_beta_slow);
 
-    // Per-beam attention + KV concat, then batch the output projection + FFN.
+        k_i = ggml_rope_ext(
+                ctx.get(), k_i, t_pos_elems[(size_t) ib], rope_factors,
+                hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+                rt.rope_freq_base, rt.rope_freq_scale,
+                rt.yarn_ext_factor, rt.yarn_attn_factor,
+                rt.yarn_beta_fast, rt.yarn_beta_slow);
+
+        t_q_roped = t_q_roped ? ggml_concat(ctx.get(), t_q_roped, q_i, 2) : q_i;
+        t_k_roped = t_k_roped ? ggml_concat(ctx.get(), t_k_roped, k_i, 2) : k_i;
+    }
+    t_q = ggml_cont(ctx.get(), t_q_roped);
+    t_k = ggml_cont(ctx.get(), t_k_roped);
+
+    // Prefer one real batched flash-attention call across beams when available.
+    // Fall back to the older per-beam attention construction otherwise.
     std::vector<ggml_tensor *> t_k_past_in((size_t) n_beams, nullptr);
     std::vector<ggml_tensor *> t_v_past_in((size_t) n_beams, nullptr);
     std::vector<ggml_tensor *> t_k_total_out((size_t) n_beams, nullptr);
     std::vector<ggml_tensor *> t_v_total_out((size_t) n_beams, nullptr);
-    std::vector<ggml_tensor *> t_attn_out_cols;
-    t_attn_out_cols.reserve((size_t) n_beams);
+    ggml_tensor * t_attn_out_b = nullptr;
+    ggml_tensor * t_attn_mask = nullptr;
+    ggml_tensor * t_k_total_root = nullptr;
+    ggml_tensor * t_v_total_root = nullptr;
+    const bool try_batched_flash = rt.backend_compute != nullptr;
 
-    for (int32_t ib = 0; ib < n_beams; ++ib) {
-        // Slice current q/k/v for this beam: [*, *, 1].
-        ggml_tensor * q_i = ggml_view_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, 1, t_q->nb[1], t_q->nb[2], (size_t) ib * t_q->nb[2]);
-        ggml_tensor * k_i = ggml_view_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1, t_k->nb[1], t_k->nb[2], (size_t) ib * t_k->nb[2]);
-        ggml_tensor * v_i = ggml_view_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1, t_v->nb[1], t_v->nb[2], (size_t) ib * t_v->nb[2]);
+    if (try_batched_flash) {
+        ggml_tensor * t_k_b4 = ggml_reshape_4d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1, n_beams);
+        ggml_tensor * t_v_b4 = ggml_reshape_4d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1, n_beams);
 
-        ggml_tensor * k_total = k_i;
-        ggml_tensor * v_total = v_i;
+        ggml_tensor * t_k_total_b4 = t_k_b4;
+        ggml_tensor * t_v_total_b4 = t_v_b4;
 
         if (past_len > 0) {
-            ggml_tensor * k_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-            ggml_tensor * v_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
-            ggml_set_input(k_past);
-            ggml_set_input(v_past);
-            t_k_past_in[(size_t) ib] = k_past;
-            t_v_past_in[(size_t) ib] = v_past;
+            ggml_tensor * t_k_past_b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len, n_beams);
+            ggml_tensor * t_v_past_b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len, n_beams);
+            ggml_set_input(t_k_past_b);
+            ggml_set_input(t_v_past_b);
 
-            k_total = ggml_concat(ctx.get(), k_past, k_i, 2); // [head_dim, n_kv, past+1]
-            v_total = ggml_concat(ctx.get(), v_past, v_i, 2);
+            for (int32_t ib = 0; ib < n_beams; ++ib) {
+                t_k_past_in[(size_t) ib] = ggml_view_3d(
+                        ctx.get(),
+                        t_k_past_b,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        past_len,
+                        t_k_past_b->nb[1],
+                        t_k_past_b->nb[2],
+                        (size_t) ib * t_k_past_b->nb[3]);
+                t_v_past_in[(size_t) ib] = ggml_view_3d(
+                        ctx.get(),
+                        t_v_past_b,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        past_len,
+                        t_v_past_b->nb[1],
+                        t_v_past_b->nb[2],
+                        (size_t) ib * t_v_past_b->nb[3]);
+            }
+
+            t_k_total_b4 = ggml_concat(ctx.get(), t_k_past_b, t_k_b4, 2);
+            t_v_total_b4 = ggml_concat(ctx.get(), t_v_past_b, t_v_b4, 2);
         }
 
-        ggml_tensor * attn_out = build_eagle_attn_output(
-                ctx.get(), hp, rt, q_i, k_total, v_total, "step_batch", rt.flash_attn_logged_step_batch);
+        ggml_tensor * t_k_attn_packed = nullptr;
+        ggml_tensor * t_v_attn_packed = nullptr;
 
-        t_attn_out_cols.push_back(attn_out);
+        for (int32_t ib = 0; ib < n_beams; ++ib) {
+            ggml_tensor * k_total_i = ggml_view_3d(
+                    ctx.get(),
+                    t_k_total_b4,
+                    hp.head_dim,
+                    hp.num_kv_heads,
+                    past_len + 1,
+                    t_k_total_b4->nb[1],
+                    t_k_total_b4->nb[2],
+                    (size_t) ib * t_k_total_b4->nb[3]);
+            ggml_tensor * v_total_i = ggml_view_3d(
+                    ctx.get(),
+                    t_v_total_b4,
+                    hp.head_dim,
+                    hp.num_kv_heads,
+                    past_len + 1,
+                    t_v_total_b4->nb[1],
+                    t_v_total_b4->nb[2],
+                    (size_t) ib * t_v_total_b4->nb[3]);
 
-        // Materialize KV totals for the caller (stored in KV-head space, not repeated-to-heads).
-        t_k_total_out[(size_t) ib] = ggml_cont(ctx.get(), k_total);
-        t_v_total_out[(size_t) ib] = ggml_cont(ctx.get(), v_total);
+            ggml_tensor * k_attn_i4 = build_eagle_kv_attn_single_4d(ctx.get(), hp, k_total_i); // [hd, n_heads, seq, 1]
+            ggml_tensor * v_attn_i4 = build_eagle_kv_attn_single_4d(ctx.get(), hp, v_total_i); // [hd, n_heads, seq, 1]
+            ggml_tensor * k_attn_i = ggml_reshape_3d(ctx.get(), k_attn_i4, hp.head_dim, hp.num_heads, past_len + 1);
+            ggml_tensor * v_attn_i = ggml_reshape_3d(ctx.get(), v_attn_i4, hp.head_dim, hp.num_heads, past_len + 1);
+
+            t_k_attn_packed = t_k_attn_packed ? ggml_concat(ctx.get(), t_k_attn_packed, k_attn_i, 2) : k_attn_i;
+            t_v_attn_packed = t_v_attn_packed ? ggml_concat(ctx.get(), t_v_attn_packed, v_attn_i, 2) : v_attn_i;
+        }
+
+        if (t_k_attn_packed && t_v_attn_packed) {
+            t_k_attn_packed = ggml_cont(ctx.get(), t_k_attn_packed);
+            t_v_attn_packed = ggml_cont(ctx.get(), t_v_attn_packed);
+        }
+
+        const int32_t seq_len_total = (past_len + 1) * n_beams;
+        t_attn_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, seq_len_total, n_beams, hp.num_heads, 1);
+        ggml_set_input(t_attn_mask);
+
+        t_attn_out_b = build_eagle_attn_output_packed_masked(
+                ctx.get(), hp, rt, t_q, t_k_attn_packed, t_v_attn_packed, t_attn_mask, "step_batch", rt.flash_attn_logged_step_batch);
+
+        if (t_attn_out_b) {
+            ggml_tensor * t_k_total_b4_cont = ggml_cont(ctx.get(), t_k_total_b4);
+            ggml_tensor * t_v_total_b4_cont = ggml_cont(ctx.get(), t_v_total_b4);
+            t_k_total_root = t_k_total_b4_cont;
+            t_v_total_root = t_v_total_b4_cont;
+            for (int32_t ib = 0; ib < n_beams; ++ib) {
+                t_k_total_out[(size_t) ib] = ggml_view_3d(
+                        ctx.get(),
+                        t_k_total_b4_cont,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        past_len + 1,
+                        t_k_total_b4_cont->nb[1],
+                        t_k_total_b4_cont->nb[2],
+                        (size_t) ib * t_k_total_b4_cont->nb[3]);
+                t_v_total_out[(size_t) ib] = ggml_view_3d(
+                        ctx.get(),
+                        t_v_total_b4_cont,
+                        hp.head_dim,
+                        hp.num_kv_heads,
+                        past_len + 1,
+                        t_v_total_b4_cont->nb[1],
+                        t_v_total_b4_cont->nb[2],
+                        (size_t) ib * t_v_total_b4_cont->nb[3]);
+            }
+        }
     }
 
-    ggml_tensor * t_attn_out_b = t_attn_out_cols.empty() ? nullptr : t_attn_out_cols[0];
-    for (int32_t ib = 1; ib < n_beams; ++ib) {
-        t_attn_out_b = ggml_concat(ctx.get(), t_attn_out_b, t_attn_out_cols[(size_t) ib], 1);
+    if (!t_attn_out_b) {
+        std::vector<ggml_tensor *> t_attn_out_cols;
+        t_attn_out_cols.reserve((size_t) n_beams);
+
+        for (int32_t ib = 0; ib < n_beams; ++ib) {
+            ggml_tensor * q_i = ggml_view_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads, 1, t_q->nb[1], t_q->nb[2], (size_t) ib * t_q->nb[2]);
+            ggml_tensor * k_i = ggml_view_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1, t_k->nb[1], t_k->nb[2], (size_t) ib * t_k->nb[2]);
+            ggml_tensor * v_i = ggml_view_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1, t_v->nb[1], t_v->nb[2], (size_t) ib * t_v->nb[2]);
+
+            ggml_tensor * k_total = k_i;
+            ggml_tensor * v_total = v_i;
+
+            if (past_len > 0) {
+                ggml_tensor * k_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+                ggml_tensor * v_past = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, past_len);
+                ggml_set_input(k_past);
+                ggml_set_input(v_past);
+                t_k_past_in[(size_t) ib] = k_past;
+                t_v_past_in[(size_t) ib] = v_past;
+
+                k_total = ggml_concat(ctx.get(), k_past, k_i, 2);
+                v_total = ggml_concat(ctx.get(), v_past, v_i, 2);
+            }
+
+            ggml_tensor * attn_out = build_eagle_attn_output(
+                    ctx.get(), hp, rt, q_i, k_total, v_total, "step_batch", rt.flash_attn_logged_step_batch);
+
+            t_attn_out_cols.push_back(attn_out);
+            t_k_total_out[(size_t) ib] = ggml_cont(ctx.get(), k_total);
+            t_v_total_out[(size_t) ib] = ggml_cont(ctx.get(), v_total);
+        }
+
+        t_attn_out_b = t_attn_out_cols.empty() ? nullptr : t_attn_out_cols[0];
+        for (int32_t ib = 1; ib < n_beams; ++ib) {
+            t_attn_out_b = ggml_concat(ctx.get(), t_attn_out_b, t_attn_out_cols[(size_t) ib], 1);
+        }
+        t_attn_out_b = ggml_cont(ctx.get(), t_attn_out_b);
+        t_k_total_root = nullptr;
+        t_v_total_root = nullptr;
     }
-    t_attn_out_b = ggml_cont(ctx.get(), t_attn_out_b); // [hidden, n_beams]
 
     ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), tensors.attn_o_w, t_attn_out_b); // [hidden, n_beams]
     if (tensors.attn_o_b) {
@@ -1802,12 +2052,23 @@ bool build_step_batch_graph(
         }
     }
 
-    for (int32_t ib = 0; ib < n_beams; ++ib) {
-        ggml_build_forward_expand(gf, t_hidden_out_views[(size_t) ib]);
-        ggml_build_forward_expand(gf, t_k_total_out[(size_t) ib]);
-        ggml_build_forward_expand(gf, t_v_total_out[(size_t) ib]);
-        if (t_logits_views[(size_t) ib]) {
-            ggml_build_forward_expand(gf, t_logits_views[(size_t) ib]);
+    if (t_k_total_root && t_v_total_root) {
+        ggml_build_forward_expand(gf, t_hidden_out_b);
+        ggml_build_forward_expand(gf, t_k_total_root);
+        ggml_build_forward_expand(gf, t_v_total_root);
+        for (int32_t ib = 0; ib < n_beams; ++ib) {
+            if (t_logits_views[(size_t) ib]) {
+                ggml_build_forward_expand(gf, t_logits_views[(size_t) ib]);
+            }
+        }
+    } else {
+        for (int32_t ib = 0; ib < n_beams; ++ib) {
+            ggml_build_forward_expand(gf, t_hidden_out_views[(size_t) ib]);
+            ggml_build_forward_expand(gf, t_k_total_out[(size_t) ib]);
+            ggml_build_forward_expand(gf, t_v_total_out[(size_t) ib]);
+            if (t_logits_views[(size_t) ib]) {
+                ggml_build_forward_expand(gf, t_logits_views[(size_t) ib]);
+            }
         }
     }
 
@@ -1826,6 +2087,7 @@ bool build_step_batch_graph(
     graph.t_hidden_in_b = t_hidden_in_b;
     graph.t_tok_b       = t_tok_b;
     graph.t_pos_b       = t_pos_b;
+    graph.t_attn_mask   = t_attn_mask;
     graph.t_hidden_in.resize((size_t) n_beams);
     graph.t_tok.resize((size_t) n_beams);
     graph.t_pos.resize((size_t) n_beams);
@@ -2338,7 +2600,7 @@ bool llama_eagle3_topk_state_batch(
         return false;
     }
 
-    if (rt.backend_compute && rt.buft_compute) {
+    if (rt.backend_compute && rt.buft_compute && !eagle_backend_is_cpu(rt.backend_compute.get())) {
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/topk_state_batch");
 #endif
@@ -2455,7 +2717,7 @@ bool llama_eagle3_select_state_batch(
         return false;
     }
 
-    if (rt.backend_compute && rt.buft_compute) {
+    if (rt.backend_compute && rt.buft_compute && !eagle_backend_is_cpu(rt.backend_compute.get())) {
 #if defined(GGML_USE_CUDA)
         ggml_cuda_profiler_scope zone_total(rt.backend_compute.get(), "eagle3/select_state_batch");
 #endif
@@ -2599,7 +2861,7 @@ bool llama_eagle3_select_state_batch_device(
         return false;
     }
 
-    if (!(rt.backend_compute && rt.buft_compute)) {
+    if (!(rt.backend_compute && rt.buft_compute) || eagle_backend_is_cpu(rt.backend_compute.get())) {
         return false;
     }
 
@@ -2690,7 +2952,7 @@ bool llama_eagle3_select_state_slots_device(
         return false;
     }
 
-    if (!(rt.backend_compute && rt.buft_compute)) {
+    if (!(rt.backend_compute && rt.buft_compute) || eagle_backend_is_cpu(rt.backend_compute.get())) {
         return false;
     }
 
@@ -2783,7 +3045,7 @@ bool llama_eagle3_select_state_slots(
         return false;
     }
 
-    if (rt.backend_compute && rt.buft_compute) {
+    if (rt.backend_compute && rt.buft_compute && !eagle_backend_is_cpu(rt.backend_compute.get())) {
         llama_eagle3_select_batch_device_result device_out;
         if (llama_eagle3_select_state_slots_device(model, rt, states, active_mask, beam_logprob, k, prob_threshold, device_out)) {
             selected_linear_out.resize((size_t) n_select);
@@ -2977,6 +3239,25 @@ bool llama_eagle3_step_batch_from_parents(
                     std::vector<int32_t> pos_host((size_t) n_beams, past_len);
                     ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos_b, pos_host.data(), 0, pos_host.size() * sizeof(int32_t));
                 }
+                if (graph.t_attn_mask) {
+                    const int32_t seq_len = past_len + 1;
+                    const int32_t seq_total = seq_len * n_beams;
+                    std::vector<float> mask_host((size_t) seq_total * n_beams * hp.num_heads, -INFINITY);
+                    for (int32_t ib = 0; ib < n_beams; ++ib) {
+                        for (int32_t ih = 0; ih < hp.num_heads; ++ih) {
+                            const size_t head_off = ((size_t) ih * n_beams + (size_t) ib) * seq_total;
+                            for (int32_t kpos = 0; kpos < seq_len; ++kpos) {
+                                mask_host[head_off + (size_t) ib * seq_len + (size_t) kpos] = 0.0f;
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set_async(
+                            rt.backend_compute.get(),
+                            graph.t_attn_mask,
+                            mask_host.data(),
+                            0,
+                            mask_host.size() * sizeof(float));
+                }
 
                 for (int32_t ib = 0; ib < n_beams; ++ib) {
                     const llama_eagle3_state * st = parent_states[(size_t) ib];
@@ -2999,6 +3280,10 @@ bool llama_eagle3_step_batch_from_parents(
                         ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in[(size_t) ib], st->hidden.data(), 0, (size_t) hidden_in_dim * sizeof(float));
                     } else {
                         return false;
+                    }
+
+                    if ((size_t) ib < graph.t_pos.size() && graph.t_pos[(size_t) ib]) {
+                        ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos[(size_t) ib], &past_len, 0, sizeof(int32_t));
                     }
 
                     if (past_len > 0 && graph.t_k_past_input[(size_t) ib] && graph.t_v_past_input[(size_t) ib]) {
@@ -3029,6 +3314,7 @@ bool llama_eagle3_step_batch_from_parents(
                         }
                     }
                 }
+
             }
 
             ggml_status status = GGML_STATUS_FAILED;
@@ -3043,6 +3329,9 @@ bool llama_eagle3_step_batch_from_parents(
 #if defined(GGML_USE_CUDA)
                     ggml_cuda_profiler_scope zone_copy_out(rt.backend_compute.get(), "eagle3/step_batch/copy_outputs");
 #endif
+                    if (dbg_step_batch) {
+                        fprintf(stderr, "eagle step_batch: copy_outputs begin\n");
+                    }
                     const int32_t required_len = past_len + 1;
                     for (int32_t ib = 0; ib < n_beams; ++ib) {
                         llama_eagle3_state * out_st = out_states[(size_t) ib];
@@ -3102,6 +3391,9 @@ bool llama_eagle3_step_batch_from_parents(
                         out_st->v.clear();
                         out_st->past_len = required_len;
                     }
+                    if (dbg_step_batch) {
+                        fprintf(stderr, "eagle step_batch: copy_outputs done\n");
+                    }
                 }
                 return true;
             }
@@ -3141,7 +3433,11 @@ bool llama_eagle3_step_from_hidden_capture(
     }
 
     const bool with_logits = logits_out != nullptr;
-    if (rt.backend_compute && rt.buft_compute && dbg == nullptr) {
+    // The rollout batching work in this change only depends on step_batch().
+    // Keep step_from_hidden_capture() on the host path for now: the CUDA path here
+    // is currently unstable in this branch and blocks validation of the new batched
+    // rollout attention path.
+    if (false && rt.backend_compute && rt.buft_compute && dbg == nullptr) {
         const uint64_t key = make_step_graph_key(state.past_len, hidden_in_dim, with_logits);
         if (rt.step_graph_key != key) {
             rt.step_graph = {};
@@ -3278,7 +3574,9 @@ bool llama_eagle3_step_from_hidden_capture(
         return false;
     }
 
-    return llama_eagle3_step(model, rt, state, hidden_concat.data(), hidden_in_dim, input_id, logits_out, dbg);
+    llama_eagle3_step_debug dbg_local;
+    llama_eagle3_step_debug * step_dbg = dbg ? dbg : &dbg_local;
+    return llama_eagle3_step(model, rt, state, hidden_concat.data(), hidden_in_dim, input_id, logits_out, step_dbg);
 }
 
 bool llama_eagle3_step(
@@ -3536,13 +3834,6 @@ bool llama_eagle3_step(
         // We want [head_dim, 1, n_kv, seq] from [head_dim, n_kv, seq, 1].
         k4 = ggml_permute(ctx.get(), k4, 0, 2, 3, 1); // [head_dim, 1, n_kv, seq]
         v4 = ggml_permute(ctx.get(), v4, 0, 2, 3, 1); // [head_dim, 1, n_kv, seq]
-
-        if (std::getenv("CASCADE_EAGLE_DEBUG")) {
-            fprintf(stderr,
-                    "eagle3 repeat_kv: k4 ne=[%lld,%lld,%lld,%lld] -> [%d,%d,%d,%lld]\n",
-                    (long long) k4->ne[0], (long long) k4->ne[1], (long long) k4->ne[2], (long long) k4->ne[3],
-                    hp.head_dim, n_rep, hp.num_kv_heads, (long long) t_k_total->ne[2]);
-        }
 
         k4 = ggml_repeat_4d(ctx.get(), k4, hp.head_dim, n_rep, hp.num_kv_heads, t_k_total->ne[2]); // [head_dim, n_rep, n_kv, seq]
         v4 = ggml_repeat_4d(ctx.get(), v4, hp.head_dim, n_rep, hp.num_kv_heads, t_v_total->ne[2]); // [head_dim, n_rep, n_kv, seq]
