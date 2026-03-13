@@ -383,6 +383,14 @@ const llama_eagle3_tensors & get_runtime_tensors(const llama_eagle3_model & mode
     return model.tensors;
 }
 
+ggml_tensor * get_runtime_tok_embd(const llama_eagle3_runtime & rt) {
+    return rt.tok_embd_compute ? rt.tok_embd_compute : rt.tok_embd;
+}
+
+ggml_tensor * get_runtime_rope_factors_compute(const llama_eagle3_runtime & rt) {
+    return rt.rope_factors_compute ? rt.rope_factors_compute : rt.rope_factors;
+}
+
 const llama_eagle3_tensors & get_host_tensors(const llama_eagle3_model & model) {
     return model.tensors;
 }
@@ -752,7 +760,7 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     }
 
     ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead() * 64 + 1024,
+        /* .mem_size   = */ ggml_tensor_overhead() * 80 + 1024,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -792,6 +800,8 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     rt.tensors_compute.ffn_gate_b    = dup(model.tensors.ffn_gate_b);
     rt.tensors_compute.ffn_up_b      = dup(model.tensors.ffn_up_b);
     rt.tensors_compute.ffn_down_b    = dup(model.tensors.ffn_down_b);
+    rt.tok_embd_compute              = dup(rt.tok_embd);
+    rt.rope_factors_compute          = dup(rt.rope_factors);
 
     rt.buf_weights_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.ctx_weights_compute.get(), rt.buft_compute));
     if (!rt.buf_weights_compute) {
@@ -800,7 +810,12 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
 
     auto copy = [&](ggml_tensor * src, ggml_tensor * dst) {
         if (src && dst) {
-            ggml_backend_tensor_copy(src, dst);
+            ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+            if (src_buf) {
+                ggml_backend_tensor_copy(src, dst);
+            } else {
+                ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+            }
         }
     };
 
@@ -825,6 +840,8 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     copy(model.tensors.ffn_gate_b,    rt.tensors_compute.ffn_gate_b);
     copy(model.tensors.ffn_up_b,      rt.tensors_compute.ffn_up_b);
     copy(model.tensors.ffn_down_b,    rt.tensors_compute.ffn_down_b);
+    copy(rt.tok_embd,                 rt.tok_embd_compute);
+    copy(rt.rope_factors,             rt.rope_factors_compute);
 
     return true;
 }
@@ -1190,7 +1207,8 @@ bool build_step_ops(
         int32_t hidden_in_dim,
         bool with_logits,
         llama_eagle3_step_ops & ops) {
-    if (!ctx || !rt.tok_embd) {
+    ggml_tensor * tok_embd = get_runtime_tok_embd(rt);
+    if (!ctx || !tok_embd) {
         return false;
     }
 
@@ -1203,7 +1221,7 @@ bool build_step_ops(
     ggml_tensor * t_tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_input(t_tok);
 
-    ggml_tensor * t_embd = ggml_get_rows(ctx, rt.tok_embd, t_tok);
+    ggml_tensor * t_embd = ggml_get_rows(ctx, tok_embd, t_tok);
     t_embd = ggml_cast(ctx, t_embd, GGML_TYPE_F32);
 
     ggml_tensor * t_hidden = t_hidden_in;
@@ -1383,12 +1401,14 @@ bool build_step_graph(
         return true;
     }
 
-    if (!rt.tok_embd) {
+    ggml_tensor * tok_embd = get_runtime_tok_embd(rt);
+    if (!tok_embd) {
         return false;
     }
 
     const auto & hp = model.hparams;
     const auto & tensors = get_runtime_tensors(model, rt);
+    ggml_tensor * rope_factors = get_runtime_rope_factors_compute(rt);
 
     auto ctx = make_ctx_no_alloc(/* max_nodes = */ 2048);
     if (!ctx) {
@@ -1401,7 +1421,7 @@ bool build_step_graph(
     ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_tok);
 
-    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), tok_embd, t_tok);
     t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
 
     ggml_tensor * t_hidden = t_hidden_in;
@@ -1443,14 +1463,14 @@ bool build_step_graph(
     ggml_set_input(t_pos);
 
     t_q = ggml_rope_ext(
-            ctx.get(), t_q, t_pos, rt.rope_factors,
+            ctx.get(), t_q, t_pos, rope_factors,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
-            ctx.get(), t_k, t_pos, rt.rope_factors,
+            ctx.get(), t_k, t_pos, rope_factors,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
@@ -2283,6 +2303,18 @@ bool llama_eagle3_topk_state(
 
     if (!state.hidden.empty()) {
         return llama_eagle3_topk(model, rt, state.hidden.data(), k, topk_idx_out, topk_prob_out);
+    }
+
+    if (state.dev && state.dev->t_hidden && rt.backend_compute) {
+        std::vector<float> hidden_host((size_t) hp.hidden_size);
+        ggml_backend_tensor_get_async(
+                rt.backend_compute.get(),
+                state.dev->t_hidden,
+                hidden_host.data(),
+                0,
+                (size_t) hp.hidden_size * sizeof(float));
+        ggml_backend_synchronize(rt.backend_compute.get());
+        return llama_eagle3_topk(model, rt, hidden_host.data(), k, topk_idx_out, topk_prob_out);
     }
 
     return false;
