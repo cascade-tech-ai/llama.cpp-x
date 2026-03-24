@@ -247,6 +247,11 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
 }
 
+void llama_kv_cache_iswa::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    kv_base->set_kq_mask_tree(tree);
+    kv_swa->set_kq_mask_tree(tree);
+}
+
 //
 // llama_kv_cache_iswa_context
 //

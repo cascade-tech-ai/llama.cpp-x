@@ -69,6 +69,7 @@ public:
 
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
 
 private:
     const llama_hparams & hparams;

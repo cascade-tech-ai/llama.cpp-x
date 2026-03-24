@@ -60,6 +60,15 @@ llama_memory_hybrid::llama_memory_hybrid(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    const bool has_recurrent_layers = [&] {
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.is_recurrent(il)) {
+                return true;
+            }
+        }
+        return false;
+    }();
+
     do {
         balloc.split_reset();
 
@@ -72,6 +81,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             if (embd_all) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
+            } else if (!has_recurrent_layers && mem_attn->get_n_stream() == 1) {
+                // Unified attention KV with no recurrent state can preserve a compact multi-seq batch as one ubatch.
+                ubatch = balloc.split_simple(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_n_stream() == 1);
@@ -196,6 +208,10 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
+}
+
+void llama_memory_hybrid::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    mem_attn->set_kq_mask_tree(tree);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}

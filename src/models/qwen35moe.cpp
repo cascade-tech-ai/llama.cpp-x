@@ -63,6 +63,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
+        cb(cur, "l_out", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);

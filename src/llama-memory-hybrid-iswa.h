@@ -81,6 +81,7 @@ public:
 
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
 
 private:
     const llama_hparams & hparams;

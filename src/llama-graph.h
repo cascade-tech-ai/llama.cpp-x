@@ -561,6 +561,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    std::vector<int32_t> eagle3_layer_ids;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -599,6 +601,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (eagle3_layer_ids != other.eagle3_layer_ids) {
             return false;
         }
 
@@ -674,6 +680,8 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    std::map<int32_t, ggml_tensor*> t_eagle3_hidden;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -752,6 +760,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const std::vector<int32_t> eagle3_layer_ids;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -763,6 +773,8 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    bool capture_eagle3_layer(int il) const;
 
     //
     // common

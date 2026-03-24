@@ -202,11 +202,13 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
 
 private:
     const llama_model & model;
@@ -244,6 +246,9 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // optional draft tree mask override
+    const llama_kq_mask_tree * kq_mask_tree = nullptr;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

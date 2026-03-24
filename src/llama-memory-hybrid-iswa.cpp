@@ -200,6 +200,10 @@ llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
     return mem_recr.get();
 }
 
+void llama_memory_hybrid_iswa::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    mem_attn->set_kq_mask_tree(tree);
+}
+
 //
 // llama_memory_hybrid_iswa_context
 //

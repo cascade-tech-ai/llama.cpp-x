@@ -236,6 +236,7 @@ extern "C" {
         llama_token  *  token;
         float        *  embd;
         llama_pos    *  pos;
+        int32_t      *  kv_slot;  // optional explicit KV cache slot index per token; null = allocator decides
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
@@ -1025,6 +1026,70 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    //
+    // EAGLE3 hidden-state capture [EXPERIMENTAL]
+    //
+
+    // Configure which layer inputs to capture for EAGLE3 (layer ids are stored in the head GGUF).
+    LLAMA_API bool llama_eagle3_set_layers(struct llama_context * ctx, const int32_t * layers, size_t n_layers);
+
+    // Clear all cached EAGLE3 hidden states and layer configuration.
+    LLAMA_API void llama_eagle3_clear(struct llama_context * ctx);
+
+    // Clear cached EAGLE3 hidden states for a specific sequence id.
+    LLAMA_API void llama_eagle3_clear_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Trim cached EAGLE3 hidden states for a sequence to the given length (pos = number of tokens to keep).
+    LLAMA_API void llama_eagle3_trim_seq(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+    // Return cached hidden states for a sequence and layer. n_tokens receives the token count.
+    // The returned pointer is owned by the context and is valid until the next decode or reset.
+    LLAMA_API const float * llama_eagle3_get_hidden_seq(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t layer_id,
+            size_t * n_tokens);
+
+    // Return the backend-resident captured hidden-state tensor for the current decode call.
+    // Shape is [n_embd, n_tokens]. The returned tensor is owned by the context.
+    LLAMA_API const struct ggml_tensor * llama_eagle3_get_hidden_capture(
+            struct llama_context * ctx,
+            int32_t layer_id,
+            size_t * n_tokens);
+
+    // Ensure the backend-resident capture buffers are ready to be consumed by EAGLE3.
+    LLAMA_API void llama_eagle3_synchronize_hidden_capture(struct llama_context * ctx);
+
+    //
+    // Speculative tree attention mask [EXPERIMENTAL]
+    //
+
+    // Describes a tree over draft tokens in the current batch.
+    // parent indices refer to entries in [0, n_nodes). Use -1 for roots.
+    struct llama_kq_mask_tree {
+        size_t       n_nodes;
+        const int32_t * parent;
+        uint32_t     batch_start;
+    };
+
+    // Apply a tree mask override for the next decode call.
+    LLAMA_API void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree);
+
+    // Clear any active tree mask override.
+    LLAMA_API void llama_clear_kq_mask_tree(struct llama_context * ctx);
+
+    //
+    // RoPE position override [EXPERIMENTAL]
+    //
+
+    // Override RoPE positions for the next decode call.
+    // When set, the KV cache uses batch.pos for cell allocation, but RoPE uses these positions instead.
+    // The array must have n_tokens entries (one per batch token).
+    LLAMA_API void llama_set_rope_pos_override(struct llama_context * ctx, uint32_t n_tokens, const llama_pos * rope_pos);
+
+    // Clear any active RoPE position override.
+    LLAMA_API void llama_clear_rope_pos_override(struct llama_context * ctx);
 
     //
     // backend sampling API [EXPERIMENTAL]

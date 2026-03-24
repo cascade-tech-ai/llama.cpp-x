@@ -10,6 +10,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -100,20 +101,23 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        // use rope_pos override if available, otherwise fall back to pos
+        const llama_pos * pos_src = ubatch->rope_pos ? ubatch->rope_pos : ubatch->pos;
+
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
             // the 3 first dims are the same, and 4th dim is all 0
             std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
             // copy the first dimension
             for (int i = 0; i < n_tokens; ++i) {
-                pos_data[               i] = ubatch->pos[i];
-                pos_data[    n_tokens + i] = ubatch->pos[i];
-                pos_data[2 * n_tokens + i] = ubatch->pos[i];
+                pos_data[               i] = pos_src[i];
+                pos_data[    n_tokens + i] = pos_src[i];
+                pos_data[2 * n_tokens + i] = pos_src[i];
                 pos_data[3 * n_tokens + i] = 0; // 4th dim is 0
             }
             ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
         } else {
-            ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
+            ggml_backend_tensor_set(pos, pos_src, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
         }
     }
 }
@@ -133,9 +137,12 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(f_attn_temp_scale != 0.0f);
         GGML_ASSERT(n_attn_temp_floor_scale != 0);
 
+        // use rope_pos override if available (flat tree has cache_pos != rope_pos)
+        const llama_pos * pos_src = ubatch->rope_pos ? ubatch->rope_pos : ubatch->pos;
+
         std::vector<float> attn_scale_data(n_tokens, 0.0f);
         for (int i = 0; i < n_tokens; ++i) {
-            const float pos = ubatch->pos[i];
+            const float pos = pos_src[i];
             attn_scale_data[i] = std::log(
                 std::floor((pos + f_attn_temp_offset) / n_attn_temp_floor_scale) + 1.0
             ) * f_attn_temp_scale + 1.0;
@@ -792,6 +799,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_eagle3_hidden.clear();
 
     params = {};
 
@@ -842,6 +850,11 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [layer_id, t] : t_eagle3_hidden) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -930,6 +943,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    eagle3_layer_ids (params.eagle3_layer_ids),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -941,6 +955,44 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+
+    // Generic EAGLE3 hidden capture.  EAGLE3 layer IDs use "input-to-layer"
+    // semantics (matching HF's hidden_states[i] = output of block i-1 = input
+    // to block i).  We hook on "l_out" which fires at the END of each layer,
+    // so l_out(il) = output of layer il = input to layer il+1.  Therefore we
+    // store l_out(il) as eagle3_hidden[il+1].
+    if (!res || !gf || il < 0) {
+        return;
+    }
+    if (strcmp(name, "l_out") != 0) {
+        return;
+    }
+
+    const int target_layer = il + 1;  // output of il = input to il+1
+    if (!capture_eagle3_layer(target_layer)) {
+        return;
+    }
+    if (res->t_eagle3_hidden.find(target_layer) != res->t_eagle3_hidden.end()) {
+        return;
+    }
+
+    // Always create a distinct copy.  Without this, when cur is already F32 &
+    // contiguous, captured == cur and the allocator may reuse its buffer for a
+    // downstream op, silently overwriting the captured data.
+    ggml_tensor * captured = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    captured = ggml_cont(ctx0, captured);
+    if (cb_func) {
+        cb_func(ubatch, captured, "eagle3_hidden", target_layer);
+    }
+    res->t_eagle3_hidden[target_layer] = captured;
+    ggml_build_forward_expand(gf, captured);
+}
+
+bool llm_graph_context::capture_eagle3_layer(int il) const {
+    if (eagle3_layer_ids.empty()) {
+        return false;
+    }
+    return std::find(eagle3_layer_ids.begin(), eagle3_layer_ids.end(), il) != eagle3_layer_ids.end();
 }
 
 ggml_tensor * llm_graph_context::build_cvec(
