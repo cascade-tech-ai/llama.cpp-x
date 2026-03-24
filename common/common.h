@@ -319,6 +319,16 @@ struct common_params_speculative {
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
 
+    // eagle3 speculative decoding (beam rollout)
+
+    int32_t eagle_max_depth               = 7;    // max draft depth (tokens)
+    int32_t eagle_max_proposals           = 16;   // beam width / max proposals
+    int32_t eagle_beam_width              = 8;    // beam width for rollout
+    int32_t eagle_per_beam_topk_candidates = 1024; // keep tokens with p >= 1/N before per-beam top-k, 0 = disable
+    float   eagle_adaptive_depth          = 0.0f; // adaptive depth: stop when greedy cumprob < threshold (0 = disabled)
+    std::string eagle_trace_yaml;                 // optional YAML-compatible trace output path
+    bool eagle_serial                     = false; // serial greedy drafting (no beam search, linear verification)
+
     // ngram-based speculative decoding
 
     uint16_t ngram_size_n     = 12; // ngram size for lookup

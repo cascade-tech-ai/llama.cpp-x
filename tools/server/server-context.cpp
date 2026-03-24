@@ -135,6 +135,7 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_eagle3_clear_seq(ctx, id);
         prompt.tokens.clear();
     }
 
@@ -280,6 +281,9 @@ struct server_slot {
 
         // determine the max draft that fits the current slot state
         int n_draft_max = task->params.speculative.n_max;
+        if (task->params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+            n_draft_max = task->params.speculative.eagle_max_depth;
+        }
 
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -439,6 +443,7 @@ struct server_slot {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
         llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
+        llama_eagle3_clear_seq(ctx, other.id);
         llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
 
         other.n_decoded   = n_decoded;
@@ -655,7 +660,9 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (params_base.speculative.has_dft()) {
+        if (params_base.speculative.has_dft() &&
+            (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT ||
+             params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NONE)) {
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 
             const auto & params_spec = params_base.speculative;
@@ -2050,6 +2057,9 @@ private:
 
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                if (slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                    llama_eagle3_clear_seq(ctx, slot.id);
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -2107,9 +2117,18 @@ private:
 
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
 
-                const auto & params_spec = slot.task->params.speculative;
+                auto params_spec = slot.task->params.speculative;
+                params_spec.n_max = n_draft_max;
 
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                if (params_spec.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                    params_spec.eagle_max_depth = std::min(params_spec.eagle_max_depth, n_draft_max);
+                    params_spec.eagle_max_proposals = std::min(params_spec.eagle_max_proposals, n_draft_max);
+                    if (params_spec.eagle_beam_width > 0) {
+                        params_spec.eagle_beam_width = std::min(params_spec.eagle_beam_width, n_draft_max);
+                    }
+                }
+
+                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled, slot.id);
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
@@ -2314,6 +2333,9 @@ private:
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
                                             llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
+                                            if (slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                                                llama_eagle3_clear_seq(ctx, slot.id);
+                                            }
                                             llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -2487,6 +2509,8 @@ private:
 
                         // there is no common part left
                         slot.n_prompt_tokens_cache = 0;
+                    } else if (slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                        llama_eagle3_trim_seq(ctx, slot.id, p0);
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -2730,6 +2754,7 @@ private:
                 batch.token    + i,
                 nullptr,
                 batch.pos      + i,
+                batch.kv_slot  ? batch.kv_slot + i : nullptr,
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
                 batch.logits   + i,
@@ -2851,7 +2876,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens(), slot.id);
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -2916,8 +2941,15 @@ private:
                 slot.drafted.clear();
 
                 const int64_t t_current = ggml_time_us();
+                const int32_t n_decoded_prev = slot.n_decoded;
 
                 slot.n_decoded += ids.size();
+
+                if (n_decoded_prev == 0 && !ids.empty()) {
+                    slot.t_start_generation = t_current;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    metrics.on_prompt_eval(slot);
+                }
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
@@ -2935,6 +2967,9 @@ private:
                 slot.sampled = ids.back(); // last accepted token
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                if (slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
+                    llama_eagle3_trim_seq(ctx, slot.id, slot.prompt.n_tokens());
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

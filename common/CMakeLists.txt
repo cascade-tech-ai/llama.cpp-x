@@ -107,6 +107,7 @@ add_library(${TARGET} STATIC
     )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PRIVATE ../src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

@@ -33,6 +33,23 @@
 //
 
 struct common_sampler;
+struct common_speculative_tree;
+
+struct common_sampler_trace_candidate {
+    llama_token token = LLAMA_TOKEN_NULL;
+    float p = 0.0f;
+};
+
+struct common_sampler_tree_trace_pass {
+    int32_t pass = 0;
+    int32_t row_idx = 0;
+    int32_t matched_node = -1;
+    llama_token sampled_token = LLAMA_TOKEN_NULL;
+    float sampled_prob = 0.0f;
+    bool accepted = false;
+    std::string reason;
+    std::vector<common_sampler_trace_candidate> target_top_candidates;
+};
 
 // llama_sampler API overloads
 
@@ -84,6 +101,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+std::vector<llama_token> common_sampler_sample_and_accept_tree(struct common_sampler * gsmpl, struct llama_context * ctx, int idx_last, const common_speculative_tree & tree, bool grammar_first = false);
+
+std::vector<llama_token> common_sampler_sample_and_accept_tree_trace(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx_last,
+        const common_speculative_tree & tree,
+        std::vector<common_sampler_tree_trace_pass> & passes,
+        int top_n = 10,
+        bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
