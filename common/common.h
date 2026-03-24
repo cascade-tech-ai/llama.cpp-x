@@ -1,4 +1,6 @@
 // Various helper functions and utilities
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #pragma once
 
@@ -274,6 +276,14 @@ struct common_params_speculative {
     int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+
+    // eagle3 speculative decoding (beam rollout)
+
+    int32_t eagle_max_depth               = 7;    // max draft depth (tokens)
+    int32_t eagle_max_proposals           = 16;   // beam width / max proposals
+    int32_t eagle_beam_width              = 8;    // beam width for rollout
+    int32_t eagle_per_beam_topk_candidates = 1024; // keep tokens with p >= 1/N before per-beam top-k, 0 = disable
+    std::string eagle_trace_yaml;                 // optional YAML-compatible trace output path
 
     // ngram-based speculative decoding
 

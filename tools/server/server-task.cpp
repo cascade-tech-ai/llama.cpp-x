@@ -1,3 +1,5 @@
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "server-task.h"
 
 #include "chat.h"
@@ -77,6 +79,10 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
+            {"speculative.eagle_max_depth", speculative.eagle_max_depth},
+            {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
+            {"speculative.eagle_beam_width", speculative.eagle_beam_width},
+            {"speculative.eagle_per_beam_topk_candidates", speculative.eagle_per_beam_topk_candidates},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
             {"speculative.ngram_size_n",  speculative.ngram_size_n},
             {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -140,6 +146,10 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.n_max},
         {"speculative.n_min",         speculative.n_min},
         {"speculative.p_min",         speculative.p_min},
+        {"speculative.eagle_max_depth", speculative.eagle_max_depth},
+        {"speculative.eagle_max_proposals", speculative.eagle_max_proposals},
+        {"speculative.eagle_beam_width", speculative.eagle_beam_width},
+        {"speculative.eagle_per_beam_topk_candidates", speculative.eagle_per_beam_topk_candidates},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
         {"speculative.ngram_size_n",  speculative.ngram_size_n},
         {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -305,10 +315,21 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.n_min = json_value(data, "speculative.n_min", defaults.speculative.n_min);
     params.speculative.n_max = json_value(data, "speculative.n_max", defaults.speculative.n_max);
     params.speculative.p_min = json_value(data, "speculative.p_min", defaults.speculative.p_min);
+    params.speculative.eagle_max_depth = json_value(data, "speculative.eagle_max_depth", defaults.speculative.eagle_max_depth);
+    params.speculative.eagle_max_proposals = json_value(data, "speculative.eagle_max_proposals", defaults.speculative.eagle_max_proposals);
+    params.speculative.eagle_beam_width = json_value(data, "speculative.eagle_beam_width", defaults.speculative.eagle_beam_width);
+    params.speculative.eagle_per_beam_topk_candidates = json_value(data, "speculative.eagle_per_beam_topk_candidates", defaults.speculative.eagle_per_beam_topk_candidates);
 
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
     params.speculative.n_max = std::max(params.speculative.n_max, 0);
+    params.speculative.eagle_max_depth = std::max(params.speculative.eagle_max_depth, 1);
+    params.speculative.eagle_max_proposals = std::max(params.speculative.eagle_max_proposals, 1);
+    params.speculative.eagle_beam_width = std::max(params.speculative.eagle_beam_width, 0);
+    if (params.speculative.eagle_beam_width > params.speculative.eagle_max_proposals) {
+        params.speculative.eagle_beam_width = params.speculative.eagle_max_proposals;
+    }
+    params.speculative.eagle_per_beam_topk_candidates = std::max(params.speculative.eagle_per_beam_topk_candidates, 0);
 
     params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
 
@@ -700,6 +721,20 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
     return bytes;
 }
 
+static json get_oai_completion_tokens_details(const result_timings & timings) {
+    if (timings.draft_n <= 0) {
+        return json::object();
+    }
+
+    const int32_t accepted = std::max(0, timings.draft_n_accepted);
+    const int32_t rejected = std::max(0, timings.draft_n - accepted);
+
+    return json {
+        {"accepted_prediction_tokens", accepted},
+        {"rejected_prediction_tokens", rejected},
+    };
+}
+
 //
 // server_task_result_cmpl_final
 //
@@ -758,6 +793,17 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = "stop";
     }
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"completion_tokens", n_decoded},
+        {"prompt_tokens",     n_prompt_tokens},
+        {"total_tokens",      n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["completion_tokens_details"] = completion_tokens_details;
+    }
+
     json res = json {
         {"choices",            json::array({
             json{
@@ -771,11 +817,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"model",              oaicompat_model},
         {"system_fingerprint", build_info},
         {"object",             "text_completion"},
-        {"usage", json {
-            {"completion_tokens", n_decoded},
-            {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
-        }},
+        {"usage", usage},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -816,6 +858,16 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"completion_tokens", n_decoded},
+        {"prompt_tokens",     n_prompt_tokens},
+        {"total_tokens",      n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["completion_tokens_details"] = completion_tokens_details;
+    }
 
     json res = json {
         {"choices",            json::array({choice})},
@@ -823,11 +875,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"model",              oaicompat_model},
         {"system_fingerprint", build_info},
         {"object",             "chat.completion"},
-        {"usage", json {
-            {"completion_tokens", n_decoded},
-            {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
-        }},
+        {"usage", usage},
         {"id", oaicompat_cmpl_id}
     };
 
@@ -885,6 +933,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (include_usage) {
         // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage
         // https://platform.openai.com/docs/api-reference/chat_streaming/streaming#chat_streaming/streaming-choices
+        const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+        json usage = json {
+            {"completion_tokens", n_decoded},
+            {"prompt_tokens",     n_prompt_tokens},
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+        };
+        if (!completion_tokens_details.empty()) {
+            usage["completion_tokens_details"] = completion_tokens_details;
+        }
+
         deltas.push_back({
             {"choices", json::array()},
             {"created",            t},
@@ -892,11 +951,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
             {"model",              oaicompat_model},
             {"system_fingerprint", build_info},
             {"object",             "chat.completion.chunk"},
-            {"usage", json {
-                {"completion_tokens", n_decoded},
-                {"prompt_tokens",     n_prompt_tokens},
-                {"total_tokens",      n_decoded + n_prompt_tokens},
-            }},
+            {"usage", usage},
         });
     }
 
@@ -963,6 +1018,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"input_tokens",  n_prompt_tokens},
+        {"output_tokens", n_decoded},
+        {"total_tokens",  n_decoded + n_prompt_tokens},
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["output_tokens_details"] = completion_tokens_details;
+    }
+
     json res = {
         {"completed_at", t},
         {"created_at",   t},
@@ -971,11 +1037,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         {"object",       "response"},
         {"output",       output},
         {"status",       "completed"},
-        {"usage",        json {
-            {"input_tokens",  n_prompt_tokens},
-            {"output_tokens", n_decoded},
-            {"total_tokens",  n_decoded + n_prompt_tokens},
-        }},
+        {"usage",        usage},
     };
 
     return res;
@@ -1069,6 +1131,17 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     std::time_t t = std::time(0);
+    const json completion_tokens_details = get_oai_completion_tokens_details(timings);
+
+    json usage = json {
+        {"input_tokens",  n_prompt_tokens},
+        {"output_tokens", n_decoded},
+        {"total_tokens",  n_decoded + n_prompt_tokens}
+    };
+    if (!completion_tokens_details.empty()) {
+        usage["output_tokens_details"] = completion_tokens_details;
+    }
+
     server_sent_events.push_back(json {
         {"event", "response.completed"},
         {"data", json {
@@ -1080,11 +1153,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"status",     "completed"},
                 {"model",      oaicompat_model},
                 {"output",     output},
-                {"usage",      json {
-                    {"input_tokens",  n_prompt_tokens},
-                    {"output_tokens", n_decoded},
-                    {"total_tokens",  n_decoded + n_prompt_tokens}
-                }}
+                {"usage",      usage}
             }},
         }}
     });
