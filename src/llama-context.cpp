@@ -1,23 +1,119 @@
 #include "llama-context.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_context
 //
+
+static bool tensor_copy_2d_async(
+        ggml_backend_t backend,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t dst_i1) {
+    if (!backend || !src || !dst || dst_i1 < 0) {
+        return false;
+    }
+    if (src->type != dst->type ||
+        src->ne[0] != dst->ne[0] ||
+        dst->ne[1] < dst_i1 + src->ne[1]) {
+        return false;
+    }
+    if (src->ne[1] == 0) {
+        return true;
+    }
+
+#if defined(GGML_USE_CUDA)
+    if (ggml_backend_is_cuda(backend)) {
+        return ggml_backend_cuda_tensor_copy_2d_async(backend, src, dst, dst_i1);
+    }
+#endif
+
+    const size_t row_bytes = (size_t) src->nb[1];
+    const size_t n_rows = (size_t) src->ne[1];
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src && buf_dst && ggml_backend_buffer_is_host(buf_src) && ggml_backend_buffer_is_host(buf_dst)) {
+        std::memcpy(
+                (char *) dst->data + (size_t) dst_i1 * (size_t) dst->nb[1],
+                src->data,
+                row_bytes * n_rows);
+        return true;
+    }
+
+    ggml_backend_synchronize(backend);
+
+    std::vector<uint8_t> tmp(row_bytes * n_rows);
+    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(dst, tmp.data(), (size_t) dst_i1 * (size_t) dst->nb[1], tmp.size());
+    return true;
+}
+
+static bool tensor_copy_bytes_async(
+        ggml_backend_t backend,
+        ggml_tensor * src,
+        size_t src_offset,
+        ggml_tensor * dst,
+        size_t dst_offset,
+        size_t size) {
+    if (!backend || !src || !dst) {
+        return false;
+    }
+    if (src_offset + size > ggml_nbytes(src) || dst_offset + size > ggml_nbytes(dst)) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+
+#if defined(GGML_USE_CUDA)
+    if (ggml_backend_is_cuda(backend)) {
+        return ggml_backend_cuda_tensor_copy_bytes_async(backend, src, src_offset, dst, dst_offset, size);
+    }
+#endif
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src && buf_dst && ggml_backend_buffer_is_host(buf_src) && ggml_backend_buffer_is_host(buf_dst)) {
+        std::memcpy(
+                (char *) dst->data + dst_offset,
+                (const char *) src->data + src_offset,
+                size);
+        return true;
+    }
+
+    ggml_backend_synchronize(backend);
+
+    std::vector<uint8_t> tmp(size);
+    ggml_backend_tensor_get(src, tmp.data(), src_offset, size);
+    ggml_backend_tensor_set(dst, tmp.data(), dst_offset, size);
+    return true;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -681,6 +777,13 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+ggml_backend_t llama_context::primary_backend() const {
+    if (!backend_ptrs.empty()) {
+        return backend_ptrs.front();
+    }
+    return backend_cpu;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -769,6 +872,228 @@ bool llama_context::memory_update(bool optimize) {
 
 enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
+}
+
+llama_rope_params llama_context::get_rope_params(int il) const {
+    llama_rope_params rp;
+    rp.rope_type   = model.hparams.rope_type;
+    rp.freq_base   = model.get_rope_freq_base(cparams, il);
+    rp.freq_scale  = model.get_rope_freq_scale(cparams, il);
+    rp.ext_factor  = cparams.yarn_ext_factor;
+    rp.attn_factor = cparams.yarn_attn_factor;
+    rp.beta_fast   = cparams.yarn_beta_fast;
+    rp.beta_slow   = cparams.yarn_beta_slow;
+    rp.n_ctx_orig  = cparams.n_ctx_orig_yarn;
+    rp.n_rot       = model.hparams.n_rot(il);
+    return rp;
+}
+
+bool llama_context::eagle3_set_layers(const std::vector<int32_t> & layers) {
+    eagle3_layer_ids = layers;
+    eagle3_capture_clear();
+    eagle3_capture.clear();
+    eagle3_capture.reserve(layers.size());
+    for (int32_t layer_id : layers) {
+        eagle3_capture.push_back({});
+        eagle3_capture.back().layer_id = layer_id;
+    }
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
+    return !eagle3_layer_ids.empty();
+}
+
+void llama_context::eagle3_clear() {
+    eagle3_layer_ids.clear();
+    eagle3_capture_clear();
+    eagle3_capture.clear();
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
+}
+
+void llama_context::eagle3_clear_seq(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
+}
+
+void llama_context::eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(pos);
+}
+
+const std::vector<float> * llama_context::eagle3_get_hidden_seq(
+        llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const {
+    n_tokens = 0;
+    if (seq_id != 0) {
+        return nullptr;
+    }
+    for (const auto & layer : eagle3_capture) {
+        if (layer.layer_id != layer_id || layer.tensor == nullptr) {
+            continue;
+        }
+        if (layer.tensor->ne[0] <= 0 || eagle3_capture_n_tokens == 0) {
+            return nullptr;
+        }
+        const size_t n_elems = (size_t) layer.tensor->ne[0] * (size_t) eagle3_capture_n_tokens;
+        layer.host_cache.resize(n_elems);
+        ggml_backend_tensor_get(layer.tensor, layer.host_cache.data(), 0, n_elems * sizeof(float));
+        n_tokens = eagle3_capture_n_tokens;
+        return &layer.host_cache;
+    }
+    return nullptr;
+}
+
+const ggml_tensor * llama_context::eagle3_get_hidden_capture(int32_t layer_id, size_t & n_tokens) const {
+    n_tokens = 0;
+    for (const auto & layer : eagle3_capture) {
+        if (layer.layer_id != layer_id || layer.tensor == nullptr) {
+            continue;
+        }
+        n_tokens = eagle3_capture_n_tokens;
+        return layer.tensor;
+    }
+    return nullptr;
+}
+
+void llama_context::eagle3_capture_clear() {
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = 0;
+    for (auto & layer : eagle3_capture) {
+        layer.backend = nullptr;
+        layer.ctx.reset();
+        layer.buf.reset();
+        layer.tensor = nullptr;
+        layer.capacity = 0;
+        layer.host_cache.clear();
+    }
+}
+
+void llama_context::eagle3_capture_synchronize() const {
+    std::unordered_set<ggml_backend_t> synced;
+    for (const auto & layer : eagle3_capture) {
+        if (!layer.tensor || !layer.backend) {
+            continue;
+        }
+        if (!synced.insert(layer.backend).second) {
+            continue;
+        }
+        ggml_backend_synchronize(layer.backend);
+    }
+}
+
+bool llama_context::eagle3_capture_begin(uint32_t n_tokens) {
+    eagle3_capture_n_tokens = 0;
+    eagle3_capture_capacity = n_tokens;
+    return true;
+}
+
+bool llama_context::eagle3_capture_append(const llama_ubatch & ubatch, const llm_graph_result & res) {
+    if (eagle3_capture.empty() || res.t_eagle3_hidden.empty() || ubatch.n_tokens == 0) {
+        return true;
+    }
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    const uint32_t required = eagle3_capture_n_tokens + n_tokens;
+    const uint32_t capacity = std::max(eagle3_capture_capacity, required);
+
+    for (auto & layer : eagle3_capture) {
+        auto it = res.t_eagle3_hidden.find(layer.layer_id);
+        if (it == res.t_eagle3_hidden.end() || it->second == nullptr) {
+            continue;
+        }
+
+        ggml_tensor * src = it->second;
+        if (src->ne[1] != (int64_t) n_tokens) {
+            LLAMA_LOG_WARN("%s: eagle3 hidden shape mismatch for layer %d\n", __func__, layer.layer_id);
+            continue;
+        }
+        const int64_t n_embd = src->ne[0];
+
+        ggml_backend_t backend_src = ggml_backend_sched_get_tensor_backend(sched.get(), src);
+        if (!backend_src) {
+            return false;
+        }
+
+        if (!layer.tensor || layer.backend != backend_src || layer.capacity < (int32_t) capacity) {
+            ggml_init_params params = {
+                /* .mem_size   = */ (size_t) ggml_tensor_overhead() * 8 + 1024,
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+
+            ggml_context_ptr ctx_capture(ggml_init(params));
+            if (!ctx_capture) {
+                return false;
+            }
+
+            ggml_tensor * t_capture = ggml_new_tensor_2d(ctx_capture.get(), GGML_TYPE_F32, n_embd, capacity);
+            if (!t_capture) {
+                return false;
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_src);
+            ggml_backend_buffer_ptr buf_capture(ggml_backend_alloc_ctx_tensors_from_buft(ctx_capture.get(), buft));
+            if (!buf_capture) {
+                return false;
+            }
+
+            layer.backend = backend_src;
+            layer.ctx = std::move(ctx_capture);
+            layer.buf = std::move(buf_capture);
+            layer.tensor = t_capture;
+            layer.capacity = (int32_t) capacity;
+        }
+
+        const size_t n_bytes = (size_t) n_embd * (size_t) n_tokens * sizeof(float);
+        const size_t dst_offset = (size_t) eagle3_capture_n_tokens * (size_t) layer.tensor->nb[1];
+        if (!tensor_copy_bytes_async(backend_src, src, 0, layer.tensor, dst_offset, n_bytes)) {
+            return false;
+        }
+    }
+
+    eagle3_capture_n_tokens = required;
+    eagle3_capture_capacity = std::max(eagle3_capture_capacity, required);
+    return true;
+}
+
+void llama_context::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    if (!memory) {
+        return;
+    }
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        kv->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+        kv_iswa->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        mem_hybrid->set_kq_mask_tree(tree);
+        return;
+    }
+
+    if (auto * mem_hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        mem_hybrid_iswa->set_kq_mask_tree(tree);
+        return;
+    }
+}
+
+void llama_context::clear_kq_mask_tree() {
+    set_kq_mask_tree(nullptr);
+}
+
+void llama_context::set_rope_pos_override(const llama_pos * data, uint32_t n) {
+    if (balloc) {
+        balloc->set_rope_pos_override(data, n);
+    }
+}
+
+void llama_context::clear_rope_pos_override() {
+    if (balloc) {
+        balloc->clear_rope_pos_override();
+    }
 }
 
 float * llama_context::get_logits() {
@@ -1661,6 +1986,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+    if (!eagle3_capture_begin(n_tokens_all)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize EAGLE3 hidden capture\n", __func__);
+        return -2;
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1668,12 +1998,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         {
             int32_t n_outputs_new = 0;
 
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                }
+            for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                n_outputs_new += (int32_t) (ubatch.output[i] != 0);
             }
 
             // needs to happen before the graph is built
@@ -1712,6 +2038,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (!eagle3_capture_append(ubatch, *res)) {
+            LLAMA_LOG_ERROR("%s: failed to append EAGLE3 hidden capture\n", __func__);
+            return -2;
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -1822,6 +2153,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto & out_ids = balloc->get_out_ids();
 
+        if (out_ids.size() != (size_t) n_outputs) {
+            LLAMA_LOG_ERROR("%s: out_ids.size()=%zu != n_outputs=%d, n_tokens_all=%u, n_outputs_all=%u\n",
+                __func__, out_ids.size(), n_outputs, balloc->get_n_tokens(), balloc->get_n_outputs());
+        }
         GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 
         for (int64_t i = 0; i < n_outputs; ++i) {
@@ -2151,6 +2486,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.eagle3_layer_ids =*/ eagle3_layer_ids,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3095,6 +3431,110 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+bool llama_eagle3_set_layers(llama_context * ctx, const int32_t * layers, size_t n_layers) {
+    if (!ctx) {
+        return false;
+    }
+    if (n_layers == 0) {
+        ctx->eagle3_clear();
+        return false;
+    }
+    if (!layers) {
+        return false;
+    }
+    std::vector<int32_t> vec(layers, layers + n_layers);
+    return ctx->eagle3_set_layers(vec);
+}
+
+void llama_eagle3_clear(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_clear();
+}
+
+void llama_eagle3_clear_seq(llama_context * ctx, llama_seq_id seq_id) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_clear_seq(seq_id);
+}
+
+void llama_eagle3_trim_seq(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_trim_seq(seq_id, pos);
+}
+
+const float * llama_eagle3_get_hidden_seq(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        int32_t layer_id,
+        size_t * n_tokens) {
+    if (!ctx || !n_tokens) {
+        return nullptr;
+    }
+
+    ctx->synchronize();
+
+    size_t n = 0;
+    const auto * vec = ctx->eagle3_get_hidden_seq(seq_id, layer_id, n);
+    if (!vec) {
+        *n_tokens = 0;
+        return nullptr;
+    }
+
+    *n_tokens = n;
+    return vec->data();
+}
+
+const ggml_tensor * llama_eagle3_get_hidden_capture(
+        llama_context * ctx,
+        int32_t layer_id,
+        size_t * n_tokens) {
+    if (!ctx || !n_tokens) {
+        return nullptr;
+    }
+
+    return ctx->eagle3_get_hidden_capture(layer_id, *n_tokens);
+}
+
+void llama_eagle3_synchronize_hidden_capture(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_capture_synchronize();
+}
+
+void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_kq_mask_tree(tree);
+}
+
+void llama_clear_kq_mask_tree(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_kq_mask_tree();
+}
+
+void llama_set_rope_pos_override(struct llama_context * ctx, uint32_t n_tokens, const llama_pos * rope_pos) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_rope_pos_override(rope_pos, n_tokens);
+}
+
+void llama_clear_rope_pos_override(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_rope_pos_override();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

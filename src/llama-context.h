@@ -1,4 +1,6 @@
 #pragma once
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama.h"
 #include "llama-cparams.h"
@@ -10,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -17,6 +20,18 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+
+struct llama_rope_params {
+    llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
+    float freq_base   = 10000.0f;
+    float freq_scale  = 1.0f;
+    float ext_factor  = 1.0f;
+    float attn_factor = 1.0f;
+    float beta_fast   = 32.0f;
+    float beta_slow   = 1.0f;
+    int32_t n_ctx_orig = 0;
+    int32_t n_rot      = 0;
+};
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -228,11 +243,30 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    ggml_backend_t primary_backend() const;
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+
+    llama_rope_params get_rope_params(int il = 0) const;
+
+    bool eagle3_set_layers(const std::vector<int32_t> & layers);
+    void eagle3_clear();
+    void eagle3_clear_seq(llama_seq_id seq_id);
+    void eagle3_trim_seq(llama_seq_id seq_id, llama_pos pos);
+    const std::vector<float> * eagle3_get_hidden_seq(llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const;
+    const ggml_tensor * eagle3_get_hidden_capture(int32_t layer_id, size_t & n_tokens) const;
+    void eagle3_capture_synchronize() const;
+    const std::vector<int32_t> & eagle3_layers() const { return eagle3_layer_ids; }
+
+    void set_kq_mask_tree(const llama_kq_mask_tree * tree);
+    void clear_kq_mask_tree();
+
+    void set_rope_pos_override(const llama_pos * data, uint32_t n);
+    void clear_rope_pos_override();
 
 private:
     llm_graph_params graph_params(
@@ -242,6 +276,10 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    bool eagle3_capture_begin(uint32_t n_tokens);
+    bool eagle3_capture_append(const llama_ubatch & ubatch, const llm_graph_result & res);
+    void eagle3_capture_clear();
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -326,6 +364,21 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    struct eagle3_hidden_capture_layer {
+        int32_t layer_id = -1;
+        ggml_backend_t backend = nullptr;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * tensor = nullptr;
+        int32_t capacity = 0;
+        mutable std::vector<float> host_cache;
+    };
+
+    std::vector<int32_t> eagle3_layer_ids;
+    std::vector<eagle3_hidden_capture_layer> eagle3_capture;
+    uint32_t eagle3_capture_n_tokens = 0;
+    uint32_t eagle3_capture_capacity = 0;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

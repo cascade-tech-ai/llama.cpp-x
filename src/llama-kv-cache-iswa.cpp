@@ -1,4 +1,6 @@
 #include "llama-kv-cache-iswa.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -245,6 +247,11 @@ llama_kv_cache * llama_kv_cache_iswa::get_base() const {
 
 llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
+}
+
+void llama_kv_cache_iswa::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    kv_base->set_kq_mask_tree(tree);
+    kv_swa->set_kq_mask_tree(tree);
 }
 
 //

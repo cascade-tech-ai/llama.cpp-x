@@ -45,16 +45,19 @@ struct llama_ubatch {
     llama_token  *  token;      // [n_tokens]         | i   | id, token
     float        *  embd;       // [n_embd, n_tokens] | i   | embd
     llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
+    int32_t      *  kv_slot;    // [n_tokens]         | i   | explicit KV slot, -1/unused if not provided
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
+    llama_pos    *  rope_pos;   // [n_tokens*n_pos]   | i   | optional RoPE position override (nullptr = use pos)
 
     struct data_t {
         std::vector<llama_token>    token;
         std::vector<float>          embd;
         std::vector<llama_pos>      pos;
+        std::vector<int32_t>        kv_slot;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
         std::vector<llama_seq_id>   seq_id_unq;
@@ -62,6 +65,7 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
 
         std::vector<llama_seq_id> seq_id_data;
+        std::vector<llama_pos>    rope_pos;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
@@ -113,12 +117,22 @@ public:
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
+    // set/clear a per-batch-token RoPE position override
+    // when set, ubatches will carry rope_pos data (used for RoPE) distinct from pos (used for KV cache)
+    void set_rope_pos_override(const llama_pos * data, uint32_t n);
+    void clear_rope_pos_override();
+
 private:
     void clear();
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
     llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+
+    // expand coupled tokens for equal-seqs splitting:
+    // each coupled token is replicated per-sequence, producing an equal_seqs ubatch
+    // with n_seq_id=1 per token. used by split_equal when the batch has coupled sequences.
+    llama_ubatch split_equal_expand(uint32_t n_ubatch);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);
@@ -139,11 +153,15 @@ private:
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 
     std::vector<llama_pos>      pos;
+    std::vector<int32_t>        kv_slot;
     std::vector<int32_t>        n_seq_id;
     std::vector<llama_seq_id *> seq_id;
     std::vector<llama_seq_id>   seq_id_unq;
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
+
+    // per-batch-token RoPE position override (indexed by batch token index)
+    std::vector<llama_pos>      rope_pos_override;
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;
@@ -163,6 +181,10 @@ private:
 
     // batch indices of the output
     std::vector<int32_t> out_ids;
+
+    // state for split_equal_expand across multiple calls
+    std::set<llama_seq_id> expand_processed_seqs;
+    std::set<int32_t>      expand_seen_outputs;
 
     uint32_t n_used;
 

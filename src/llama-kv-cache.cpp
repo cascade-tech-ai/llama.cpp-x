@@ -1,4 +1,6 @@
 #include "llama-kv-cache.h"
+// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
+// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -12,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 //
 // llama_kv_cache
@@ -804,6 +807,27 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ubatch.kv_slot) {
+            std::unordered_set<uint32_t> seen;
+            seen.reserve(n_tokens);
+
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t i = s*n_tokens + ii;
+                const int32_t idx = ubatch.kv_slot[i];
+                if (idx < 0 || (uint32_t) idx >= cells.size()) {
+                    return { };
+                }
+
+                if (!seen.insert((uint32_t) idx).second) {
+                    return { };
+                }
+
+                res.idxs[s].push_back((uint32_t) idx);
+            }
+
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -969,7 +993,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         auto & head = v_heads[sinfo.strm[s]];
 
-        head = sinfo.idxs[s].back() + 1;
+        head = *std::max_element(sinfo.idxs[s].begin(), sinfo.idxs[s].end()) + 1;
     }
 }
 
@@ -1443,7 +1467,78 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+static void apply_tree_kq_mask_override(
+        float * data,
+        const llama_ubatch * ubatch,
+        const llama_kv_cache::slot_info & sinfo,
+        const llama_kq_mask_tree & tree,
+        int64_t n_kv) {
+    if (tree.n_nodes == 0 || tree.parent == nullptr) {
+        return;
+    }
+
+    const uint32_t batch_start = tree.batch_start;
+    const uint32_t n_nodes = (uint32_t) tree.n_nodes;
+
+    if (batch_start >= ubatch->n_tokens || batch_start + n_nodes > ubatch->n_tokens) {
+        return;
+    }
+
+    const uint32_t n_stream = sinfo.n_stream();
+    const uint32_t n_tps = sinfo.size();
+    if (n_stream == 0 || n_tps == 0) {
+        return;
+    }
+
+    std::vector<uint32_t> kv_idx(n_nodes, UINT32_MAX);
+    std::vector<uint32_t> row_idx(n_nodes, UINT32_MAX);
+
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        const uint32_t ubatch_idx = batch_start + i;
+        const uint32_t stream = ubatch_idx / n_tps;
+        const uint32_t ii = ubatch_idx % n_tps;
+        if (stream >= n_stream) {
+            continue;
+        }
+        if (ii >= sinfo.idxs[stream].size()) {
+            continue;
+        }
+        row_idx[i] = ubatch_idx;
+        kv_idx[i] = sinfo.idxs[stream][ii];
+    }
+
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        const uint32_t row = row_idx[i];
+        if (row == UINT32_MAX) {
+            continue;
+        }
+        const uint64_t idst = (uint64_t) n_kv * row;
+
+        std::vector<char> allow(n_nodes, 0);
+        int32_t cur = (int32_t) i;
+        while (cur >= 0 && cur < (int32_t) n_nodes) {
+            allow[(size_t) cur] = 1;
+            const int32_t next = tree.parent[cur];
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+
+        for (uint32_t j = 0; j < n_nodes; ++j) {
+            if (allow[j]) {
+                continue;
+            }
+            const uint32_t kvj = kv_idx[j];
+            if (kvj == UINT32_MAX || kvj >= (uint32_t) n_kv) {
+                continue;
+            }
+            data[idst + kvj] = -INFINITY;
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1477,6 +1572,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<false>(args, data);
     }
 
+    if (kq_mask_tree) {
+        apply_tree_kq_mask_override(data, ubatch, sinfo, *kq_mask_tree, n_kv);
+    }
+
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
@@ -1505,6 +1604,10 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+}
+
+void llama_kv_cache::set_kq_mask_tree(const llama_kq_mask_tree * tree) {
+    kq_mask_tree = tree;
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2277,7 +2380,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, sinfos[i_cur], causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
