@@ -35,10 +35,12 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               ggml_sort_order  order,
                               cudaStream_t     stream) {
     ggml_cuda_pool_alloc<int>   temp_indices_alloc(pool, ncols * nrows);
-    ggml_cuda_pool_alloc<float> temp_keys_alloc(pool, ncols * nrows);
+    ggml_cuda_pool_alloc<float> temp_keys_in_alloc(pool, ncols * nrows);
+    ggml_cuda_pool_alloc<float> temp_keys_out_alloc(pool, ncols * nrows);
 
     int *   temp_indices = temp_indices_alloc.get();
-    float * temp_keys    = temp_keys_alloc.get();
+    float * temp_keys_in = temp_keys_in_alloc.get();
+    float * temp_keys_out = temp_keys_out_alloc.get();
 
     static const int block_size = 256;
     const dim3 grid_size((ncols + block_size - 1) / block_size, nrows);
@@ -54,28 +56,28 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
     const dim3                offset_grid((nrows_offset + block_size - 1) / block_size);
     init_offsets<<<offset_grid, block_size, 0, stream>>>(offset_iterator, ncols, nrows);
 #endif
-    CUDA_CHECK(cudaMemcpyAsync(temp_keys, x, ncols * nrows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(temp_keys_in, x, ncols * nrows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
     size_t temp_storage_bytes = 0;
 
     if (order == GGML_SORT_ORDER_ASC) {
         if (nrows == 1) {
-            DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+            DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                        temp_indices, dst,                                  // values (indices)
                                        ncols, 0, sizeof(float) * 8, stream);
         } else {
-            DeviceSegmentedSort::SortPairs(nullptr, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+            DeviceSegmentedSort::SortPairs(nullptr, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                            temp_indices, dst,                                  // values (indices)
                                            ncols * nrows, nrows,  // num items, num segments
                                            offset_iterator, offset_iterator + 1, stream);
         }
     } else {
         if (nrows == 1) {
-            DeviceRadixSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+            DeviceRadixSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                                  temp_indices, dst,                                  // values (indices)
                                                  ncols, 0, sizeof(float) * 8, stream);
         } else {
-            DeviceSegmentedSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys, temp_keys, temp_indices,
+            DeviceSegmentedSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys_in, temp_keys_out, temp_indices,
                                                      dst, ncols * nrows, nrows, offset_iterator, offset_iterator + 1,
                                                      stream);
         }
@@ -86,20 +88,20 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 
     if (order == GGML_SORT_ORDER_ASC) {
         if (nrows == 1) {
-            DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+            DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                        temp_indices, dst,  // values (indices)
                                        ncols, 0, sizeof(float) * 8, stream);
         } else {
-            DeviceSegmentedSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+            DeviceSegmentedSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys_in, temp_keys_out, temp_indices, dst,
                                            ncols * nrows, nrows, offset_iterator, offset_iterator + 1, stream);
         }
     } else {
         if (nrows == 1) {
-            DeviceRadixSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+            DeviceRadixSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                                  temp_indices, dst,                                  // values (indices)
                                                  ncols, 0, sizeof(float) * 8, stream);
         } else {
-            DeviceSegmentedSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,
+            DeviceSegmentedSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys_in, temp_keys_out,
                                                      temp_indices, dst, ncols * nrows, nrows, offset_iterator,
                                                      offset_iterator + 1, stream);
         }

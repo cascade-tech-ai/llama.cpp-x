@@ -8140,21 +8140,88 @@ static void ggml_compute_forward_top_k_f32(
     }
 }
 
+static void ggml_compute_forward_top_k_threshold_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = ggml_nrows(src0);
+
+    const int top_k = ne0;
+    const float threshold = ggml_get_op_params_f32(dst, 0);
+    const int32_t sentinel = (int32_t) ne00;
+
+    int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+    for (int64_t i = ith; i < nr; i += nth) {
+        const float * src_data = (float *) ((char *) src0->data + i*nb01);
+
+        int32_t n_valid = 0;
+        for (int32_t j = 0; j < ne00; ++j) {
+            if (src_data[j] >= threshold) {
+                tmp[n_valid++] = j;
+            }
+        }
+
+        const int valid_top_k = std::min(top_k, n_valid);
+        if (valid_top_k > 0) {
+            std::partial_sort(tmp, tmp + valid_top_k, tmp + n_valid, cmp_top_k{src_data});
+        }
+
+        int32_t * dst_data = (int32_t *) ((char *) dst->data + i*nb1);
+        if (valid_top_k > 0) {
+            std::copy(tmp, tmp + valid_top_k, dst_data);
+            if (valid_top_k > 1) {
+                std::swap(dst_data[0], dst_data[1]);
+            }
+        }
+        for (int j = valid_top_k; j < top_k; ++j) {
+            dst_data[j] = sentinel;
+        }
+    }
+}
+
 void ggml_compute_forward_top_k(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
 
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_top_k_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
+    switch (dst->op) {
+        case GGML_OP_TOP_K:
+            switch (src0->type) {
+                case GGML_TYPE_F32:
+                    {
+                        ggml_compute_forward_top_k_f32(params, dst);
+                    } break;
+                default:
+                    {
+                        GGML_ABORT("fatal error");
+                    }
             }
+            break;
+        case GGML_OP_TOP_K_THRESHOLD:
+            switch (src0->type) {
+                case GGML_TYPE_F32:
+                    {
+                        ggml_compute_forward_top_k_threshold_f32(params, dst);
+                    } break;
+                default:
+                    {
+                        GGML_ABORT("fatal error");
+                    }
+            }
+            break;
+        default:
+            GGML_ABORT("fatal error");
     }
 }
 
