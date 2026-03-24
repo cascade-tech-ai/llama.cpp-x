@@ -1,6 +1,4 @@
 #include "models.h"
-// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 template <bool embed>
 llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {

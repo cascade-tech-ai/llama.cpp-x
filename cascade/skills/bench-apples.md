@@ -35,7 +35,7 @@ Each prompt is 2-8k characters from user turns only. Run each prompt file with `
 ## Standard parameters
 
 ```
--n 128 -c 4096 -b 4096 -ngl 999 --temp 0 --seed 123
+-n 128 -c 4096 -b 4096 -ngl 999 --temp 0 --seed 123 -fa on
 ```
 
 EAGLE3 additional flags:
@@ -71,13 +71,13 @@ From the output:
 
 ## Last known good baselines (RTX 5090, 2026-03-24, commit 327b6f2fa)
 
-### Llama 3.2-1B bf16
+### Llama 3.2-1B bf16 (10-prompt average)
 
 | Mode | t/s | Acc length |
 |------|-----|------------|
-| Baseline (no spec) | ~466 | - |
-| EAGLE3 | ~436 | 3.8 |
-| Speedup | 0.94x | - |
+| Baseline (no spec) | ~455 | - |
+| EAGLE3 | ~350 | 3.1 |
+| Speedup | 0.77x | - |
 
 Note: 1B is too fast on RTX 5090 for spec decoding to help. Draft head overhead dominates. This model is useful for correctness validation, not speedup testing.
 

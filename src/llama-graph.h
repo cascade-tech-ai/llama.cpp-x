@@ -1,6 +1,4 @@
 #pragma once
-// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-arch.h"
 #include "llama-batch.h"

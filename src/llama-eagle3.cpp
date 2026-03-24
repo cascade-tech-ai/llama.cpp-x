@@ -1,5 +1,3 @@
-// AI-GENERATED: This file was created with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "llama-eagle3.h"
 
 #include "llama-impl.h"

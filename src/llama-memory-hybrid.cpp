@@ -1,6 +1,4 @@
 #include "llama-memory-hybrid.h"
-// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "llama-impl.h"
 #include "llama-model.h"

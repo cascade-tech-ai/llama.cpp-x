@@ -1,6 +1,4 @@
 #include "server-context.h"
-// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"

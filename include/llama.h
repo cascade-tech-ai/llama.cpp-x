@@ -1,7 +1,5 @@
 #ifndef LLAMA_H
 #define LLAMA_H
-// AI-GENERATED: This file was modified with AI assistance for an experimental fork.
-// DO NOT SUBMIT upstream unless rewritten or exhaustively reviewed by a human.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
