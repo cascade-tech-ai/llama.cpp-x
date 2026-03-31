@@ -1263,6 +1263,98 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         }
 
         const int max_depth = params.eagle_max_depth;
+
+        // ---- Serial greedy rollout (no beam search) ----
+        if (params.eagle_serial) {
+            llama_eagle3_state cur_state = root_state;
+
+            last_tree_states.clear();
+            std::map<llama_tokens, llama_eagle3_state> serial_prefix_states;
+
+            llama_tokens chain;
+
+            for (int depth = 0; depth < max_depth; ++depth) {
+                // Get the hidden vector from the current state.
+                std::vector<float> cur_hidden;
+                if (!llama_eagle3_state_get_hidden(*model, rt, cur_state, cur_hidden)) {
+                    break;
+                }
+
+                // Compute logits and pick the argmax token.
+                std::vector<float> logits;
+                if (!llama_eagle3_logits(*model, rt, cur_hidden.data(), logits)) {
+                    LOG_WRN("eagle3 serial: logits failed at depth %d\n", depth);
+                    break;
+                }
+
+                const int32_t draft_vocab = model->hparams.draft_vocab_size;
+                int32_t best_idx = 0;
+                float   best_val = logits[0];
+                for (int32_t j = 1; j < draft_vocab && j < (int32_t) logits.size(); ++j) {
+                    if (logits[(size_t) j] > best_val) {
+                        best_val = logits[(size_t) j];
+                        best_idx = j;
+                    }
+                }
+
+
+                const int32_t base_id = best_idx + model->d2t[(size_t) best_idx];
+                if (base_id < 0 || base_id >= model->hparams.vocab_size) {
+                    break;
+                }
+                const llama_token token = (llama_token) base_id;
+                chain.push_back(token);
+
+                // Step eagle head forward by one token.
+                if (!llama_eagle3_step(*model, rt, cur_state,
+                            nullptr, hidden_size, token, nullptr, nullptr)) {
+                    break;
+                }
+
+                // Store state for accept_tokens prefix tracking.
+                serial_prefix_states[chain] = cur_state;
+            }
+
+            if (chain.empty()) {
+                return;
+            }
+
+            // Build trivial linear tree (single parent chain).
+            last_tree.tokens  = chain;
+            last_tree.parents.resize(chain.size());
+            last_tree.depths.resize(chain.size());
+            for (size_t i = 0; i < chain.size(); ++i) {
+                last_tree.parents[i] = i > 0 ? (int32_t)(i - 1) : -1;
+                last_tree.depths[i]  = (int32_t) i;
+            }
+            common_speculative_tree_build_metadata(last_tree);
+
+            // Store per-node states for accept_tokens.
+            last_tree_states.resize(chain.size());
+            {
+                llama_tokens prefix;
+                for (size_t i = 0; i < chain.size(); ++i) {
+                    prefix.push_back(chain[i]);
+                    auto it = serial_prefix_states.find(prefix);
+                    if (it != serial_prefix_states.end()) {
+                        last_tree_states[i] = it->second;
+                    }
+                }
+            }
+
+            if (verbose) {
+                LOG_INF("eagle3 serial: drafted %zu tokens:", chain.size());
+                for (size_t i = 0; i < chain.size(); ++i) {
+                    LOG_INF(" %d", (int) chain[i]);
+                }
+                LOG_INF("\n");
+            }
+
+            draft_tokens = chain;
+            return;
+        }
+
+        // ---- Beam search rollout ----
         const int max_proposals = params.eagle_max_proposals;
         const int beam_width = params.eagle_beam_width > 0
             ? std::min(params.eagle_beam_width, max_proposals)

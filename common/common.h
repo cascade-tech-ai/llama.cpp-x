@@ -282,6 +282,7 @@ struct common_params_speculative {
     int32_t eagle_beam_width              = 8;    // beam width for rollout
     int32_t eagle_per_beam_topk_candidates = 1024; // keep tokens with p >= 1/N before per-beam top-k, 0 = disable
     std::string eagle_trace_yaml;                 // optional YAML-compatible trace output path
+    bool eagle_serial                     = false; // serial greedy drafting (no beam search, linear verification)
 
     // ngram-based speculative decoding
 

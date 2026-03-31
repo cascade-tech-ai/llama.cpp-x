@@ -557,7 +557,8 @@ int main(int argc, char ** argv) {
         // Tree verification creates coupled sequences (root token shared across all branches),
         // which the hybrid memory's batch splitting cannot handle for recurrent layers.
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty()
-            && !llama_model_is_hybrid(model_tgt);
+            && !llama_model_is_hybrid(model_tgt)
+            && !params.speculative.eagle_serial;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
