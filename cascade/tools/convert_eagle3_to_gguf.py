@@ -72,8 +72,8 @@ def main() -> int:
     parser.add_argument(
         "--dtype",
         choices=("f16", "bf16", "f32"),
-        default="f16",
-        help="Output tensor dtype (default: f16)",
+        default="bf16",
+        help="Output tensor dtype (default: bf16). Use bf16 to preserve bfloat16 precision from PyTorch.",
     )
     parser.add_argument(
         "--base-n-layers",

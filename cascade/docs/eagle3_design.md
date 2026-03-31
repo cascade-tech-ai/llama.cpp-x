@@ -52,7 +52,17 @@ Flat tree is strictly faster and produces identical outputs. Coupled batches can
 Kestrel is the reference. When our outputs diverge from kestrel, we assume we have a bug until proven otherwise. Key compatibility points:
 
 - **Hidden state indexing**: Both use input-to-layer semantics. `layer_id=2` means input to block 2 = output of block 1 = HF `hidden_states[2]`.
-- **Draft logits**: Root logits should match within bf16 tolerance (~0.05 max abs diff, same top-10 ordering). Verified via `CASCADE_EAGLE_DUMP_DIR` env var which dumps all intermediate tensors as `.npy` files.
-- **Acceptance length**: This is the acceptance metric that matters for performance comparisons. It means accepted draft tokens per speculative cycle, and it should be in the same ballpark for the same model and prompts. Exact trace match is not expected since the beam search implementations differ.
+- **Draft logits**: Root logits should match within bf16 tolerance (~0.18 max abs diff with bf16 GGUF, same top-5 ordering). Verified via `CASCADE_EAGLE_DUMP_DIR` env var which dumps all intermediate tensors as `.npy` files.
+- **Acceptance length**: This is the acceptance metric that matters for performance comparisons. It means accepted draft tokens per speculative cycle. With matching beam parameters (mp=8, bw=8), expect ~87% of kestrel due to fundamental numerical differences between ggml/CUDA and PyTorch/CUDA (teacher hidden states can differ by up to ~5.0 at deep layers, cascading through the eagle head's attention). Wider beams (mp=16, bw=16) compensate, reaching ~91% of kestrel.
 - **Draft acceptance rate** (`n_accept / n_drafted`): This is only a low-signal debugging ratio from the example binary. It is not the primary benchmark metric and can be misleading across different depth / proposal settings.
-- **GGUF conversion**: `cascade/tools/convert_eagle3_to_gguf.py` converts kestrel checkpoints to GGUF.
+- **GGUF conversion**: `cascade/tools/convert_eagle3_to_gguf.py` converts kestrel checkpoints to GGUF. Use `--dtype bf16` (not f16) to preserve bfloat16 precision and minimize logit divergence from kestrel.
+
+## RoPE in the EAGLE head
+
+The EAGLE head has its own attention layer with RoPE. Critical correctness requirements:
+
+1. **Use the base model's `rope_factors`**: For llama3-type models, RoPE uses non-uniform per-dimension frequency scaling (15/32 dims unchanged, 14/32 dims scaled by 1/32, 3/32 intermediate). The base model's `rope_factors` tensor encodes these correctly. The eagle head MUST use these factors, not a uniform `freq_scale`.
+
+2. **Use NEOX-style interleaving** (`LLAMA_ROPE_TYPE_NEOX`): The eagle head weights come from HuggingFace, which uses NEOX-style RoPE (pair first-half with second-half). The base model in llama.cpp may use NORM-style (adjacent pairs) due to weight permutation, but the eagle head weights are NOT permuted.
+
+3. **Do NOT use `freq_scale = factor`**: A uniform `freq_scale=32` destroys positional information for the 15 high-frequency dimensions that should remain unchanged. This was the root cause of the ~50% acceptance rate gap observed with the incorrect RoPE fix.
