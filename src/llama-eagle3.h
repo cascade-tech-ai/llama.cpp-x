@@ -255,6 +255,26 @@ struct llama_eagle3_runtime {
     mutable uint64_t step_batch_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_batch_graph step_batch_graph;
 
+    // Persistent host-side staging buffers for ggml_backend_tensor_set_async().
+    // CUDA's async memcpy reads from the source pointer asynchronously, so the
+    // source must remain valid until the next synchronize or until the stream
+    // has consumed the data (guaranteed by single-stream ordering within this
+    // backend).  Putting the buffers here instead of on the stack ensures they
+    // outlive any individual function call.
+    mutable struct {
+        llama_token              tok   = 0;
+        int32_t                  pos   = 0;
+        std::vector<llama_token> tokens;
+        std::vector<int32_t>     positions;
+        std::vector<int32_t>     k_idxs;
+        std::vector<int32_t>     v_idxs;
+        std::vector<float>       beam_logprobs;
+        std::vector<float>       hidden;
+        std::vector<float>       fork_offsets;
+        std::vector<int32_t>     fork_dst_idxs;
+        std::vector<uint16_t>    mask_data; // ggml_fp16_t = uint16_t
+    } async_buf;
+
     // Cached prefill infrastructure (reused across prefill calls).
     struct prefill_cached_state;
     mutable std::shared_ptr<prefill_cached_state> prefill_state;

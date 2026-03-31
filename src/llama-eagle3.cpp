@@ -4118,7 +4118,8 @@ bool llama_eagle3_logits(
 
     if (rt.backend_compute && rt.buft_compute) {
         if (build_logits_graph(model, rt, rt.logits_graph)) {
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.logits_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
+            rt.async_buf.hidden.assign(hidden, hidden + hp.hidden_size);
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.logits_graph.t_hidden, rt.async_buf.hidden.data(), 0, hp.hidden_size * sizeof(float));
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.logits_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
                 logits_out.resize(hp.draft_vocab_size);
@@ -4177,7 +4178,8 @@ bool llama_eagle3_topk(
 
     if (rt.backend_compute && rt.buft_compute) {
         if (build_topk_graph(model, rt, k, rt.topk_graph)) {
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.topk_graph.t_hidden, hidden, 0, hp.hidden_size * sizeof(float));
+            rt.async_buf.hidden.assign(hidden, hidden + hp.hidden_size);
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.topk_graph.t_hidden, rt.async_buf.hidden.data(), 0, hp.hidden_size * sizeof(float));
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), rt.topk_graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
                 topk_idx_out.resize(k);
@@ -4445,12 +4447,13 @@ bool llama_eagle3_select_state_batch(
                 }
             }
 
+            rt.async_buf.beam_logprobs = beam_logprob;
             ggml_backend_tensor_set_async(
                     rt.backend_compute.get(),
                     graph.t_beam_logprob,
-                    beam_logprob.data(),
+                    rt.async_buf.beam_logprobs.data(),
                     0,
-                    beam_logprob.size() * sizeof(float));
+                    rt.async_buf.beam_logprobs.size() * sizeof(float));
 
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
             if (status == GGML_STATUS_SUCCESS) {
@@ -4592,12 +4595,13 @@ bool llama_eagle3_select_state_batch_device(
         }
     }
 
+    rt.async_buf.beam_logprobs = beam_logprob;
     ggml_backend_tensor_set_async(
             rt.backend_compute.get(),
             graph.t_beam_logprob,
-            beam_logprob.data(),
+            rt.async_buf.beam_logprobs.data(),
             0,
-            beam_logprob.size() * sizeof(float));
+            rt.async_buf.beam_logprobs.size() * sizeof(float));
 
     const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4654,8 +4658,8 @@ bool llama_eagle3_select_state_slots_device(
         return false;
     }
 
-    std::vector<float> zero_hidden((size_t) hp.hidden_size, 0.0f);
-    std::vector<float> masked_logprob = beam_logprob;
+    rt.async_buf.hidden.assign((size_t) hp.hidden_size, 0.0f); // zero_hidden
+    rt.async_buf.beam_logprobs = beam_logprob; // masked_logprob
     const float inactive_logprob = -1e30f;
 
     for (int32_t ib = 0; ib < n_beams; ++ib) {
@@ -4680,17 +4684,17 @@ bool llama_eagle3_select_state_slots_device(
         } else if (active && st && !st->hidden.empty()) {
             ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, st->hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
         } else {
-            masked_logprob[(size_t) ib] = inactive_logprob;
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, zero_hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+            rt.async_buf.beam_logprobs[(size_t) ib] = inactive_logprob;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), dst, rt.async_buf.hidden.data(), 0, (size_t) hp.hidden_size * sizeof(float));
         }
     }
 
     ggml_backend_tensor_set_async(
             rt.backend_compute.get(),
             graph.t_beam_logprob,
-            masked_logprob.data(),
+            rt.async_buf.beam_logprobs.data(),
             0,
-            masked_logprob.size() * sizeof(float));
+            rt.async_buf.beam_logprobs.size() * sizeof(float));
 
     const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -5398,8 +5402,10 @@ bool llama_eagle3_step_from_hidden_capture(
                 }
             }
 
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &input_id, 0, sizeof(input_id));
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &state.past_len, 0, sizeof(state.past_len));
+            rt.async_buf.tok = input_id;
+            rt.async_buf.pos = state.past_len;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &rt.async_buf.tok, 0, sizeof(rt.async_buf.tok));
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &rt.async_buf.pos, 0, sizeof(rt.async_buf.pos));
 
             if (graph.t_k_past_input && state.past_len > 0) {
                 if (state.dev && state.dev->t_k && state.dev->kv_capacity >= state.past_len) {
@@ -5563,7 +5569,8 @@ bool llama_eagle3_step_multi_from_hidden_capture(
             const size_t hidden_step_bytes = (size_t) hidden_in_dim * sizeof(float);
 
             if (first_hidden_in) {
-                ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, first_hidden_in, 0, hidden_step_bytes);
+                rt.async_buf.hidden.assign(first_hidden_in, first_hidden_in + hidden_in_dim);
+                ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, rt.async_buf.hidden.data(), 0, hidden_step_bytes);
             }
 
             for (int32_t it = 0; it < n_capture_tokens; ++it) {
@@ -5591,13 +5598,14 @@ bool llama_eagle3_step_multi_from_hidden_capture(
                 }
             }
 
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, input_ids.data(), 0, (size_t) n_tokens * sizeof(llama_token));
+            rt.async_buf.tokens.assign(input_ids.begin(), input_ids.end());
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, rt.async_buf.tokens.data(), 0, (size_t) n_tokens * sizeof(llama_token));
 
-            std::vector<int32_t> pos((size_t) n_tokens);
+            rt.async_buf.positions.resize((size_t) n_tokens);
             for (int32_t i = 0; i < n_tokens; ++i) {
-                pos[(size_t) i] = base_state.past_len + i;
+                rt.async_buf.positions[(size_t) i] = base_state.past_len + i;
             }
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, rt.async_buf.positions.data(), 0, rt.async_buf.positions.size() * sizeof(int32_t));
 
             if (graph.t_k_past_input && base_state.past_len > 0) {
                 if (base_state.dev && base_state.dev->t_k && base_state.dev->kv_capacity >= base_state.past_len) {
@@ -5787,7 +5795,8 @@ bool llama_eagle3_step(
             const int32_t required_len = state.past_len + 1;
 
             if (hidden_in) {
-                ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, hidden_in, 0, hidden_in_dim * sizeof(float));
+                rt.async_buf.hidden.assign(hidden_in, hidden_in + hidden_in_dim);
+                ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, rt.async_buf.hidden.data(), 0, hidden_in_dim * sizeof(float));
             } else if (state.dev && state.dev->t_hidden) {
                 if (!tensor_copy_bytes_async(
                             rt.backend_compute.get(),
@@ -5802,8 +5811,10 @@ bool llama_eagle3_step(
             } else {
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in, state.hidden.data(), 0, hidden_in_dim * sizeof(float));
             }
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &input_id, 0, sizeof(input_id));
-            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &state.past_len, 0, sizeof(state.past_len));
+            rt.async_buf.tok = input_id;
+            rt.async_buf.pos = state.past_len;
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok, &rt.async_buf.tok, 0, sizeof(rt.async_buf.tok));
+            ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos, &rt.async_buf.pos, 0, sizeof(rt.async_buf.pos));
 
             if (graph.t_k_past_input && state.past_len > 0) {
                 if (state.dev && state.dev->t_k && state.dev->kv_capacity >= state.past_len) {
@@ -6276,66 +6287,63 @@ bool llama_eagle3_fused_rollout(
                     root_state.dev->t_hidden, 0,
                     mg.t_hidden_in, 0, h_bytes);
             if (n_beams > 1) {
-                std::vector<float> zeros((size_t) hp.hidden_size * (size_t)(n_beams - 1), 0.0f);
+                rt.async_buf.hidden.assign((size_t) hp.hidden_size * (size_t)(n_beams - 1), 0.0f);
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_hidden_in,
-                        zeros.data(), h_bytes, zeros.size() * sizeof(float));
+                        rt.async_buf.hidden.data(), h_bytes, rt.async_buf.hidden.size() * sizeof(float));
             }
         }
         {
-            std::vector<float> lp(n_beams, -1e30f);
-            lp[0] = 0.0f;
+            rt.async_buf.beam_logprobs.assign(n_beams, -1e30f);
+            rt.async_buf.beam_logprobs[0] = 0.0f;
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_beam_logprob,
-                    lp.data(), 0, lp.size() * sizeof(float));
+                    rt.async_buf.beam_logprobs.data(), 0, rt.async_buf.beam_logprobs.size() * sizeof(float));
         }
         if (max_fork_rows > 0 && mg.t_fork_row_offsets && mg.t_fork_dst_idxs) {
             const int32_t total_fork = max_fork_rows * n_beams;
-            std::vector<float>   fork_offsets(total_fork);
-            std::vector<int32_t> fork_dst(total_fork);
+            rt.async_buf.fork_offsets.resize(total_fork);
+            rt.async_buf.fork_dst_idxs.resize(total_fork);
             for (int32_t b = 0; b < n_beams; ++b) {
                 for (int32_t r = 0; r < max_fork_rows; ++r) {
                     const int32_t idx = b * max_fork_rows + r;
-                    fork_offsets[idx] = (float)(rollout_start + r);
-                    fork_dst[idx] = b * kv_cap + rollout_start + r;
+                    rt.async_buf.fork_offsets[idx] = (float)(rollout_start + r);
+                    rt.async_buf.fork_dst_idxs[idx] = b * kv_cap + rollout_start + r;
                 }
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_fork_row_offsets,
-                    fork_offsets.data(), 0, total_fork * sizeof(float));
+                    rt.async_buf.fork_offsets.data(), 0, total_fork * sizeof(float));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_fork_dst_idxs,
-                    fork_dst.data(), 0, total_fork * sizeof(int32_t));
+                    rt.async_buf.fork_dst_idxs.data(), 0, total_fork * sizeof(int32_t));
         }
 
         // ---- Upload all per-depth inputs at once ----
         {
-            std::vector<int32_t> pos_all((size_t) n_beams * max_depth);
-            std::vector<int32_t> kv_idxs_all((size_t) n_beams * max_depth);
-            std::vector<ggml_fp16_t> mask_all((size_t) kv_cap * max_depth, ggml_fp32_to_fp16(-INFINITY));
+            rt.async_buf.positions.resize((size_t) n_beams * max_depth);
+            rt.async_buf.k_idxs.resize((size_t) n_beams * max_depth);
+            rt.async_buf.mask_data.assign((size_t) kv_cap * max_depth, ggml_fp32_to_fp16(-INFINITY));
 
             for (int32_t d = 0; d < max_depth; ++d) {
                 const int32_t pos = rollout_start + d;
 
-                // pos_all: all beams at depth d have the same position.
                 for (int32_t b = 0; b < n_beams; ++b) {
-                    pos_all[(size_t) d * n_beams + b] = pos;
+                    rt.async_buf.positions[(size_t) d * n_beams + b] = pos;
                 }
 
-                // kv_write_idxs: each beam writes to its slot at the current position.
                 for (int32_t b = 0; b < n_beams; ++b) {
-                    kv_idxs_all[(size_t) d * n_beams + b] = b * kv_cap + pos;
+                    rt.async_buf.k_idxs[(size_t) d * n_beams + b] = b * kv_cap + pos;
                 }
 
-                // mask: positions [0..pos] are visible (0.0f), rest is -inf.
                 const size_t mask_offset = (size_t) d * kv_cap;
                 for (int32_t i = 0; i <= pos; ++i) {
-                    mask_all[mask_offset + i] = ggml_fp32_to_fp16(0.0f);
+                    rt.async_buf.mask_data[mask_offset + i] = ggml_fp32_to_fp16(0.0f);
                 }
             }
 
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_pos_all,
-                    pos_all.data(), 0, pos_all.size() * sizeof(int32_t));
+                    rt.async_buf.positions.data(), 0, rt.async_buf.positions.size() * sizeof(int32_t));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_kv_write_idxs_all,
-                    kv_idxs_all.data(), 0, kv_idxs_all.size() * sizeof(int32_t));
+                    rt.async_buf.k_idxs.data(), 0, rt.async_buf.k_idxs.size() * sizeof(int32_t));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), mg.t_mask_all,
-                    mask_all.data(), 0, mask_all.size() * sizeof(ggml_fp16_t));
+                    rt.async_buf.mask_data.data(), 0, rt.async_buf.mask_data.size() * sizeof(ggml_fp16_t));
         }
 
         // ---- Single dispatch ----
@@ -6398,58 +6406,58 @@ bool llama_eagle3_fused_rollout(
                     root_state.dev->t_hidden, 0,
                     fg.t_hidden_in, 0, h_bytes);
             if (n_beams > 1) {
-                std::vector<float> zeros((size_t) hp.hidden_size * (size_t)(n_beams - 1), 0.0f);
+                rt.async_buf.hidden.assign((size_t) hp.hidden_size * (size_t)(n_beams - 1), 0.0f);
                 ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_hidden_in,
-                        zeros.data(), h_bytes, zeros.size() * sizeof(float));
+                        rt.async_buf.hidden.data(), h_bytes, rt.async_buf.hidden.size() * sizeof(float));
             }
         }
         {
-            std::vector<float> lp(n_beams, -1e30f);
-            lp[0] = 0.0f;
+            rt.async_buf.beam_logprobs.assign(n_beams, -1e30f);
+            rt.async_buf.beam_logprobs[0] = 0.0f;
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_beam_logprob,
-                    lp.data(), 0, lp.size() * sizeof(float));
+                    rt.async_buf.beam_logprobs.data(), 0, rt.async_buf.beam_logprobs.size() * sizeof(float));
         }
         if (max_fork_rows > 0 && fg.t_fork_row_offsets && fg.t_fork_dst_idxs) {
             const int32_t total_fork = max_fork_rows * n_beams;
-            std::vector<float>   fork_offsets(total_fork);
-            std::vector<int32_t> fork_dst(total_fork);
+            rt.async_buf.fork_offsets.resize(total_fork);
+            rt.async_buf.fork_dst_idxs.resize(total_fork);
             for (int32_t b = 0; b < n_beams; ++b) {
                 for (int32_t r = 0; r < max_fork_rows; ++r) {
                     const int32_t idx = b * max_fork_rows + r;
-                    fork_offsets[idx] = (float)(rollout_start + r);
-                    fork_dst[idx] = b * kv_cap + rollout_start + r;
+                    rt.async_buf.fork_offsets[idx] = (float)(rollout_start + r);
+                    rt.async_buf.fork_dst_idxs[idx] = b * kv_cap + rollout_start + r;
                 }
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_fork_row_offsets,
-                    fork_offsets.data(), 0, total_fork * sizeof(float));
+                    rt.async_buf.fork_offsets.data(), 0, total_fork * sizeof(float));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_fork_dst_idxs,
-                    fork_dst.data(), 0, total_fork * sizeof(int32_t));
+                    rt.async_buf.fork_dst_idxs.data(), 0, total_fork * sizeof(int32_t));
         }
 
         // ---- Depth loop ----
-        std::vector<int32_t> pos_host(n_beams);
-        std::vector<int32_t> kv_idxs(n_beams);
-        std::vector<ggml_fp16_t> mask_data(kv_cap, ggml_fp32_to_fp16(-INFINITY));
+        rt.async_buf.positions.resize(n_beams);
+        rt.async_buf.k_idxs.resize(n_beams);
+        rt.async_buf.mask_data.assign(kv_cap, ggml_fp32_to_fp16(-INFINITY));
         for (int32_t i = 0; i < rollout_start; ++i) {
-            mask_data[i] = ggml_fp32_to_fp16(0.0f);
+            rt.async_buf.mask_data[i] = ggml_fp32_to_fp16(0.0f);
         }
 
         for (int32_t depth = 0; depth < max_depth; ++depth) {
             const int32_t pos = rollout_start + depth;
 
-            std::fill(pos_host.begin(), pos_host.end(), pos);
+            std::fill(rt.async_buf.positions.begin(), rt.async_buf.positions.end(), pos);
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_pos_b,
-                    pos_host.data(), 0, n_beams * sizeof(int32_t));
+                    rt.async_buf.positions.data(), 0, n_beams * sizeof(int32_t));
 
             for (int32_t b = 0; b < n_beams; ++b) {
-                kv_idxs[b] = b * kv_cap + pos;
+                rt.async_buf.k_idxs[b] = b * kv_cap + pos;
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_kv_write_idxs,
-                    kv_idxs.data(), 0, n_beams * sizeof(int32_t));
+                    rt.async_buf.k_idxs.data(), 0, n_beams * sizeof(int32_t));
 
-            mask_data[pos] = ggml_fp32_to_fp16(0.0f);
+            rt.async_buf.mask_data[pos] = ggml_fp32_to_fp16(0.0f);
             ggml_backend_tensor_set_async(rt.backend_compute.get(), fg.t_mask,
-                    mask_data.data(), 0, kv_cap * sizeof(ggml_fp16_t));
+                    rt.async_buf.mask_data.data(), 0, kv_cap * sizeof(ggml_fp16_t));
 
             const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), fg.gf);
             if (status != GGML_STATUS_SUCCESS) {
@@ -6701,18 +6709,19 @@ bool llama_eagle3_prefill_chunked(
     auto fill_positions = [&](ggml_tensor * t_tok_g, ggml_tensor * t_pos_g,
                               ggml_tensor * t_k_idxs_g, ggml_tensor * t_v_idxs_g,
                               int32_t pos, int32_t n_tokens) {
+        rt.async_buf.tokens.assign(input_ids + pos, input_ids + pos + n_tokens);
         ggml_backend_tensor_set_async(rt.backend_compute.get(), t_tok_g,
-                input_ids + pos, 0, (size_t) n_tokens * sizeof(llama_token));
-        std::vector<int32_t> positions((size_t) n_tokens);
+                rt.async_buf.tokens.data(), 0, (size_t) n_tokens * sizeof(llama_token));
+        rt.async_buf.positions.resize((size_t) n_tokens);
         for (int32_t i = 0; i < n_tokens; ++i) {
-            positions[(size_t) i] = pos + i;
+            rt.async_buf.positions[(size_t) i] = pos + i;
         }
         ggml_backend_tensor_set_async(rt.backend_compute.get(), t_pos_g,
-                positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
+                rt.async_buf.positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
         ggml_backend_tensor_set_async(rt.backend_compute.get(), t_k_idxs_g,
-                positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
+                rt.async_buf.positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
         ggml_backend_tensor_set_async(rt.backend_compute.get(), t_v_idxs_g,
-                positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
+                rt.async_buf.positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     };
 
     // --- KV-only: single pass for all tokens except root ---------------------
@@ -6741,25 +6750,25 @@ bool llama_eagle3_prefill_chunked(
 
         // Token ids: real for [0,kv_only_count), pad with token 0 for the rest
         {
-            std::vector<llama_token> toks((size_t) graph_n, input_ids[0]);
-            std::memcpy(toks.data(), input_ids, (size_t) kv_only_count * sizeof(llama_token));
+            rt.async_buf.tokens.assign((size_t) graph_n, input_ids[0]);
+            std::memcpy(rt.async_buf.tokens.data(), input_ids, (size_t) kv_only_count * sizeof(llama_token));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_tok,
-                    toks.data(), 0, (size_t) graph_n * sizeof(llama_token));
+                    rt.async_buf.tokens.data(), 0, (size_t) graph_n * sizeof(llama_token));
         }
 
         // Positions and KV indices: real for [0,kv_only_count), extra slots
         // point to kv_only_count (root position, overwritten by root pass).
         {
-            std::vector<int32_t> positions((size_t) graph_n, kv_only_count);
+            rt.async_buf.positions.assign((size_t) graph_n, kv_only_count);
             for (int32_t i = 0; i < kv_only_count; ++i) {
-                positions[(size_t) i] = i;
+                rt.async_buf.positions[(size_t) i] = i;
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_pos,
-                    positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+                    rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_k_idxs,
-                    positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+                    rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_v_idxs,
-                    positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+                    rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
         }
 
         if (do_profile) { t_kv = ggml_time_us(); }
