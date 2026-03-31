@@ -2926,7 +2926,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.default_template_kwargs[item.key()] = item.value().dump();
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_CHAT_TEMPLATE_KWARGS"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_CHAT_TEMPLATE_KWARGS"));
     add_opt(common_arg(
         {"-to", "--timeout"}, "N",
         string_format("server read/write timeout in seconds (default: %d)", params.timeout_read),
@@ -3046,7 +3046,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.use_jinja = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
     add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
@@ -3057,7 +3057,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.reasoning_format = common_reasoning_format_from_name(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK"));
     add_opt(common_arg(
         {"-rea", "--reasoning"}, "[on|off|auto]",
         "Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))",
@@ -3075,7 +3075,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("error: unknown value for --reasoning: '%s'\n", value.c_str()));
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING"));
     add_opt(common_arg(
         {"--reasoning-budget"}, "N",
         "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
@@ -3083,14 +3083,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < -1) { throw std::invalid_argument("invalid value"); }
             params.reasoning_budget = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
         [](common_params & params, const std::string & value) {
             params.reasoning_budget_message = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
         string_format(
@@ -3102,7 +3102,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.chat_template = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
     add_opt(common_arg(
         {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
         string_format(
@@ -3114,7 +3114,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.chat_template = read_file(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
     add_opt(common_arg(
         {"--prefill-assistant"},
         {"--no-prefill-assistant"},

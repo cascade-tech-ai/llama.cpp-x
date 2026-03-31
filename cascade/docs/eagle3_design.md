@@ -53,5 +53,6 @@ Kestrel is the reference. When our outputs diverge from kestrel, we assume we ha
 
 - **Hidden state indexing**: Both use input-to-layer semantics. `layer_id=2` means input to block 2 = output of block 1 = HF `hidden_states[2]`.
 - **Draft logits**: Root logits should match within bf16 tolerance (~0.05 max abs diff, same top-10 ordering). Verified via `CASCADE_EAGLE_DUMP_DIR` env var which dumps all intermediate tensors as `.npy` files.
-- **Acceptance length**: Should be in the same ballpark for the same model and prompts. Exact trace match is not expected since the beam search implementations differ.
+- **Acceptance length**: This is the acceptance metric that matters for performance comparisons. It means accepted draft tokens per speculative cycle, and it should be in the same ballpark for the same model and prompts. Exact trace match is not expected since the beam search implementations differ.
+- **Draft acceptance rate** (`n_accept / n_drafted`): This is only a low-signal debugging ratio from the example binary. It is not the primary benchmark metric and can be misleading across different depth / proposal settings.
 - **GGUF conversion**: `cascade/tools/convert_eagle3_to_gguf.py` converts kestrel checkpoints to GGUF.

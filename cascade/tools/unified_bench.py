@@ -68,6 +68,12 @@ def parse_llama_spec_stdout(text: str) -> dict[str, Any]:
     }
 
 
+def draft_acceptance_rate(n_accept: int | None, n_drafted: int | None) -> float | None:
+    if n_accept is None or n_drafted is None or n_drafted <= 0:
+        return None
+    return n_accept / n_drafted
+
+
 def run_llama_spec(args: argparse.Namespace, prompt_info: dict[str, Any], persist_trace_path: Path | None) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="eagle-trace-") as tmpdir:
         trace_path = Path(tmpdir) / "llama_trace.yaml"
@@ -222,7 +228,17 @@ def run_kestrel_base(args: argparse.Namespace, prompt_info: dict[str, Any]) -> d
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run Kestrel or llama.cpp with a unified prompt pipeline and metrics output.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Run Kestrel or llama.cpp with a unified prompt pipeline and metrics output. "
+            "Acceptance length is the primary acceptance metric: accepted draft tokens per speculative cycle."
+        ),
+        epilog=(
+            "Metric note: prioritize acceptance_len when comparing runs. "
+            "The example binary's n_accept / n_drafted ratio is an auxiliary draft acceptance rate only; "
+            "it is not the main performance metric and is often misleading across different search settings."
+        ),
+    )
     ap.add_argument("--backend", choices=["llama", "kestrel"], required=True)
     ap.add_argument("--mode", choices=["spec", "base"], required=True)
     ap.add_argument("--dataset", required=True)
@@ -262,6 +278,7 @@ def main() -> None:
 
     observed_tokens = [int(tok) for tok in (result.get("prompt_tokens_observed") or [])]
     observed_hash = sha256_tokens(observed_tokens) if observed_tokens else None
+    rate = draft_acceptance_rate(result.get("n_accept"), result.get("n_drafted"))
 
     payload = {
         "backend": args.backend,
@@ -277,7 +294,14 @@ def main() -> None:
         "generated_count": result.get("generated_count"),
         "decode_seconds": result.get("decode_seconds"),
         "generation_tps": result.get("generation_tps"),
+        "primary_acceptance_metric": "acceptance_len",
+        "acceptance_len_definition": "accepted draft tokens / speculative cycle",
         "acceptance_len": result.get("acceptance_len"),
+        "draft_acceptance_rate_definition": "n_accept / n_drafted from llama-speculative-simple stdout; auxiliary only",
+        "draft_acceptance_rate_note": (
+            "Low-signal debugging metric. Do not treat this as the main performance metric when comparing search settings."
+        ),
+        "draft_acceptance_rate": rate,
         "n_accept": result.get("n_accept"),
         "n_drafted": result.get("n_drafted"),
         "trace_path": result.get("trace_path"),

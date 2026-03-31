@@ -341,6 +341,8 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
     auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
     const bool profile_spec = std::getenv("CASCADE_SPEC_PROFILE") != nullptr;
+    const bool template_supports_thinking = params.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
+    const bool enable_thinking = params.enable_reasoning != 0 && template_supports_thinking;
 
     // load the draft model (non-eagle3)
     llama_model_ptr model_dft;
@@ -415,6 +417,21 @@ int main(int argc, char ** argv) {
             inputs.use_jinja = params.use_jinja;
             inputs.messages = std::move(chat_msgs);
             inputs.add_generation_prompt = !params.prompt.empty();
+            inputs.reasoning_format = params.reasoning_format;
+            inputs.enable_thinking = enable_thinking;
+            inputs.chat_template_kwargs = params.default_template_kwargs;
+
+            const auto enable_thinking_kwarg = inputs.chat_template_kwargs.find("enable_thinking");
+            if (enable_thinking_kwarg != inputs.chat_template_kwargs.end()) {
+                if (enable_thinking_kwarg->second == "true") {
+                    inputs.enable_thinking = true;
+                } else if (enable_thinking_kwarg->second == "false") {
+                    inputs.enable_thinking = false;
+                } else if (!enable_thinking_kwarg->second.empty() && enable_thinking_kwarg->second[0] == '"') {
+                    LOG_ERR("%s: invalid type for \"enable_thinking\" (expected boolean, got string)\n", __func__);
+                    return 1;
+                }
+            }
 
             prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
         }

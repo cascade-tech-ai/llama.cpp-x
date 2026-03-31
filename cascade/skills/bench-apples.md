@@ -66,7 +66,8 @@ build/bin/llama-speculative-simple
 
 From the output:
 - **t/s**: from `decoded N tokens in X seconds, speed: Y t/s`
-- **Acceptance length**: `n_predict / (n_predict - n_accept)`
+- **Acceptance length**: accepted draft tokens per speculative cycle. When using traces, compute `sum(cycle.accepted_count) / len(cycles)`.
+- **Draft acceptance rate**: `n_accept / n_drafted` from the example binary. This is only a low-signal debugging ratio and should not be used as the main performance metric.
 - **Speedup**: `eagle_tps / baseline_tps`
 
 ## Last known good baselines (RTX 5090, 2026-03-24, commit 327b6f2fa)
@@ -102,3 +103,7 @@ Note: 4B is also too fast on RTX 5090. Acceptance length 2.3 matches kestrel exa
 ## What to report
 
 For each model config, report a table with: Model, Baseline t/s, EAGLE3 t/s, Speedup %, Acceptance Length. Compare against the baselines above to detect regressions.
+
+When reporting acceptance metrics:
+- Always report acceptance length, because that is the acceptance metric that matters for performance comparisons.
+- Do not substitute draft acceptance rate for acceptance length.
