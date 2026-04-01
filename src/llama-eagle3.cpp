@@ -818,13 +818,19 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     rt.tensors_compute.ffn_up_b      = dup(model.tensors.ffn_up_b);
     rt.tensors_compute.ffn_down_b    = dup(model.tensors.ffn_down_b);
 
-    // tok_embd lives on the base model's backend — must be copied to the eagle
-    // head's backend to avoid cross-backend memory access (causes UVM faults on
-    // RTX 5090 and illegal memory access on A40).
+    // tok_embd lives on the base model's backend and rope_factors in host memory.
+    // Both must be copied to the eagle head's compute backend to avoid
+    // cross-backend / host-device memory access faults (UVM crashes on RTX 5090,
+    // illegal memory access on A40).
     ggml_tensor * tok_embd_compute = nullptr;
     if (rt.tok_embd) {
         tok_embd_compute = ggml_dup_tensor(rt.ctx_weights_compute.get(), rt.tok_embd);
         ggml_set_name(tok_embd_compute, "tok_embd_compute");
+    }
+    ggml_tensor * rope_factors_compute = nullptr;
+    if (rt.rope_factors) {
+        rope_factors_compute = ggml_dup_tensor(rt.ctx_weights_compute.get(), rt.rope_factors);
+        ggml_set_name(rope_factors_compute, "rope_factors_compute");
     }
 
     rt.buf_weights_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.ctx_weights_compute.get(), rt.buft_compute));
@@ -841,6 +847,14 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     if (rt.tok_embd && tok_embd_compute) {
         ggml_backend_tensor_copy(rt.tok_embd, tok_embd_compute);
         rt.tok_embd = tok_embd_compute;
+    }
+
+    // rope_factors is allocated in host memory for CPU fallback. Copy it to the
+    // compute backend so CUDA kernels can access it without cross-memory faults.
+    if (rt.rope_factors && rope_factors_compute) {
+        const size_t rf_bytes = ggml_nbytes(rt.rope_factors);
+        ggml_backend_tensor_set(rope_factors_compute, rt.rope_factors->data, 0, rf_bytes);
+        rt.rope_factors = rope_factors_compute;
     }
 
     copy(model.tensors.fc_w,          rt.tensors_compute.fc_w);
@@ -4112,8 +4126,11 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
             zero_tensor(ps->r_graph.t_k_idxs);
             zero_tensor(ps->r_graph.t_v_idxs);
             for (auto * t : ps->r_graph.t_hidden_layers) { zero_tensor(t); }
+            // Warm up the KV-only graph (no attention, safe with zero inputs).
+            // Skip root graph warmup: it includes flash attention which crashes
+            // on some GPUs (A40) with all-zero Q/K/V inputs. The first real
+            // prefill call pays ~20ms of JIT cost for the root graph instead.
             ggml_backend_graph_compute_async(rt.backend_compute.get(), ps->kv_graph.gf);
-            ggml_backend_graph_compute_async(rt.backend_compute.get(), ps->r_graph.gf);
             ggml_backend_synchronize(rt.backend_compute.get());
             ps->warmed_up = true;
             rt.prefill_state = std::move(ps);
