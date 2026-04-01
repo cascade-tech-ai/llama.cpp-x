@@ -818,6 +818,15 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
     rt.tensors_compute.ffn_up_b      = dup(model.tensors.ffn_up_b);
     rt.tensors_compute.ffn_down_b    = dup(model.tensors.ffn_down_b);
 
+    // tok_embd lives on the base model's backend — must be copied to the eagle
+    // head's backend to avoid cross-backend memory access (causes UVM faults on
+    // RTX 5090 and illegal memory access on A40).
+    ggml_tensor * tok_embd_compute = nullptr;
+    if (rt.tok_embd) {
+        tok_embd_compute = ggml_dup_tensor(rt.ctx_weights_compute.get(), rt.tok_embd);
+        ggml_set_name(tok_embd_compute, "tok_embd_compute");
+    }
+
     rt.buf_weights_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.ctx_weights_compute.get(), rt.buft_compute));
     if (!rt.buf_weights_compute) {
         return false;
@@ -828,6 +837,11 @@ bool copy_weight_tensors_to_backend(const llama_eagle3_model & model, llama_eagl
             ggml_backend_tensor_copy(src, dst);
         }
     };
+
+    if (rt.tok_embd && tok_embd_compute) {
+        ggml_backend_tensor_copy(rt.tok_embd, tok_embd_compute);
+        rt.tok_embd = tok_embd_compute;
+    }
 
     copy(model.tensors.fc_w,          rt.tensors_compute.fc_w);
     copy(model.tensors.norm_w,        rt.tensors_compute.norm_w);
