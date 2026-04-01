@@ -4104,10 +4104,14 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
                 std::vector<uint8_t> zeros(nbytes, 0);
                 ggml_backend_tensor_set(t, zeros.data(), 0, nbytes);
             };
+            zero_tensor(ps->kv_graph.t_tok);
             zero_tensor(ps->kv_graph.t_k_idxs);
             zero_tensor(ps->kv_graph.t_v_idxs);
+            for (auto * t : ps->kv_graph.t_hidden_layers) { zero_tensor(t); }
+            zero_tensor(ps->r_graph.t_tok);
             zero_tensor(ps->r_graph.t_k_idxs);
             zero_tensor(ps->r_graph.t_v_idxs);
+            for (auto * t : ps->r_graph.t_hidden_layers) { zero_tensor(t); }
             ggml_backend_graph_compute_async(rt.backend_compute.get(), ps->kv_graph.gf);
             ggml_backend_graph_compute_async(rt.backend_compute.get(), ps->r_graph.gf);
             ggml_backend_synchronize(rt.backend_compute.get());
