@@ -260,6 +260,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
+    // Keep conv_input alive for conv state extraction during speculative commit
+    if (!recurrent_parent_index.empty()) {
+        ggml_set_output(conv_input);
+        res->t_conv_input[il] = conv_input;
+    }
+
     // Update convolution state cache
     // Extract the last (conv_kernel_size - 1) states from conv_input
     ggml_tensor * last_conv_states =
