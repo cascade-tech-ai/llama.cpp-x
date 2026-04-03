@@ -497,6 +497,24 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+class llm_graph_input_recurrent_parent : public llm_graph_input_i {
+public:
+    llm_graph_input_recurrent_parent(const std::vector<int32_t> & data) : data(data) {}
+    virtual ~llm_graph_input_recurrent_parent() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        if (parent_index && !data.empty()) {
+            const size_t n = std::min(data.size(), (size_t) ggml_nelements(parent_index));
+            ggml_backend_tensor_set(parent_index, data.data(), 0, n * sizeof(int32_t));
+        }
+    }
+
+    ggml_tensor * parent_index = nullptr;
+
+    const std::vector<int32_t> data;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -563,6 +581,10 @@ struct llm_graph_params {
 
     std::vector<int32_t> eagle3_layer_ids;
 
+    // per-token parent indices for recurrent state caching (speculative decoding)
+    // empty = disabled; otherwise size == n_tokens
+    std::vector<int32_t> recurrent_parent_index;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -605,6 +627,11 @@ struct llm_graph_params {
         }
 
         if (eagle3_layer_ids != other.eagle3_layer_ids) {
+            return false;
+        }
+
+        // graph topology changes when recurrent caching is enabled/disabled
+        if (recurrent_parent_index.empty() != other.recurrent_parent_index.empty()) {
             return false;
         }
 
@@ -682,6 +709,11 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
 
     std::map<int32_t, ggml_tensor*> t_eagle3_hidden;
+
+    // per-layer state caches for speculative decoding with hybrid models
+    // set by recurrent layers when parent_index is active
+    std::map<int32_t, ggml_tensor*> t_state_cache;   // delta-net state cache
+    std::map<int32_t, ggml_tensor*> t_conv_input;     // conv_input tensor (for conv state extraction)
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -761,6 +793,9 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const std::vector<int32_t> eagle3_layer_ids;
+
+    // per-token parent indices for recurrent state caching (speculative decoding)
+    const std::vector<int32_t> recurrent_parent_index;
 
     const llm_graph_cb & cb_func;
 

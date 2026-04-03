@@ -1086,6 +1086,130 @@ void llama_context::clear_rope_pos_override() {
     }
 }
 
+void llama_context::set_recurrent_parent_index(const int32_t * data, uint32_t n_tokens) {
+    recurrent_parent_index_data.assign(data, data + n_tokens);
+}
+
+void llama_context::clear_recurrent_parent_index() {
+    recurrent_parent_index_data.clear();
+}
+
+void llama_context::recurrent_state_commit(int32_t accepted_batch_pos, llama_pos new_pos) {
+    // After speculative decoding verification, commit the accepted token's
+    // recurrent state from the state_cache back to persistent storage.
+    // The graph wrote the LAST token's state to persistent storage via ggml_cpy,
+    // so we need to overwrite it with the accepted token's state from the cache.
+    // Also update the recurrent cell's tracked position so subsequent seq_rm works.
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem_hybrid) {
+        return;
+    }
+    auto * mem_recr = mem_hybrid->get_mem_recr();
+    if (!mem_recr) {
+        return;
+    }
+
+    auto * res = gf_res_prev.get();
+    if (!res) {
+        return;
+    }
+
+    const int64_t n_embd_s = model.hparams.n_embd_s();
+
+    // Delta-net state commit: GPU→GPU copy via ggml_backend_tensor_copy with views.
+    // This avoids the GPU→CPU→GPU round-trip that dominated commit time (~10 ms).
+    {
+        // Allocate a temporary ggml context for view tensors (no tensor data, just metadata)
+        const size_t n_layers = res->t_state_cache.size();
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ (2 * n_layers + 1) * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        for (auto & [il, cache_tensor] : res->t_state_cache) {
+            if (!cache_tensor) {
+                continue;
+            }
+
+            ggml_tensor * s_l = mem_recr->s_l[(size_t) il];
+            if (!s_l) {
+                continue;
+            }
+
+            const uint32_t kv_head = mem_recr->head;
+            const size_t src_offset = (size_t) accepted_batch_pos * n_embd_s * sizeof(float);
+            const size_t dst_offset = (size_t) kv_head * n_embd_s * ggml_element_size(s_l);
+
+            // Create 1D views into the source (state_cache) and destination (s_l) tensors.
+            // Both are already allocated on the GPU, so the view data pointers are valid
+            // device pointers at the correct offsets.
+            ggml_tensor * src_view = ggml_view_1d(ctx0, cache_tensor, n_embd_s, src_offset);
+            ggml_tensor * dst_view = ggml_view_1d(ctx0, s_l, n_embd_s, dst_offset);
+
+            // Set buffer fields so ggml_backend_tensor_copy can identify the backend
+            // and use cudaMemcpyAsync(DeviceToDevice) instead of bouncing through host.
+            src_view->buffer = cache_tensor->buffer;
+            dst_view->buffer = s_l->buffer;
+
+            ggml_backend_tensor_copy(src_view, dst_view);
+        }
+
+        ggml_free(ctx0);
+    }
+
+    // Commit conv state: extract the correct conv state from conv_input for each layer.
+    // conv_input shape: [d_conv-1 + n_seq_tokens, conv_channels, n_seqs]
+    // Conv state after batch token k is columns [k+1 .. k+d_conv-1] of conv_input.
+    const int64_t n_embd_r = model.hparams.n_embd_r();
+    const int64_t d_conv_minus_1 = model.hparams.ssm_d_conv > 0 ? model.hparams.ssm_d_conv - 1 : 0;
+
+    for (auto & [il, conv_input_tensor] : res->t_conv_input) {
+        if (!conv_input_tensor) {
+            continue;
+        }
+
+        ggml_tensor * r_l = mem_recr->r_l[(size_t) il];
+        if (!r_l) {
+            continue;
+        }
+
+        const uint32_t kv_head = mem_recr->head;
+
+        // conv_input is [n_cols, conv_channels, n_seqs] where n_cols = d_conv-1 + n_seq_tokens
+        const int64_t n_cols = conv_input_tensor->ne[0];
+        const int64_t n_chan = conv_input_tensor->ne[1];
+        const int64_t elem_size = ggml_element_size(conv_input_tensor);
+
+        // Copy entire conv_input to host in one transfer, then extract on CPU
+        std::vector<float> ci_host(ggml_nelements(conv_input_tensor));
+        ggml_backend_tensor_get(conv_input_tensor, ci_host.data(), 0, ggml_nbytes(conv_input_tensor));
+
+        // Extract conv state for accepted token k: columns [k+1 .. k+d_conv-1]
+        // Rearrange from [n_cols, channels] to [d_conv-1, channels] (r_l layout)
+        std::vector<float> conv_state(n_embd_r);
+        for (int64_t ch = 0; ch < n_chan; ch++) {
+            for (int64_t d = 0; d < d_conv_minus_1; d++) {
+                conv_state[d + ch * d_conv_minus_1] =
+                    ci_host[(accepted_batch_pos + 1 + d) + ch * n_cols];
+            }
+        }
+
+        const size_t dst_offset = (size_t) kv_head * n_embd_r * ggml_element_size(r_l);
+        ggml_backend_tensor_set(r_l, conv_state.data(), dst_offset, n_embd_r * elem_size);
+    }
+
+    // Update the recurrent cell's tracked position to the accepted token's position.
+    // This is critical: without it, seq_rm(seq_id, p0, -1) will fail because it
+    // refuses to partially erase a state whose pos > p0.
+    const int32_t tail_id = mem_recr->cells[0].tail;
+    if (tail_id >= 0) {
+        mem_recr->cells[tail_id].pos = new_pos;
+    }
+
+}
+
 float * llama_context::get_logits() {
     output_reorder();
 
@@ -2494,6 +2618,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.eagle3_layer_ids =*/ eagle3_layer_ids,
+        /*.recurrent_parent_index =*/ recurrent_parent_index_data,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3542,6 +3667,27 @@ void llama_clear_rope_pos_override(struct llama_context * ctx) {
         return;
     }
     ctx->clear_rope_pos_override();
+}
+
+void llama_set_recurrent_parent_index(struct llama_context * ctx, const int32_t * parent, uint32_t n_tokens) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_recurrent_parent_index(parent, n_tokens);
+}
+
+void llama_clear_recurrent_parent_index(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_recurrent_parent_index();
+}
+
+void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos, llama_pos new_pos) {
+    if (!ctx) {
+        return;
+    }
+    ctx->recurrent_state_commit(accepted_batch_pos, new_pos);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

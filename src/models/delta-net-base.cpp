@@ -420,6 +420,46 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {output, new_state};
 }
 
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_fused_cached(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        ggml_tensor * parent_index,
+        ggml_tensor * state_cache,
+        int           il) {
+    const int64_t S_k      = q->ne[0];
+    const int64_t H_k      = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+
+    GGML_ASSERT(S_k == S_v);
+    GGML_ASSERT(H_v % H_k == 0);
+
+    ggml_tensor * result = ggml_gated_delta_net_cached(ctx0, q, k, v, g, b, s, parent_index, state_cache);
+    cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
+
+    ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+    return {output, new_state};
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -427,8 +467,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * parent_index,
+        ggml_tensor * state_cache) {
     const int64_t n_seq_tokens = q->ne[2];
+
+    // Cached mode: always use fused kernel
+    if (parent_index != nullptr && state_cache != nullptr) {
+        return build_delta_net_fused_cached(q, k, v, g, b, s, parent_index, state_cache, il);
+    }
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {

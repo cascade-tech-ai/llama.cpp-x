@@ -261,6 +261,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
+    // Keep conv_input alive for conv state extraction during speculative commit
+    if (!recurrent_parent_index.empty()) {
+        ggml_set_output(conv_input);
+        res->t_conv_input[il] = conv_input;
+    }
+
     // Update convolution state cache
     // Extract the last (conv_kernel_size - 1) states from conv_input
     ggml_tensor * last_conv_states =
@@ -335,7 +341,34 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    // Create parent_index and state_cache tensors for speculative state caching
+    ggml_tensor * t_parent_index = nullptr;
+    ggml_tensor * t_state_cache  = nullptr;
+
+    if (!recurrent_parent_index.empty()) {
+        // parent_index: I32 [n_seq_tokens * n_seqs]
+        t_parent_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seq_tokens * n_seqs);
+        ggml_set_name(t_parent_index, "parent_index");
+        ggml_set_input(t_parent_index);
+
+        // Register graph input to populate parent_index before compute
+        auto inp_parent = std::make_unique<llm_graph_input_recurrent_parent>(recurrent_parent_index);
+        inp_parent->parent_index = t_parent_index;
+        res->add_input(std::move(inp_parent));
+
+        // state_cache: F32 [n_embd_s * n_seq_tokens]
+        // n_embd_s = head_v_dim * head_v_dim * num_v_heads (per seq, but we process n_seqs)
+        const int64_t state_elems = head_v_dim * head_v_dim * num_v_heads * n_seqs * n_seq_tokens;
+        t_state_cache = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, state_elems);
+        ggml_set_name(t_state_cache, "state_cache");
+        ggml_set_output(t_state_cache); // keep alive after graph execution
+
+        // Store in graph result for post-decode state commit
+        res->t_state_cache[il] = t_state_cache;
+    }
+
+    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il,
+                                     t_parent_index, t_state_cache);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;

@@ -513,11 +513,6 @@ int main(int argc, char ** argv) {
     const bool is_hybrid = llama_model_is_hybrid(model_tgt);
     const bool use_flat_tree = !is_hybrid && (std::getenv("COUPLED_TREE") == nullptr);
     bool flat_tree_diverged = false; // once true, cache positions diverge from rope positions
-    // For hybrid models during linear verification, we use a temporary seq to
-    // save/restore the recurrent state (which can't be partially rolled back).
-    // Must be < n_seq_max (= n_parallel) so the recurrent memory accepts it.
-    // Tree verification is disabled for hybrid models, so branch seq_ids are unused.
-    const llama_seq_id hybrid_save_seq = (llama_seq_id)(llama_n_seq_max(ctx_tgt) - 1);
 
     const int max_tree_seq_ids = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3
         ? std::max(1, params.speculative.eagle_max_proposals + 1)
@@ -637,12 +632,16 @@ int main(int argc, char ** argv) {
                     }
                     llama_set_rope_pos_override(ctx_tgt, (uint32_t) rope_pos.size(), rope_pos.data());
                 } else {
-                    // For hybrid models, save the recurrent state before processing drafts.
-                    // The recurrent state can't be partially rolled back, so we need to
-                    // restore it if any drafts are rejected.
+                    // For hybrid models, use per-token recurrent state caching
+                    // instead of save/restore/replay.
                     if (is_hybrid && !draft.empty()) {
-                        llama_memory_seq_rm(mem, hybrid_save_seq, -1, -1);
-                        llama_memory_seq_cp(mem, 0, hybrid_save_seq, -1, -1);
+                        std::vector<int32_t> serial_parents(1 + draft.size());
+                        serial_parents[0] = -1; // root uses persistent state
+                        for (size_t i = 1; i < serial_parents.size(); ++i) {
+                            serial_parents[i] = (int32_t)(i - 1);
+                        }
+                        llama_set_recurrent_parent_index(ctx_tgt, serial_parents.data(),
+                                                         (uint32_t) serial_parents.size());
                     }
                     common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
                     for (size_t i = 0; i < draft.size(); ++i) {
@@ -833,31 +832,14 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, remove_from, -1);
                     llama_clear_rope_pos_override(ctx_tgt);
                 } else if (is_hybrid && !draft.empty()) {
-                    // For hybrid models, the recurrent state can't be partially rolled back.
-                    // Restore the saved state (at position n_past_before - 1) and replay
-                    // only the accepted tokens to rebuild both KV cache and recurrent state.
-                    auto * mem = llama_get_memory(ctx_tgt);
+                    // Commit the accepted token's recurrent state from the per-token cache
+                    // to persistent storage, then clear the parent index.
+                    const int accepted_batch_pos = (int) ids_limited.size() - 1;
+                    llama_recurrent_state_commit(ctx_tgt, accepted_batch_pos, n_past - 1);
+                    llama_clear_recurrent_parent_index(ctx_tgt);
 
-                    // Clear seq 0 entirely (both attention KV and recurrent state)
-                    llama_memory_seq_rm(mem, 0, -1, -1);
-                    // Restore the saved state from before draft processing
-                    llama_memory_seq_cp(mem, hybrid_save_seq, 0, -1, -1);
-                    // Clean up the temporary save sequence
-                    llama_memory_seq_rm(mem, hybrid_save_seq, -1, -1);
-
-                    // Replay accepted tokens through the full target model to rebuild
-                    // both the attention KV cache and the recurrent state.
-                    // prompt_tgt[n_past_before .. n_past-1] contains the original id_last
-                    // followed by the accepted draft tokens (pushed during the acceptance loop).
-                    const int n_replay = n_past - n_past_before;
-                    GGML_ASSERT(n_replay > 0 && n_replay == (int) ids_limited.size());
-                    llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
-                    common_batch_clear(replay_batch);
-                    for (int i = 0; i < n_replay; i++) {
-                        common_batch_add(replay_batch, prompt_tgt[(size_t)(n_past_before + i)], n_past_before + i, { 0 }, false);
-                    }
-                    llama_decode(ctx_tgt, replay_batch);
-                    llama_batch_free(replay_batch);
+                    // Remove rejected draft tokens from attention KV cache
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
                 }
