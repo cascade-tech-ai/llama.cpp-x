@@ -2484,6 +2484,21 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // Cached variant: per-token state caching with parent-indexed state loading.
+    // parent_index[t] == -1 means load from initial state; parent_index[t] == p means
+    // load from state_cache slot p. After each token, state is saved to state_cache[t].
+    // Used for speculative decoding verification with hybrid (recurrent+attention) models.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_cached(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent_index,
+            struct ggml_tensor  * state_cache);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

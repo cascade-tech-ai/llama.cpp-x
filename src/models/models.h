@@ -55,6 +55,18 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // fused operator with per-token state caching for speculative decoding
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused_cached(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                ggml_tensor * parent_index,
+                ggml_tensor * state_cache,
+                        int   il);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
@@ -63,7 +75,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * parent_index = nullptr,
+                ggml_tensor * state_cache  = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

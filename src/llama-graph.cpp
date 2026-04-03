@@ -893,6 +893,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     eagle3_layer_ids (params.eagle3_layer_ids),
+    recurrent_parent_index(params.recurrent_parent_index),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

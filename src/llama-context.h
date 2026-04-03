@@ -266,6 +266,10 @@ public:
     void set_rope_pos_override(const llama_pos * data, uint32_t n);
     void clear_rope_pos_override();
 
+    void set_recurrent_parent_index(const int32_t * data, uint32_t n_tokens);
+    void clear_recurrent_parent_index();
+    void recurrent_state_commit(int32_t accepted_batch_pos);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -377,6 +381,9 @@ private:
     std::vector<eagle3_hidden_capture_layer> eagle3_capture;
     uint32_t eagle3_capture_n_tokens = 0;
     uint32_t eagle3_capture_capacity = 0;
+
+    // per-token parent indices for recurrent state caching (speculative decoding)
+    std::vector<int32_t> recurrent_parent_index_data;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

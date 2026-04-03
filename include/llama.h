@@ -1077,6 +1077,20 @@ extern "C" {
     // Clear any active RoPE position override.
     LLAMA_API void llama_clear_rope_pos_override(struct llama_context * ctx);
 
+    // Set per-token parent indices for recurrent state caching during speculative verification.
+    // parent[t] == -1: token t uses the persistent recurrent state.
+    // parent[t] == p:  token t uses the output state from token p in this batch.
+    // Used with hybrid (recurrent+attention) models to avoid save/restore/replay.
+    LLAMA_API void llama_set_recurrent_parent_index(struct llama_context * ctx, const int32_t * parent, uint32_t n_tokens);
+
+    // Clear any active recurrent parent index override.
+    LLAMA_API void llama_clear_recurrent_parent_index(struct llama_context * ctx);
+
+    // After speculative verification with recurrent parent indices, commit the recurrent
+    // state from the given batch position back to persistent storage.
+    // Call this after sampling determines which draft token was accepted.
+    LLAMA_API void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

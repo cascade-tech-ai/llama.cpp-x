@@ -10470,12 +10470,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     int64_t ir0,
     int64_t ir1) {
 
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q            = dst->src[0];
+    ggml_tensor * src_k            = dst->src[1];
+    ggml_tensor * src_v            = dst->src[2];
+    ggml_tensor * src_g            = dst->src[3];
+    ggml_tensor * src_beta         = dst->src[4];
+    ggml_tensor * src_state        = dst->src[5];
+    ggml_tensor * src_parent_index = dst->src[6]; // optional
+    ggml_tensor * src_state_cache  = dst->src[7]; // optional
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10488,6 +10490,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+
+    const int32_t * parent_index = src_parent_index ? (const int32_t *) src_parent_index->data : nullptr;
+    float *         state_cache  = src_state_cache  ? (float *) src_state_cache->data          : nullptr;
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -10526,6 +10531,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // state_cache layout: [n_tokens][n_seqs][H][S_v][S_v]
+    const int64_t cache_head_stride = S_v * S_v;
+    const int64_t cache_seq_stride  = cache_head_stride * H;
+    const int64_t cache_tok_stride  = cache_seq_stride * n_seqs;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
@@ -10538,14 +10548,30 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (parent_index == nullptr) {
+            // Non-cached: copy input state into output buffer and operate in-place
+            const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
         for (int64_t t = 0; t < n_tokens; t++) {
+            // Cached mode: load state from parent or initial state
+            if (parent_index != nullptr) {
+                const int32_t parent = parent_index[iv3 * n_tokens + t];
+                const float * src_state_ptr;
+                if (parent == -1) {
+                    src_state_ptr = state_in_base + (iv3 * H + iv1) * S_v * S_v;
+                } else {
+                    src_state_ptr = state_cache + parent * cache_tok_stride
+                                  + iv3 * cache_seq_stride
+                                  + iv1 * cache_head_stride;
+                }
+                memcpy(s_out, src_state_ptr, S_v * S_v * sizeof(float));
+            }
+
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
@@ -10586,6 +10612,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
+            }
+
+            // Save state to cache after each token
+            if (parent_index != nullptr) {
+                float * cache_slot = state_cache + t * cache_tok_stride
+                                   + iv3 * cache_seq_stride
+                                   + iv1 * cache_head_stride;
+                memcpy(cache_slot, s_out, S_v * S_v * sizeof(float));
             }
 
             attn_data += S_v * H; // advance to next token

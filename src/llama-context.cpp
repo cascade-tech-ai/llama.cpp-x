@@ -1094,6 +1094,60 @@ void llama_context::clear_rope_pos_override() {
     }
 }
 
+void llama_context::set_recurrent_parent_index(const int32_t * data, uint32_t n_tokens) {
+    recurrent_parent_index_data.assign(data, data + n_tokens);
+}
+
+void llama_context::clear_recurrent_parent_index() {
+    recurrent_parent_index_data.clear();
+}
+
+void llama_context::recurrent_state_commit(int32_t accepted_batch_pos) {
+    // After speculative decoding verification, commit the accepted token's
+    // recurrent state from the state_cache back to persistent storage.
+    // The graph wrote the LAST token's state to persistent storage via ggml_cpy,
+    // so we need to overwrite it with the accepted token's state from the cache.
+    auto * res = gf_res_prev.get();
+    if (!res) {
+        return;
+    }
+
+    const int64_t n_embd_s = model.hparams.n_embd_s();
+
+    for (auto & [il, cache_tensor] : res->t_state_cache) {
+        if (!cache_tensor) {
+            continue;
+        }
+
+        // Find the persistent s_l tensor via the memory hierarchy
+        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (!mem_hybrid) {
+            continue;
+        }
+        auto * mem_recr = mem_hybrid->get_mem_recr();
+        if (!mem_recr) {
+            continue;
+        }
+
+        ggml_tensor * s_l = mem_recr->s_l[(size_t) il];
+        if (!s_l) {
+            continue;
+        }
+
+        const uint32_t kv_head = mem_recr->head;
+
+        // state_cache layout: [n_tokens * n_embd_s] (flat for n_seqs=1)
+        // offset for token t = t * n_embd_s * sizeof(float)
+        const size_t src_offset = (size_t) accepted_batch_pos * n_embd_s * sizeof(float);
+        const size_t dst_offset = (size_t) kv_head * n_embd_s * ggml_element_size(s_l);
+
+        // Copy from state_cache[accepted_pos] to persistent s_l[kv_head]
+        std::vector<float> buf(n_embd_s);
+        ggml_backend_tensor_get(cache_tensor, buf.data(), src_offset, n_embd_s * sizeof(float));
+        ggml_backend_tensor_set(s_l, buf.data(), dst_offset, n_embd_s * sizeof(float));
+    }
+}
+
 float * llama_context::get_logits() {
     output_reorder();
 
@@ -2485,6 +2539,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.eagle3_layer_ids =*/ eagle3_layer_ids,
+        /*.recurrent_parent_index =*/ recurrent_parent_index_data,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3533,6 +3588,27 @@ void llama_clear_rope_pos_override(struct llama_context * ctx) {
         return;
     }
     ctx->clear_rope_pos_override();
+}
+
+void llama_set_recurrent_parent_index(struct llama_context * ctx, const int32_t * parent, uint32_t n_tokens) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_recurrent_parent_index(parent, n_tokens);
+}
+
+void llama_clear_recurrent_parent_index(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->clear_recurrent_parent_index();
+}
+
+void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos) {
+    if (!ctx) {
+        return;
+    }
+    ctx->recurrent_state_commit(accepted_batch_pos);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
