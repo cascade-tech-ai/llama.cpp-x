@@ -1087,9 +1087,10 @@ extern "C" {
     LLAMA_API void llama_clear_recurrent_parent_index(struct llama_context * ctx);
 
     // After speculative verification with recurrent parent indices, commit the recurrent
-    // state from the given batch position back to persistent storage.
+    // state from the given batch position back to persistent storage and update the
+    // recurrent cell's tracked position to new_pos (the last accepted token's position).
     // Call this after sampling determines which draft token was accepted.
-    LLAMA_API void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos);
+    LLAMA_API void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos, llama_pos new_pos);
 
     //
     // backend sampling API [EXPERIMENTAL]

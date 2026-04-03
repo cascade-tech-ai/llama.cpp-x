@@ -827,7 +827,7 @@ int main(int argc, char ** argv) {
                     // Commit the accepted token's recurrent state from the per-token cache
                     // to persistent storage, then clear the parent index.
                     const int accepted_batch_pos = (int) ids_limited.size() - 1;
-                    llama_recurrent_state_commit(ctx_tgt, accepted_batch_pos);
+                    llama_recurrent_state_commit(ctx_tgt, accepted_batch_pos, n_past - 1);
                     llama_clear_recurrent_parent_index(ctx_tgt);
 
                     // Remove rejected draft tokens from attention KV cache

@@ -504,7 +504,7 @@ public:
 
     ggml_tensor * parent_index = nullptr;
 
-    const std::vector<int32_t> & data;
+    const std::vector<int32_t> data;
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {

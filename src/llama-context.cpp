@@ -1102,11 +1102,21 @@ void llama_context::clear_recurrent_parent_index() {
     recurrent_parent_index_data.clear();
 }
 
-void llama_context::recurrent_state_commit(int32_t accepted_batch_pos) {
+void llama_context::recurrent_state_commit(int32_t accepted_batch_pos, llama_pos new_pos) {
     // After speculative decoding verification, commit the accepted token's
     // recurrent state from the state_cache back to persistent storage.
     // The graph wrote the LAST token's state to persistent storage via ggml_cpy,
     // so we need to overwrite it with the accepted token's state from the cache.
+    // Also update the recurrent cell's tracked position so subsequent seq_rm works.
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem_hybrid) {
+        return;
+    }
+    auto * mem_recr = mem_hybrid->get_mem_recr();
+    if (!mem_recr) {
+        return;
+    }
+
     auto * res = gf_res_prev.get();
     if (!res) {
         return;
@@ -1116,16 +1126,6 @@ void llama_context::recurrent_state_commit(int32_t accepted_batch_pos) {
 
     for (auto & [il, cache_tensor] : res->t_state_cache) {
         if (!cache_tensor) {
-            continue;
-        }
-
-        // Find the persistent s_l tensor via the memory hierarchy
-        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
-        if (!mem_hybrid) {
-            continue;
-        }
-        auto * mem_recr = mem_hybrid->get_mem_recr();
-        if (!mem_recr) {
             continue;
         }
 
@@ -1145,6 +1145,14 @@ void llama_context::recurrent_state_commit(int32_t accepted_batch_pos) {
         std::vector<float> buf(n_embd_s);
         ggml_backend_tensor_get(cache_tensor, buf.data(), src_offset, n_embd_s * sizeof(float));
         ggml_backend_tensor_set(s_l, buf.data(), dst_offset, n_embd_s * sizeof(float));
+    }
+
+    // Update the recurrent cell's tracked position to the accepted token's position.
+    // This is critical: without it, seq_rm(seq_id, p0, -1) will fail because it
+    // refuses to partially erase a state whose pos > p0.
+    const int32_t tail_id = mem_recr->cells[0].tail;
+    if (tail_id >= 0) {
+        mem_recr->cells[tail_id].pos = new_pos;
     }
 }
 
@@ -3604,11 +3612,11 @@ void llama_clear_recurrent_parent_index(struct llama_context * ctx) {
     ctx->clear_recurrent_parent_index();
 }
 
-void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos) {
+void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos, llama_pos new_pos) {
     if (!ctx) {
         return;
     }
-    ctx->recurrent_state_commit(accepted_batch_pos);
+    ctx->recurrent_state_commit(accepted_batch_pos, new_pos);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

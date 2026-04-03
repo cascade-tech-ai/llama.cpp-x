@@ -268,7 +268,7 @@ public:
 
     void set_recurrent_parent_index(const int32_t * data, uint32_t n_tokens);
     void clear_recurrent_parent_index();
-    void recurrent_state_commit(int32_t accepted_batch_pos);
+    void recurrent_state_commit(int32_t accepted_batch_pos, llama_pos new_pos);
 
 private:
     llm_graph_params graph_params(
