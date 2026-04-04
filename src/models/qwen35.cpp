@@ -257,40 +257,107 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
-    cb(conv_input, "conv_input", il);
+    ggml_tensor * conv_qkv_mix;
+    ggml_tensor * state_predelta = nullptr;
 
-    // Keep conv_input alive for conv state extraction during speculative commit
-    if (!recurrent_parent_index.empty()) {
-        ggml_set_output(conv_input);
-        res->t_conv_input[il] = conv_input;
+    if (!recurrent_parent_index.empty() && n_seq_tokens > 1) {
+        // Per-token conv unrolling for tree/serial speculative decoding.
+        // Each token loads its parent's conv state instead of using sequential order.
+        // Tokens are sorted by depth (parents before children) so dependencies are safe.
+        const int64_t d_conv_minus_1 = conv_kernel_size - 1;
+
+        // Per-token conv state cache (separate tensors on GPU, kept alive via OUTPUT flag)
+        std::vector<ggml_tensor *> pt_conv_states(n_seq_tokens);
+        auto & conv_cache_vec = res->t_conv_state_cache[il];
+        conv_cache_vec.resize(n_seq_tokens, nullptr);
+
+        ggml_tensor * conv_output_accum = nullptr;
+
+        for (int64_t t = 0; t < n_seq_tokens; t++) {
+            const int32_t parent = recurrent_parent_index[t];
+
+            // Get conv state from parent or persistent cache
+            ggml_tensor * state_t = (parent == -1) ? conv_states : pt_conv_states[parent];
+            GGML_ASSERT(state_t != nullptr);
+
+            // Extract this token's projection: qkv_mixed[t, :, :] → [1, channels, n_seqs]
+            // qkv_mixed is transposed so nb[0] = conv_channels * element_size
+            ggml_tensor * proj_t = ggml_view_3d(ctx0, qkv_mixed, 1, conv_channels, n_seqs,
+                qkv_mixed->nb[1], qkv_mixed->nb[2],
+                t * qkv_mixed->nb[0]);
+
+            // conv_input_t = [state_t; proj_t] → [d_conv, channels, 1]
+            ggml_tensor * conv_input_t = ggml_concat(ctx0, state_t, proj_t, 0);
+
+            // Apply 1D conv → [channels, 1, 1], then silu
+            ggml_tensor * conv_out_t = ggml_silu(ctx0,
+                ggml_ssm_conv(ctx0, conv_input_t, conv_kernel));
+
+            // New conv state = last d_conv-1 rows of conv_input_t (contiguous copy)
+            pt_conv_states[t] = ggml_cont_3d(ctx0,
+                ggml_view_3d(ctx0, conv_input_t,
+                    d_conv_minus_1, conv_channels, n_seqs,
+                    conv_input_t->nb[1], conv_input_t->nb[2],
+                    1 * ggml_element_size(conv_input_t)),
+                d_conv_minus_1, conv_channels, n_seqs);
+
+            // Keep alive on GPU for post-decode state commit.
+            // Must be added to the graph explicitly so the allocator knows about it
+            // (leaf tokens in a tree have no children, so pt_conv_states[t] would
+            // otherwise be unreachable from graph outputs).
+            ggml_set_output(pt_conv_states[t]);
+            ggml_build_forward_expand(gf, pt_conv_states[t]);
+            conv_cache_vec[t] = pt_conv_states[t];
+
+            // Build up the batched conv output via concat chain along dim 1
+            conv_output_accum = conv_output_accum
+                ? ggml_concat(ctx0, conv_output_accum, conv_out_t, 1)
+                : conv_out_t;
+        }
+
+        conv_qkv_mix = conv_output_accum;  // [channels, n_tokens, 1]
+
+        // Update persistent conv state with last token's state
+        // (will be overwritten by commit with accepted token's state)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+            ggml_reshape_1d(ctx0, pt_conv_states[n_seq_tokens - 1],
+                d_conv_minus_1 * conv_channels * n_seqs),
+            ggml_view_1d(ctx0, conv_states_all,
+                d_conv_minus_1 * conv_channels * n_seqs,
+                kv_head * d_conv_minus_1 * conv_channels * ggml_element_size(conv_states_all))));
+
+        ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state_predelta = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+
+    } else {
+        // Batched conv path — sequential order or single token
+        ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+        cb(conv_input, "conv_input", il);
+
+        // Update convolution state cache
+        ggml_tensor * last_conv_states =
+            ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+        cb(last_conv_states, "last_conv_states", il);
+
+        ggml_tensor * state_update_target =
+            ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
+                kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
+        cb(state_update_target, "state_update_target", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+
+        ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state_predelta = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        conv_qkv_mix = ggml_silu(ctx0, conv_output_proper);
     }
 
-    // Update convolution state cache
-    // Extract the last (conv_kernel_size - 1) states from conv_input
-    ggml_tensor * last_conv_states =
-        ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
-                     conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
-    cb(last_conv_states, "last_conv_states", il);
-
-    ggml_tensor * state_update_target =
-        ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
-                     kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
-    cb(state_update_target, "state_update_target", il);
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
-
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
+    cb(state_predelta, "state_predelta", il);
 
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
@@ -366,7 +433,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
         res->t_state_cache[il] = t_state_cache;
     }
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il,
+    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state_predelta, il,
                                      t_parent_index, t_state_cache);
 
     ggml_tensor * output    = attn_out.first;

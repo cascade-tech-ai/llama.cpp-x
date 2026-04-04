@@ -270,6 +270,10 @@ public:
     void clear_recurrent_parent_index();
     void recurrent_state_commit(int32_t accepted_batch_pos, llama_pos new_pos);
 
+    // For hybrid models: remove from attention sub-memory only, bypassing recurrent.
+    // For non-hybrid models: equivalent to regular seq_rm on the memory.
+    bool memory_seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

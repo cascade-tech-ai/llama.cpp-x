@@ -749,6 +749,8 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
     t_eagle3_hidden.clear();
+    t_state_cache.clear();
+    t_conv_state_cache.clear();
 
     params = {};
 
@@ -907,10 +909,12 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 
     // Generic EAGLE3 hidden capture.  EAGLE3 layer IDs use "input-to-layer"
-    // semantics (matching HF's hidden_states[i] = output of block i-1 = input
-    // to block i).  We hook on "l_out" which fires at the END of each layer,
-    // so l_out(il) = output of layer il = input to layer il+1.  Therefore we
-    // store l_out(il) as eagle3_hidden[il+1].
+    // Layer IDs follow the vLLM / kestrel convention (adopted Dec 2025): each
+    // ID refers to the OUTPUT of that transformer block.  HuggingFace's
+    // hidden_states[i] = output of block i-1 = input to block i.  We hook on
+    // "l_out" which fires at the END of each layer, so l_out(il) = output of
+    // layer il = input to layer il+1.  Therefore we store l_out(il) as
+    // eagle3_hidden[il+1] to match the convention.
     if (!res || !gf || il < 0) {
         return;
     }

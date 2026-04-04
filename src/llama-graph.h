@@ -705,7 +705,7 @@ public:
     // per-layer state caches for speculative decoding with hybrid models
     // set by recurrent layers when parent_index is active
     std::map<int32_t, ggml_tensor*> t_state_cache;   // delta-net state cache
-    std::map<int32_t, ggml_tensor*> t_conv_input;     // conv_input tensor (for conv state extraction)
+    std::map<int32_t, std::vector<ggml_tensor*>> t_conv_state_cache; // per-token conv state cache on GPU
 
     std::vector<llm_graph_input_ptr> inputs;
 

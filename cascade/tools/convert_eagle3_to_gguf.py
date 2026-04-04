@@ -45,6 +45,15 @@ def _require_keys(state: Dict[str, torch.Tensor], keys: Iterable[str]) -> None:
 
 
 def _resolve_layer_ids(config, base_n_layers: int | None) -> List[int]:
+    """Resolve hidden state layer IDs from the head config.
+
+    Layer IDs follow the vLLM/kestrel convention (adopted Dec 2025): each ID
+    refers to the OUTPUT of that layer, i.e. the tensor produced after layer N
+    finishes.  In llama.cpp's internal numbering the l_out callback fires at the
+    end of layer ``il``, so we store l_out(il) under key ``il + 1`` to match
+    this convention.  See llm_graph_context::try_capture_eagle3_hidden() in
+    llama-graph.cpp for the mapping.
+    """
     layer_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
     if layer_ids:
         return [int(x) for x in layer_ids]
