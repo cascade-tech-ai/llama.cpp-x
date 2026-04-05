@@ -1106,6 +1106,10 @@ extern "C" {
     // Call this after sampling determines which draft token was accepted.
     LLAMA_API void llama_recurrent_state_commit(struct llama_context * ctx, int32_t accepted_batch_pos, llama_pos new_pos);
 
+    // For hybrid models: remove from attention sub-memory only, bypassing recurrent.
+    // For non-hybrid models: equivalent to llama_memory_seq_rm.
+    LLAMA_API bool llama_memory_seq_rm_attn(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

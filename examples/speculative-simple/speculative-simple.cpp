@@ -18,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -212,6 +213,79 @@ static void build_flat_tree_batch(
             tree_parents_out.push_back(-1);  // parent is root (outside tree)
         } else {
             tree_parents_out.push_back(node_to_sorted[(size_t) orig_parent]);
+        }
+    }
+
+    for (size_t i = 0; i < tree.row_indices.size(); ++i) {
+        GGML_ASSERT(tree.row_indices[i] != std::numeric_limits<uint32_t>::max());
+    }
+}
+
+// Build a hybrid tree batch: all tokens on seq 0 with tree mask for attention
+// and recurrent parent index for conv/delta-net state branching.
+static void build_hybrid_tree_batch(
+        llama_batch & batch_tgt,
+        const llama_token id_last,
+        const llama_pos cache_base,
+        const llama_pos rope_base,
+        common_speculative_tree & tree,
+        std::vector<llama_pos> & rope_pos_out,
+        std::vector<int32_t> & tree_parents_out,
+        std::vector<int32_t> & recurrent_parents_out) {
+    // Root token: on seq 0 only (no seq 1 — recurrent memory can't handle multiple seqs)
+    common_batch_add(batch_tgt, id_last, cache_base, { 0 }, true);
+    rope_pos_out.push_back(rope_base);
+
+    // Sort tree nodes by depth (parents before children)
+    tree.row_indices.assign(tree.tokens.size(), std::numeric_limits<uint32_t>::max());
+    std::vector<int32_t> nodes(tree.tokens.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        nodes[i] = (int32_t) i;
+    }
+    std::stable_sort(nodes.begin(), nodes.end(), [&](int32_t a, int32_t b) {
+        const int32_t depth_a = tree.depths[(size_t) a];
+        const int32_t depth_b = tree.depths[(size_t) b];
+        if (depth_a != depth_b) {
+            return depth_a < depth_b;
+        }
+        return a < b;
+    });
+
+    // Map from original tree node index → sorted position
+    std::vector<int32_t> node_to_sorted(tree.tokens.size(), -1);
+    for (size_t si = 0; si < nodes.size(); ++si) {
+        node_to_sorted[(size_t) nodes[si]] = (int32_t) si;
+    }
+
+    // Root's recurrent parent: -1 (uses persistent state)
+    recurrent_parents_out.clear();
+    recurrent_parents_out.push_back(-1);
+
+    tree_parents_out.clear();
+    for (size_t si = 0; si < nodes.size(); ++si) {
+        const int32_t node = nodes[si];
+        const uint32_t row = batch_tgt.n_tokens;
+        const llama_pos cache_pos = cache_base + 1 + (llama_pos) si;
+        const llama_pos rope_pos  = rope_base  + 1 + tree.depths[(size_t) node];
+
+        common_batch_add(batch_tgt, tree.tokens[(size_t) node], cache_pos, { 0 }, true);
+        rope_pos_out.push_back(rope_pos);
+        tree.row_indices[(size_t) node] = row;
+
+        // Tree parent for attention mask
+        const int32_t orig_parent = tree.parents[(size_t) node];
+        if (orig_parent < 0) {
+            tree_parents_out.push_back(-1);
+        } else {
+            tree_parents_out.push_back(node_to_sorted[(size_t) orig_parent]);
+        }
+
+        // Recurrent parent: batch position of this node's parent
+        // Root is batch pos 0, tree node at sorted pos si is batch pos 1+si
+        if (orig_parent < 0) {
+            recurrent_parents_out.push_back(0);  // parent is root
+        } else {
+            recurrent_parents_out.push_back(1 + node_to_sorted[(size_t) orig_parent]);
         }
     }
 
@@ -492,10 +566,6 @@ int main(int argc, char ** argv) {
         ? common_speculative_init(params.speculative, ctx_tgt)
         : nullptr;
 
-    if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && llama_model_is_hybrid(model_tgt)) {
-        LOG_WRN("%s: hybrid model detected — tree verification disabled, using linear verification\n", __func__);
-    }
-
     // eval the prompt
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
 
@@ -511,7 +581,7 @@ int main(int argc, char ** argv) {
     common_speculative_begin(spec, prompt_tgt, 0);
 
     const bool is_hybrid = llama_model_is_hybrid(model_tgt);
-    const bool use_flat_tree = !is_hybrid && (std::getenv("COUPLED_TREE") == nullptr);
+    const bool use_flat_tree = (std::getenv("COUPLED_TREE") == nullptr);
     bool flat_tree_diverged = false; // once true, cache positions diverge from rope positions
 
     const int max_tree_seq_ids = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3
@@ -552,10 +622,7 @@ int main(int argc, char ** argv) {
         common_speculative_trace spec_trace;
         const bool has_tree = spec ? common_speculative_get_tree(spec, tree) : false;
         bool has_trace = spec ? common_speculative_get_trace(spec, spec_trace) : false;
-        // Tree verification creates coupled sequences (root token shared across all branches),
-        // which the hybrid memory's batch splitting cannot handle for recurrent layers.
         bool use_tree = params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3 && has_tree && !tree.tokens.empty()
-            && !llama_model_is_hybrid(model_tgt)
             && !params.speculative.eagle_serial;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
@@ -578,7 +645,26 @@ int main(int argc, char ** argv) {
                 use_tree = false;
             }
 
-            if (use_tree && use_flat_tree) {
+            if (use_tree && is_hybrid && use_flat_tree) {
+                // Hybrid flat tree: all tokens on seq 0 with tree mask for attention
+                // and parent index for recurrent state branching.
+                auto * mem = llama_get_memory(ctx_tgt);
+                cache_base = llama_memory_seq_pos_max(mem, 0) + 1;
+
+                std::vector<llama_pos> rope_pos;
+                std::vector<int32_t> recurrent_parents;
+                build_hybrid_tree_batch(batch_tgt, id_last, cache_base, n_past, tree, rope_pos, tree_parents, recurrent_parents);
+
+                tree_mask = { tree_parents.size(), tree_parents.data(), 1 };
+                llama_set_kq_mask_tree(ctx_tgt, &tree_mask);
+                llama_set_rope_pos_override(ctx_tgt, (uint32_t) rope_pos.size(), rope_pos.data());
+                llama_set_recurrent_parent_index(ctx_tgt, recurrent_parents.data(), (uint32_t) recurrent_parents.size());
+
+                flat_tree_diverged = true;
+                n_past++;
+
+                common_speculative_set_tree(spec, tree);
+            } else if (use_tree && use_flat_tree) {
                 // Flat tree: all tree tokens on seq 1 with unique cache positions,
                 // depth-based RoPE positions, and a tree attention mask.
                 auto * mem = llama_get_memory(ctx_tgt);
@@ -631,6 +717,17 @@ int main(int argc, char ** argv) {
                         rope_pos.push_back(n_past + (llama_pos)i);
                     }
                     llama_set_rope_pos_override(ctx_tgt, (uint32_t) rope_pos.size(), rope_pos.data());
+
+                    // For hybrid models, set parent_index for recurrent state caching
+                    if (is_hybrid && !draft.empty()) {
+                        std::vector<int32_t> serial_parents(1 + draft.size());
+                        serial_parents[0] = -1;
+                        for (size_t i = 1; i < serial_parents.size(); ++i) {
+                            serial_parents[i] = (int32_t)(i - 1);
+                        }
+                        llama_set_recurrent_parent_index(ctx_tgt, serial_parents.data(),
+                                                         (uint32_t) serial_parents.size());
+                    }
                 } else {
                     // For hybrid models, use per-token recurrent state caching
                     // instead of save/restore/replay.
@@ -727,7 +824,34 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<int32_t> accepted_nodes;
-        if (use_tree && use_flat_tree) {
+        if (use_tree && is_hybrid && use_flat_tree) {
+            // Hybrid tree cleanup: commit recurrent state, remove rejected from attention only
+            accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
+
+            // Build set of accepted batch rows
+            std::set<uint32_t> accepted_rows;
+            for (const auto & node : accepted_nodes) {
+                accepted_rows.insert(tree.row_indices[(size_t) node]);
+            }
+
+            // Commit the deepest accepted token's recurrent state
+            const int accepted_batch_pos = accepted_nodes.empty()
+                ? 0 : (int) tree.row_indices[accepted_nodes.back()];
+            llama_recurrent_state_commit(ctx_tgt, accepted_batch_pos, n_past - 1);
+            llama_clear_recurrent_parent_index(ctx_tgt);
+
+            // Remove rejected tree entries from attention cache only
+            for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                const uint32_t row = tree.row_indices[i];
+                if (accepted_rows.count(row) == 0) {
+                    const llama_pos p = cache_base + (llama_pos) row;
+                    llama_memory_seq_rm_attn(ctx_tgt, 0, p, p + 1);
+                }
+            }
+
+            llama_clear_kq_mask_tree(ctx_tgt);
+            llama_clear_rope_pos_override(ctx_tgt);
+        } else if (use_tree && use_flat_tree) {
             // Flat tree cleanup: copy accepted cells from seq 1 to seq 0, delete seq 1
             accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
             auto * mem = llama_get_memory(ctx_tgt);
@@ -826,7 +950,16 @@ int main(int argc, char ** argv) {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
             if (!use_tree) {
-                if (flat_tree_diverged) {
+                if (flat_tree_diverged && is_hybrid && !draft.empty()) {
+                    // Hybrid diverged linear: commit recurrent state, then remove rejected
+                    const int accepted_batch_pos = (int) ids_limited.size() - 1;
+                    llama_recurrent_state_commit(ctx_tgt, accepted_batch_pos, n_past - 1);
+                    llama_clear_recurrent_parent_index(ctx_tgt);
+
+                    const llama_pos remove_from = cache_base + (llama_pos) ids_limited.size();
+                    llama_memory_seq_rm_attn(ctx_tgt, 0, remove_from, -1);
+                    llama_clear_rope_pos_override(ctx_tgt);
+                } else if (flat_tree_diverged) {
                     // After flat tree, positions diverged: remove rejected draft tokens by cache position
                     const llama_pos remove_from = cache_base + (llama_pos) ids_limited.size();
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, remove_from, -1);
