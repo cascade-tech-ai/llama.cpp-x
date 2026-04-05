@@ -1263,6 +1263,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         }
 
         const int max_depth = params.eagle_max_depth;
+        const float adaptive_depth_threshold = params.eagle_adaptive_depth;
 
         // ---- Serial greedy rollout (no beam search) ----
         if (params.eagle_serial) {
@@ -1272,6 +1273,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             std::map<llama_tokens, llama_eagle3_state> serial_prefix_states;
 
             llama_tokens chain;
+            float greedy_cum_prob = 1.0f;
 
             for (int depth = 0; depth < max_depth; ++depth) {
                 // Get the hidden vector from the current state.
@@ -1297,6 +1299,20 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     }
                 }
 
+                // Compute greedy token probability via softmax.
+                if (adaptive_depth_threshold > 0.0f) {
+                    float max_logit = best_val;
+                    double sum_exp = 0.0;
+                    for (int32_t j = 0; j < draft_vocab && j < (int32_t) logits.size(); ++j) {
+                        sum_exp += std::exp((double)(logits[(size_t) j] - max_logit));
+                    }
+                    float greedy_prob = (float)(1.0 / sum_exp);
+                    greedy_cum_prob *= greedy_prob;
+
+                    if (greedy_cum_prob < adaptive_depth_threshold) {
+                        break;
+                    }
+                }
 
                 const int32_t base_id = best_idx + model->d2t[(size_t) best_idx];
                 if (base_id < 0 || base_id >= model->hparams.vocab_size) {
@@ -1406,7 +1422,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         // ---- GPU-fused rollout path ----
         bool fused_ok = false;
-        if (rollout_prefix_ok && llama_eagle3_fused_rollout_available(rt)) {
+        // Fused rollout runs all depths on GPU at once — incompatible with adaptive depth cutoff.
+        if (rollout_prefix_ok && llama_eagle3_fused_rollout_available(rt) && adaptive_depth_threshold <= 0.0f) {
             const int k = std::min<int>(beam_width, model->hparams.draft_vocab_size);
 
 #if defined(GGML_USE_CUDA)
@@ -1649,6 +1666,16 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
             if (expansions.empty()) {
                 break;
+            }
+
+            // Adaptive depth: stop if best beam's cumulative probability drops below threshold.
+            // expansions are sorted by logprob (best first), so expansions[0].logprob is the
+            // best cumulative log-probability across all beams at this depth.
+            if (adaptive_depth_threshold > 0.0f) {
+                float best_cum_prob = std::exp(expansions[0].logprob);
+                if (best_cum_prob < adaptive_depth_threshold) {
+                    break;
+                }
             }
 
             std::vector<const llama_eagle3_state *> parent_states;

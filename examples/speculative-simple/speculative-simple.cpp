@@ -536,6 +536,7 @@ int main(int argc, char ** argv) {
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
+    int total_draft_depth = 0;
 
     // used to determine end of generation
     bool has_eos = false;
@@ -791,6 +792,11 @@ int main(int argc, char ** argv) {
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
         n_accept  += ids_limited.size() - 1;
         n_predict += ids_limited.size();
+        if (!tree.depths.empty()) {
+            total_draft_depth += *std::max_element(tree.depths.begin(), tree.depths.end()) + 1;
+        } else if (!draft.empty()) {
+            total_draft_depth += (int) draft.size();
+        }
         t_target_total_us += (int64_t) (zone_target.elapsed_ms() * 1000.0);
         ++n_target_passes;
 
@@ -996,6 +1002,7 @@ int main(int argc, char ** argv) {
     LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? (100.0f * n_accept / n_drafted) : 0.0f);
     const int n_cycles = n_predict - n_accept;
     LOG_INF("acc_len   = %.3f\n", n_cycles > 0 ? (1.0f * n_accept / n_cycles) : 0.0f);
+    LOG_INF("avg_depth = %.1f\n", n_cycles > 0 ? (1.0f * total_draft_depth / n_cycles) : 0.0f);
 
     if (profile_spec) {
         LOG_INF("spec profile total: target_passes=%d target_total=%.3fms target_forward=%.3fms target_sampling=%.3fms eagle_total=%.3fms\n",
