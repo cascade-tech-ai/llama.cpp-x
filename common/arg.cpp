@@ -3502,8 +3502,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--eagle-verify-greedy"},
+        "re-evaluate accepted tree tokens one-at-a-time to verify greedy correctness (slower but exact)",
+        [](common_params & params) {
+            params.speculative.eagle_verify_greedy = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
         {"--eagle-adaptive-depth"}, "P",
-        "stop EAGLE3 rollout when greedy cumulative probability drops below P (e.g. 0.05 for 5%%, 0 = disabled)",
+        string_format("stop EAGLE3 rollout when greedy cumulative probability drops below P (default: %.2f, 0 = disabled)", params.speculative.eagle_adaptive_depth),
         [](common_params & params, const std::string & value) {
             params.speculative.eagle_adaptive_depth = std::stof(value);
         }

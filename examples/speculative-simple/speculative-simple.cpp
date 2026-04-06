@@ -171,8 +171,8 @@ static void build_flat_tree_batch(
         common_speculative_tree & tree,
         std::vector<llama_pos> & rope_pos_out,
         std::vector<int32_t> & tree_parents_out) {
-    // Root token: on both seq 0 and seq 1
-    common_batch_add(batch_tgt, id_last, cache_base, { 0, 1 }, true);
+    // Root token: on seq 0 only (avoids KV duplication across sequences)
+    common_batch_add(batch_tgt, id_last, cache_base, { 0 }, true);
     rope_pos_out.push_back(rope_base);
 
     // Sort tree nodes by depth (same ordering as coupled version)
@@ -203,7 +203,7 @@ static void build_flat_tree_batch(
         const llama_pos cache_pos = cache_base + 1 + (llama_pos) si;
         const llama_pos rope_pos  = rope_base  + 1 + tree.depths[(size_t) node];
 
-        common_batch_add(batch_tgt, tree.tokens[(size_t) node], cache_pos, { 1 }, true);
+        common_batch_add(batch_tgt, tree.tokens[(size_t) node], cache_pos, { 0 }, true);
         rope_pos_out.push_back(rope_pos);
         tree.row_indices[(size_t) node] = row;
 
@@ -405,6 +405,15 @@ int main(int argc, char ** argv) {
 
     if (params.speculative.type == COMMON_SPECULATIVE_TYPE_EAGLE3) {
         params.kv_unified = true;
+        if (params.speculative.eagle_serial) {
+            // Serial mode produces exactly max_depth tokens — beam search params don't apply.
+            if (params.speculative.eagle_max_proposals != 16 || params.speculative.eagle_beam_width != 8) {
+                LOG_WRN("serial mode: --eagle-max-proposals and --eagle-beam-width are ignored (overridden by --eagle-max-depth %d)\n",
+                        params.speculative.eagle_max_depth);
+            }
+            params.speculative.eagle_max_proposals = params.speculative.eagle_max_depth;
+            params.speculative.eagle_beam_width    = 0;
+        }
         params.n_parallel = std::max(params.n_parallel, params.speculative.eagle_max_proposals + 1);
     }
 
@@ -540,6 +549,13 @@ int main(int argc, char ** argv) {
     int n_accept  = 0;
     int total_draft_depth = 0;
 
+    // verify-greedy diagnostics
+    int    verify_n_tokens    = 0;
+    int    verify_n_mismatch  = 0;
+    float  verify_pdiff_min   = 1.0f;
+    float  verify_pdiff_max   = 0.0f;
+    double verify_pdiff_sum   = 0.0;
+
     // used to determine end of generation
     bool has_eos = false;
 
@@ -665,13 +681,10 @@ int main(int argc, char ** argv) {
 
                 common_speculative_set_tree(spec, tree);
             } else if (use_tree && use_flat_tree) {
-                // Flat tree: all tree tokens on seq 1 with unique cache positions,
+                // Flat tree: all tokens on seq 0 with unique cache positions,
                 // depth-based RoPE positions, and a tree attention mask.
                 auto * mem = llama_get_memory(ctx_tgt);
                 cache_base = llama_memory_seq_pos_max(mem, 0) + 1;
-
-                llama_memory_seq_rm(mem, 1, -1, -1);
-                llama_memory_seq_cp(mem, 0, 1, -1, -1);
 
                 std::vector<llama_pos> rope_pos;
                 build_flat_tree_batch(batch_tgt, id_last, cache_base, n_past, tree, rope_pos, tree_parents);
@@ -852,14 +865,22 @@ int main(int argc, char ** argv) {
             llama_clear_kq_mask_tree(ctx_tgt);
             llama_clear_rope_pos_override(ctx_tgt);
         } else if (use_tree && use_flat_tree) {
-            // Flat tree cleanup: copy accepted cells from seq 1 to seq 0, delete seq 1
+            // Flat tree cleanup: remove rejected tree entries from seq 0
             accepted_nodes = trace_accepted_tree_nodes(tree, ids_limited);
             auto * mem = llama_get_memory(ctx_tgt);
+
+            std::set<uint32_t> accepted_rows;
             for (const auto & node : accepted_nodes) {
-                const llama_pos p = cache_base + (llama_pos) tree.row_indices[(size_t) node];
-                llama_memory_seq_cp(mem, 1, 0, p, p + 1);
+                accepted_rows.insert(tree.row_indices[(size_t) node]);
             }
-            llama_memory_seq_rm(mem, 1, -1, -1);
+            for (size_t i = 0; i < tree.tokens.size(); ++i) {
+                const uint32_t row = tree.row_indices[i];
+                if (accepted_rows.count(row) == 0) {
+                    const llama_pos p = cache_base + (llama_pos) row;
+                    llama_memory_seq_rm(mem, 0, p, p + 1);
+                }
+            }
+
             llama_clear_kq_mask_tree(ctx_tgt);
             llama_clear_rope_pos_override(ctx_tgt);
         } else if (use_tree) {
@@ -877,6 +898,67 @@ int main(int argc, char ** argv) {
                 const llama_seq_id seq_id = (llama_seq_id) (1 + i);
                 llama_memory_seq_rm(mem, seq_id, -1, -1);
             }
+        }
+
+        // Greedy verification diagnostic: re-evaluate accepted tokens one-at-a-time
+        // to measure how many greedy decisions diverge between tree batch and
+        // sequential evaluation. Corrects to sequential greedy at each position
+        // so subsequent positions are evaluated in the correct context.
+        //
+        // This is a diagnostic tool (--eagle-verify-greedy), not for production.
+        // The re-evaluation cost largely negates the speculative speedup.
+        if (use_tree && params.speculative.eagle_verify_greedy) {
+            const int n_vocab_v = llama_vocab_n_tokens(vocab);
+            auto * rmem = llama_get_memory(ctx_tgt);
+            llama_memory_seq_rm(rmem, 0, n_past_before, -1);
+
+            // Suppress eagle hidden state capture during re-evaluation so the
+            // tree batch's captures remain intact for the next cycle's draft.
+            llama_eagle3_suppress_capture(ctx_tgt, true);
+
+            llama_token reeval_tok = id_last;
+            for (size_t vi = 0; vi < ids_limited.size(); vi++) {
+                common_batch_clear(batch_tgt);
+                common_batch_add(batch_tgt, reeval_tok, n_past_before + (llama_pos) vi, { 0 }, true);
+                llama_decode(ctx_tgt, batch_tgt);
+
+                const float * logits_v = llama_get_logits_ith(ctx_tgt, 0);
+                llama_token seq_greedy = 0;
+                for (int j = 1; j < n_vocab_v; j++) {
+                    if (logits_v[j] > logits_v[seq_greedy]) seq_greedy = j;
+                }
+
+                verify_n_tokens++;
+
+                if (seq_greedy != ids_limited[vi]) {
+                    verify_n_mismatch++;
+
+                    // Compute probability gap: p(seq_greedy) - p(tree_choice)
+                    const float logit_max = logits_v[seq_greedy];
+                    double sum_exp = 0.0;
+                    for (int j = 0; j < n_vocab_v; j++) {
+                        sum_exp += expf(logits_v[j] - logit_max);
+                    }
+                    const float log_z = logit_max + logf((float) sum_exp);
+                    const float p_seq  = expf(logits_v[seq_greedy] - log_z);
+                    const float p_tree = expf(logits_v[ids_limited[vi]] - log_z);
+                    const float pdiff  = p_seq - p_tree;
+
+                    verify_pdiff_min = std::min(verify_pdiff_min, pdiff);
+                    verify_pdiff_max = std::max(verify_pdiff_max, pdiff);
+                    verify_pdiff_sum += pdiff;
+
+                    // Correct to sequential greedy for accurate subsequent evaluation
+                    ids_limited[vi] = seq_greedy;
+                }
+
+                reeval_tok = ids_limited[vi];
+            }
+
+            // Adjust n_past to match corrected sequence
+            n_past = n_past_before + (int) ids_limited.size();
+
+            llama_eagle3_suppress_capture(ctx_tgt, false);
         }
 
         if (trace_enabled) {
@@ -1005,6 +1087,18 @@ int main(int argc, char ** argv) {
     const int n_cycles = n_predict - n_accept;
     LOG_INF("acc_len   = %.3f\n", n_cycles > 0 ? (1.0f * n_accept / n_cycles) : 0.0f);
     LOG_INF("avg_depth = %.1f\n", n_cycles > 0 ? (1.0f * total_draft_depth / n_cycles) : 0.0f);
+
+    if (verify_n_tokens > 0) {
+        LOG_INF("\n");
+        LOG_INF("verify-greedy: %d/%d tokens differ (%.1f%%)\n",
+                verify_n_mismatch, verify_n_tokens,
+                100.0f * verify_n_mismatch / verify_n_tokens);
+        if (verify_n_mismatch > 0) {
+            LOG_INF("verify-greedy: prob_diff min=%.6f max=%.6f mean=%.6f\n",
+                    verify_pdiff_min, verify_pdiff_max,
+                    (float)(verify_pdiff_sum / verify_n_mismatch));
+        }
+    }
 
     if (profile_spec) {
         LOG_INF("spec profile total: target_passes=%d target_total=%.3fms target_forward=%.3fms target_sampling=%.3fms eagle_total=%.3fms\n",

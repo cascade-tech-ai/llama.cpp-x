@@ -258,6 +258,7 @@ public:
     const std::vector<float> * eagle3_get_hidden_seq(llama_seq_id seq_id, int32_t layer_id, size_t & n_tokens) const;
     const ggml_tensor * eagle3_get_hidden_capture(int32_t layer_id, size_t & n_tokens) const;
     void eagle3_capture_synchronize() const;
+    void eagle3_set_capture_suppress(bool suppress) { eagle3_capture_suppress = suppress; }
     const std::vector<int32_t> & eagle3_layers() const { return eagle3_layer_ids; }
 
     void set_kq_mask_tree(const llama_kq_mask_tree * tree);
@@ -385,6 +386,7 @@ private:
     std::vector<eagle3_hidden_capture_layer> eagle3_capture;
     uint32_t eagle3_capture_n_tokens = 0;
     uint32_t eagle3_capture_capacity = 0;
+    bool     eagle3_capture_suppress = false;
 
     // per-token parent indices for recurrent state caching (speculative decoding)
     std::vector<int32_t> recurrent_parent_index_data;

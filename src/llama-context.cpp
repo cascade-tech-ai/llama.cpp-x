@@ -970,13 +970,16 @@ void llama_context::eagle3_capture_synchronize() const {
 }
 
 bool llama_context::eagle3_capture_begin(uint32_t n_tokens) {
+    if (eagle3_capture_suppress) {
+        return true;
+    }
     eagle3_capture_n_tokens = 0;
     eagle3_capture_capacity = n_tokens;
     return true;
 }
 
 bool llama_context::eagle3_capture_append(const llama_ubatch & ubatch, const llm_graph_result & res) {
-    if (eagle3_capture.empty() || res.t_eagle3_hidden.empty() || ubatch.n_tokens == 0) {
+    if (eagle3_capture_suppress || eagle3_capture.empty() || res.t_eagle3_hidden.empty() || ubatch.n_tokens == 0) {
         return true;
     }
 
@@ -3625,6 +3628,13 @@ void llama_eagle3_synchronize_hidden_capture(llama_context * ctx) {
         return;
     }
     ctx->eagle3_capture_synchronize();
+}
+
+void llama_eagle3_suppress_capture(llama_context * ctx, bool suppress) {
+    if (!ctx) {
+        return;
+    }
+    ctx->eagle3_set_capture_suppress(suppress);
 }
 
 void llama_set_kq_mask_tree(struct llama_context * ctx, const struct llama_kq_mask_tree * tree) {

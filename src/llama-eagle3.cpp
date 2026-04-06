@@ -3915,10 +3915,6 @@ llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & e
         if (hp.hidden_concat <= 0) {
             throw std::runtime_error("hidden_concat must be >= 1");
         }
-        if (hp.norm_before_residual) {
-            throw std::runtime_error("norm_before_residual is not supported");
-        }
-
         model->hparams = hp;
 
         model->hidden_layer_ids = get_kv_arr_i32(ctx_gguf.get(), EAGLE3_KEY_HIDDEN_LAYER_IDS, true);

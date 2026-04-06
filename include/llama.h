@@ -1061,6 +1061,10 @@ extern "C" {
     // Ensure the backend-resident capture buffers are ready to be consumed by EAGLE3.
     LLAMA_API void llama_eagle3_synchronize_hidden_capture(struct llama_context * ctx);
 
+    // Suppress EAGLE3 hidden capture during llama_decode. When suppressed,
+    // decode will not overwrite previously captured hidden states.
+    LLAMA_API void llama_eagle3_suppress_capture(struct llama_context * ctx, bool suppress);
+
     //
     // Speculative tree attention mask [EXPERIMENTAL]
     //
