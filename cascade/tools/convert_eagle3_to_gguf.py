@@ -144,29 +144,29 @@ def main() -> int:
     _require_keys(state, required)
 
     mapping = {
-        "fc.weight": "eagle3.fc.weight",
-        "norm.weight": "eagle3.norm.weight",
-        "lm_head.weight": "eagle3.lm_head.weight",
-        "midlayer.hidden_norm.weight": "eagle3.hidden_norm.weight",
-        "midlayer.input_layernorm.weight": "eagle3.input_layernorm.weight",
-        "midlayer.post_attention_layernorm.weight": "eagle3.post_attention_layernorm.weight",
-        "midlayer.self_attn.q_proj.weight": "eagle3.attn_q.weight",
-        "midlayer.self_attn.k_proj.weight": "eagle3.attn_k.weight",
-        "midlayer.self_attn.v_proj.weight": "eagle3.attn_v.weight",
-        "midlayer.self_attn.o_proj.weight": "eagle3.attn_o.weight",
-        "midlayer.mlp.gate_proj.weight": "eagle3.ffn_gate.weight",
-        "midlayer.mlp.up_proj.weight": "eagle3.ffn_up.weight",
-        "midlayer.mlp.down_proj.weight": "eagle3.ffn_down.weight",
+        "fc.weight": "fc.weight",
+        "norm.weight": "output_norm.weight",
+        "lm_head.weight": "output.weight",
+        "midlayer.hidden_norm.weight": "hidden_norm.weight",
+        "midlayer.input_layernorm.weight": "attn_norm.weight",
+        "midlayer.post_attention_layernorm.weight": "ffn_norm.weight",
+        "midlayer.self_attn.q_proj.weight": "attn_q.weight",
+        "midlayer.self_attn.k_proj.weight": "attn_k.weight",
+        "midlayer.self_attn.v_proj.weight": "attn_v.weight",
+        "midlayer.self_attn.o_proj.weight": "attn_output.weight",
+        "midlayer.mlp.gate_proj.weight": "ffn_gate.weight",
+        "midlayer.mlp.up_proj.weight": "ffn_up.weight",
+        "midlayer.mlp.down_proj.weight": "ffn_down.weight",
     }
 
     optional = {
-        "midlayer.self_attn.q_proj.bias": "eagle3.attn_q.bias",
-        "midlayer.self_attn.k_proj.bias": "eagle3.attn_k.bias",
-        "midlayer.self_attn.v_proj.bias": "eagle3.attn_v.bias",
-        "midlayer.self_attn.o_proj.bias": "eagle3.attn_o.bias",
-        "midlayer.mlp.gate_proj.bias": "eagle3.ffn_gate.bias",
-        "midlayer.mlp.up_proj.bias": "eagle3.ffn_up.bias",
-        "midlayer.mlp.down_proj.bias": "eagle3.ffn_down.bias",
+        "midlayer.self_attn.q_proj.bias": "attn_q.bias",
+        "midlayer.self_attn.k_proj.bias": "attn_k.bias",
+        "midlayer.self_attn.v_proj.bias": "attn_v.bias",
+        "midlayer.self_attn.o_proj.bias": "attn_output.bias",
+        "midlayer.mlp.gate_proj.bias": "ffn_gate.bias",
+        "midlayer.mlp.up_proj.bias": "ffn_up.bias",
+        "midlayer.mlp.down_proj.bias": "ffn_down.bias",
     }
 
     writer = GGUFWriter(args.out, arch="eagle3")

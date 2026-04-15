@@ -31,10 +31,10 @@ struct scoped_prof {
     int64_t t_start_us = 0;
 
     scoped_prof(bool enabled, const char * name) : enabled(enabled), name(name) {
+        t_start_us = ggml_time_us();
         if (!enabled) {
             return;
         }
-        t_start_us = ggml_time_us();
 #if defined(GGML_USE_CUDA)
         ggml_backend_cuda_nvtx_push(name);
 #endif
@@ -50,7 +50,7 @@ struct scoped_prof {
     }
 
     double elapsed_ms() const {
-        return enabled ? (ggml_time_us() - t_start_us) / 1000.0 : 0.0;
+        return (ggml_time_us() - t_start_us) / 1000.0;
     }
 };
 
@@ -901,13 +901,13 @@ int main(int argc, char ** argv) {
         }
 
         // Greedy verification diagnostic: re-evaluate accepted tokens one-at-a-time
-        // to measure how many greedy decisions diverge between tree batch and
-        // sequential evaluation. Corrects to sequential greedy at each position
-        // so subsequent positions are evaluated in the correct context.
+        // to measure how many greedy decisions diverge between speculative batch
+        // verification and sequential evaluation. Corrects to sequential greedy at
+        // each position so subsequent positions are evaluated in the correct context.
         //
         // This is a diagnostic tool (--eagle-verify-greedy), not for production.
         // The re-evaluation cost largely negates the speculative speedup.
-        if (use_tree && params.speculative.eagle_verify_greedy) {
+        if (params.speculative.eagle_verify_greedy) {
             const int n_vocab_v = llama_vocab_n_tokens(vocab);
             auto * rmem = llama_get_memory(ctx_tgt);
             llama_memory_seq_rm(rmem, 0, n_past_before, -1);
@@ -941,8 +941,8 @@ int main(int argc, char ** argv) {
                     }
                     const float log_z = logit_max + logf((float) sum_exp);
                     const float p_seq  = expf(logits_v[seq_greedy] - log_z);
-                    const float p_tree = expf(logits_v[ids_limited[vi]] - log_z);
-                    const float pdiff  = p_seq - p_tree;
+                    const float p_batch = expf(logits_v[ids_limited[vi]] - log_z);
+                    const float pdiff   = p_seq - p_batch;
 
                     verify_pdiff_min = std::min(verify_pdiff_min, pdiff);
                     verify_pdiff_max = std::max(verify_pdiff_max, pdiff);
@@ -1146,12 +1146,44 @@ int main(int argc, char ** argv) {
         LOG_INF("wrote eagle trace: %s\n", params_spec.eagle_trace_yaml.c_str());
     }
 
-    LOG_INF("\n");
-    LOG_INF("draft:\n\n");
+    const auto perf_ctx = llama_perf_context(ctx_tgt);
+    const auto perf_smpl = llama_perf_sampler(common_sampler_get(smpl));
+    const double t_decode_ms = (t_dec_end - t_dec_start) / 1000.0;
+    const double t_draft_ms = t_eagle_total_us / 1000.0;
+    const double t_target_total_ms = t_target_total_us / 1000.0;
+    const double t_target_fwd_ms = t_target_fwd_us / 1000.0;
+    const double t_target_sampling_ms = t_target_sampling_us / 1000.0;
+    const double t_unacc_ms = t_decode_ms - (t_draft_ms + t_target_total_ms);
+    const double t_unacc_pc = t_decode_ms > 0.0 ? (100.0 * t_unacc_ms / t_decode_ms) : 0.0;
 
     LOG_INF("\n");
-    LOG_INF("target:\n\n");
-    common_perf_print(ctx_tgt, smpl);
+    LOG_INF("performance:\n\n");
+    LOG_INF("speculative_perf:        load time = %10.2f ms\n", perf_ctx.t_load_ms);
+    LOG_INF("speculative_perf:    sampling time = %10.2f ms\n", t_target_sampling_ms);
+    LOG_INF("speculative_perf:    samplers time = %10.2f ms / %5d tokens\n", perf_smpl.t_sample_ms, perf_smpl.n_sample);
+    LOG_INF("speculative_perf:       draft time = %10.2f ms / %5d passes  (%8.2f ms per pass)\n",
+            t_draft_ms,
+            n_target_passes,
+            n_target_passes > 0 ? (t_draft_ms / n_target_passes) : 0.0);
+    LOG_INF("speculative_perf:  target fwd time = %10.2f ms / %5d passes  (%8.2f ms per pass)\n",
+            t_target_fwd_ms,
+            n_target_passes,
+            n_target_passes > 0 ? (t_target_fwd_ms / n_target_passes) : 0.0);
+    LOG_INF("speculative_perf:    target time = %10.2f ms / %5d passes  (%8.2f ms per pass)\n",
+            t_target_total_ms,
+            n_target_passes,
+            n_target_passes > 0 ? (t_target_total_ms / n_target_passes) : 0.0);
+    LOG_INF("speculative_perf:    decode time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+            t_decode_ms,
+            n_predict,
+            n_predict > 0 ? (t_decode_ms / n_predict) : 0.0,
+            t_decode_ms > 0.0 ? (1000.0 * n_predict / t_decode_ms) : 0.0);
+    LOG_INF("speculative_perf: unaccounted time = %10.2f ms / %5.1f %%      (decode - draft - target) / decode\n",
+            t_unacc_ms,
+            t_unacc_pc);
+    LOG_INF("speculative_perf:    graphs reused = %10d\n", perf_ctx.n_reused);
+
+    llama_memory_breakdown_print(ctx_tgt);
 
     llama_batch_free(batch_tgt);
 

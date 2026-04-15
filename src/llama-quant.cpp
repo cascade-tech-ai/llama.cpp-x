@@ -314,8 +314,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
     // do not quantize positional embeddings and token types (BERT)
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
+    if (arch != LLM_ARCH_EAGLE3) {
+        quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
+        quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
+    }
 
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
@@ -881,13 +883,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         fname_inp, splits, /*file*/ nullptr, use_mmap, /*use_direct_io*/ false, /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
-    llama_model model(llama_model_default_params());
+    std::unique_ptr<llama_model> model_holder;
+    if (ml.get_arch_name() == "eagle3") {
+        auto find_i32 = [&](const char * key, uint32_t fallback = 0) -> uint32_t {
+            const int kid = gguf_find_key(ml.metadata, key);
+            return kid < 0 ? fallback : (uint32_t) gguf_get_val_i32(ml.metadata, kid);
+        };
 
-    model.load_arch   (ml);
-    model.load_hparams(ml);
-    model.load_stats  (ml);
+        llama_quant_model_desc desc = {
+            /*.architecture =*/ "eagle3",
+            /*.n_embd       =*/ find_i32("eagle3.hidden_size"),
+            /*.n_ff         =*/ find_i32("eagle3.intermediate_size"),
+            /*.n_layer      =*/ 1,
+            /*.n_head       =*/ find_i32("eagle3.num_attention_heads"),
+            /*.n_head_kv    =*/ find_i32("eagle3.num_key_value_heads"),
+            /*.n_expert     =*/ 0,
+            /*.n_embd_head_k=*/ find_i32("eagle3.head_dim"),
+            /*.n_embd_head_v=*/ find_i32("eagle3.head_dim"),
+        };
+        model_holder.reset(llama_quant_model_from_metadata(&desc));
+    } else {
+        model_holder = std::make_unique<llama_model>(llama_model_default_params());
+        model_holder->load_arch   (ml);
+        model_holder->load_hparams(ml);
+        model_holder->load_stats  (ml);
+    }
 
-    quantize_state_impl qs(model, params);
+    quantize_state_impl qs(*model_holder, params);
 
     if (params->only_copy) {
         ftype = ml.ftype;
@@ -1022,7 +1044,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
 
-        metadata[i].allows_quantization = tensor_allows_quantization(params, model.arch, tensor);
+        metadata[i].allows_quantization = tensor_allows_quantization(params, qs.model.arch, tensor);
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);

@@ -184,33 +184,26 @@ constexpr const char * EAGLE3_KEY_NORM_BEFORE_RESIDUAL = "eagle3.norm_before_res
 constexpr const char * EAGLE3_KEY_HIDDEN_LAYER_IDS    = "eagle3.hidden_state_layer_ids";
 constexpr const char * EAGLE3_KEY_D2T                 = "eagle3.d2t";
 
-// fallback keys aligned with gguf LLM conventions (optional)
-constexpr const char * EAGLE3_KEY_EMBEDDING_LENGTH      = "eagle3.embedding_length";
-constexpr const char * EAGLE3_KEY_FFN_LENGTH            = "eagle3.feed_forward_length";
-constexpr const char * EAGLE3_KEY_ATTN_HEAD_COUNT       = "eagle3.attention.head_count";
-constexpr const char * EAGLE3_KEY_ATTN_HEAD_COUNT_KV    = "eagle3.attention.head_count_kv";
-constexpr const char * EAGLE3_KEY_ATTN_RMS_EPS          = "eagle3.attention.layer_norm_rms_epsilon";
-
-constexpr const char * EAGLE3_TENSOR_FC          = "eagle3.fc.weight";
-constexpr const char * EAGLE3_TENSOR_NORM        = "eagle3.norm.weight";
-constexpr const char * EAGLE3_TENSOR_LM_HEAD     = "eagle3.lm_head.weight";
-constexpr const char * EAGLE3_TENSOR_HIDDEN_NORM = "eagle3.hidden_norm.weight";
-constexpr const char * EAGLE3_TENSOR_INPUT_NORM  = "eagle3.input_layernorm.weight";
-constexpr const char * EAGLE3_TENSOR_POST_NORM   = "eagle3.post_attention_layernorm.weight";
-constexpr const char * EAGLE3_TENSOR_ATTN_Q      = "eagle3.attn_q.weight";
-constexpr const char * EAGLE3_TENSOR_ATTN_K      = "eagle3.attn_k.weight";
-constexpr const char * EAGLE3_TENSOR_ATTN_V      = "eagle3.attn_v.weight";
-constexpr const char * EAGLE3_TENSOR_ATTN_O      = "eagle3.attn_o.weight";
-constexpr const char * EAGLE3_TENSOR_ATTN_Q_B    = "eagle3.attn_q.bias";
-constexpr const char * EAGLE3_TENSOR_ATTN_K_B    = "eagle3.attn_k.bias";
-constexpr const char * EAGLE3_TENSOR_ATTN_V_B    = "eagle3.attn_v.bias";
-constexpr const char * EAGLE3_TENSOR_ATTN_O_B    = "eagle3.attn_o.bias";
-constexpr const char * EAGLE3_TENSOR_FFN_GATE    = "eagle3.ffn_gate.weight";
-constexpr const char * EAGLE3_TENSOR_FFN_UP      = "eagle3.ffn_up.weight";
-constexpr const char * EAGLE3_TENSOR_FFN_DOWN    = "eagle3.ffn_down.weight";
-constexpr const char * EAGLE3_TENSOR_FFN_GATE_B  = "eagle3.ffn_gate.bias";
-constexpr const char * EAGLE3_TENSOR_FFN_UP_B    = "eagle3.ffn_up.bias";
-constexpr const char * EAGLE3_TENSOR_FFN_DOWN_B  = "eagle3.ffn_down.bias";
+constexpr const char * EAGLE3_TENSOR_FC          = "fc.weight";
+constexpr const char * EAGLE3_TENSOR_NORM        = "output_norm.weight";
+constexpr const char * EAGLE3_TENSOR_LM_HEAD     = "output.weight";
+constexpr const char * EAGLE3_TENSOR_HIDDEN_NORM = "hidden_norm.weight";
+constexpr const char * EAGLE3_TENSOR_INPUT_NORM  = "attn_norm.weight";
+constexpr const char * EAGLE3_TENSOR_POST_NORM   = "ffn_norm.weight";
+constexpr const char * EAGLE3_TENSOR_ATTN_Q      = "attn_q.weight";
+constexpr const char * EAGLE3_TENSOR_ATTN_K      = "attn_k.weight";
+constexpr const char * EAGLE3_TENSOR_ATTN_V      = "attn_v.weight";
+constexpr const char * EAGLE3_TENSOR_ATTN_O      = "attn_output.weight";
+constexpr const char * EAGLE3_TENSOR_ATTN_Q_B    = "attn_q.bias";
+constexpr const char * EAGLE3_TENSOR_ATTN_K_B    = "attn_k.bias";
+constexpr const char * EAGLE3_TENSOR_ATTN_V_B    = "attn_v.bias";
+constexpr const char * EAGLE3_TENSOR_ATTN_O_B    = "attn_output.bias";
+constexpr const char * EAGLE3_TENSOR_FFN_GATE    = "ffn_gate.weight";
+constexpr const char * EAGLE3_TENSOR_FFN_UP      = "ffn_up.weight";
+constexpr const char * EAGLE3_TENSOR_FFN_DOWN    = "ffn_down.weight";
+constexpr const char * EAGLE3_TENSOR_FFN_GATE_B  = "ffn_gate.bias";
+constexpr const char * EAGLE3_TENSOR_FFN_UP_B    = "ffn_up.bias";
+constexpr const char * EAGLE3_TENSOR_FFN_DOWN_B  = "ffn_down.bias";
 
 int32_t get_kv_i32(const gguf_context * ctx, const char * key, bool required, int32_t fallback = 0) {
     const int64_t kid = gguf_find_key(ctx, key);
@@ -3873,26 +3866,11 @@ llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & e
 
         llama_eagle3_hparams hp;
 
-        hp.hidden_size = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_HIDDEN_SIZE, false, 0);
-        if (hp.hidden_size == 0) {
-            hp.hidden_size = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_EMBEDDING_LENGTH, true);
-        }
-        hp.intermediate_size = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_INTERMEDIATE_SIZE, false, 0);
-        if (hp.intermediate_size == 0) {
-            hp.intermediate_size = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_FFN_LENGTH, true);
-        }
-        hp.num_heads = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_NUM_HEADS, false, 0);
-        if (hp.num_heads == 0) {
-            hp.num_heads = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_ATTN_HEAD_COUNT, true);
-        }
-        hp.num_kv_heads = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_NUM_KV_HEADS, false, 0);
-        if (hp.num_kv_heads == 0) {
-            hp.num_kv_heads = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_ATTN_HEAD_COUNT_KV, true);
-        }
-        hp.rms_norm_eps = get_kv_f32(ctx_gguf.get(), EAGLE3_KEY_RMS_EPS, false, 0.0f);
-        if (hp.rms_norm_eps == 0.0f) {
-            hp.rms_norm_eps = get_kv_f32(ctx_gguf.get(), EAGLE3_KEY_ATTN_RMS_EPS, true);
-        }
+        hp.hidden_size         = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_HIDDEN_SIZE, true);
+        hp.intermediate_size   = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_INTERMEDIATE_SIZE, true);
+        hp.num_heads           = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_NUM_HEADS, true);
+        hp.num_kv_heads        = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_NUM_KV_HEADS, true);
+        hp.rms_norm_eps        = get_kv_f32(ctx_gguf.get(), EAGLE3_KEY_RMS_EPS, true);
         hp.hidden_concat      = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_HIDDEN_CONCAT, true);
         hp.target_hidden_size = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_TARGET_HIDDEN_SIZE, false, hp.hidden_size);
         hp.draft_vocab_size   = get_kv_i32(ctx_gguf.get(), EAGLE3_KEY_DRAFT_VOCAB_SIZE, true);
