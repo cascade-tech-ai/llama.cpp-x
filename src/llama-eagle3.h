@@ -214,6 +214,7 @@ struct llama_eagle3_select_batch_graph {
 struct llama_eagle3_runtime {
     const llama_model * base_model = nullptr;
     ggml_tensor * tok_embd = nullptr;
+    ggml_tensor * tok_embd_host = nullptr;
     bool flash_attn = false;
     mutable bool flash_attn_logged_step = false;
     mutable bool flash_attn_logged_step_batch = false;
@@ -224,6 +225,7 @@ struct llama_eagle3_runtime {
     ggml_context_ptr        rope_factors_ctx;
     std::vector<uint8_t>    rope_factors_buf;
     ggml_tensor *           rope_factors = nullptr;
+    ggml_tensor *           rope_factors_host = nullptr;
 
     float yarn_ext_factor  = 1.0f;
     float yarn_attn_factor = 1.0f;

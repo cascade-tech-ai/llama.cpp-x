@@ -4008,6 +4008,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
 
     rt.base_model     = llama_get_model(const_cast<llama_context *>(ctx_tgt));
     rt.tok_embd       = rt.base_model ? rt.base_model->tok_embd : nullptr;
+    rt.tok_embd_host  = rt.tok_embd;
     rt.flash_attn     = cparams.flash_attn;
     rt.target_backend = ctx_impl->primary_backend();
     // The EAGLE head is exported from HF Transformers and uses the same RoPE convention as
@@ -4018,6 +4019,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
     rt.rope_freq_base = rope.freq_base;
     rt.rope_freq_scale = rope.freq_scale;
     rt.rope_factors    = nullptr;
+    rt.rope_factors_host = nullptr;
     rt.yarn_ext_factor  = rope.ext_factor;
     rt.yarn_attn_factor = rope.attn_factor;
     rt.yarn_beta_fast   = rope.beta_fast;
@@ -4045,6 +4047,7 @@ llama_eagle3_runtime llama_eagle3_make_runtime(
                 ggml_backend_tensor_get(src, tmp.data(), 0, n_bytes);
                 std::memcpy(dst->data, tmp.data(), n_bytes);
                 rt.rope_factors = dst;
+                rt.rope_factors_host = dst;
             }
         }
     }
@@ -5925,6 +5928,12 @@ bool llama_eagle3_step(
         }
     }
 
+    ggml_tensor * tok_embd_host = rt.tok_embd_host ? rt.tok_embd_host : rt.tok_embd;
+    ggml_tensor * rope_factors_host = rt.rope_factors_host ? rt.rope_factors_host : rt.rope_factors;
+    if (!tok_embd_host) {
+        return false;
+    }
+
     const auto & tensors = get_host_tensors(model);
 
     const size_t mem_size = estimate_step_mem(hp, state.past_len);
@@ -5940,7 +5949,7 @@ bool llama_eagle3_step(
     ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_tok);
 
-    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), tok_embd_host, t_tok);
     t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
 
     ggml_tensor * t_hidden = t_hidden_in;
@@ -5982,14 +5991,14 @@ bool llama_eagle3_step(
     ggml_set_input(t_pos);
 
     t_q = ggml_rope_ext(
-            ctx.get(), t_q, t_pos, rt.rope_factors,
+            ctx.get(), t_q, t_pos, rope_factors_host,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
-            ctx.get(), t_k, t_pos, rt.rope_factors,
+            ctx.get(), t_k, t_pos, rope_factors_host,
             hp.head_dim, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
