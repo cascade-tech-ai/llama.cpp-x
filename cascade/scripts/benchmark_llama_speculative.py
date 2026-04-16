@@ -353,6 +353,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",
         )
         output = proc.stdout
 
