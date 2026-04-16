@@ -16,9 +16,40 @@ This document has two sections:
 
 **Always use the EXACT command lines documented here. Do NOT add, remove, or change any flags.**
 
-The most important rule: **chat templating (conversation mode) MUST be used.** It is the default — do NOT add `--no-conversation`. The eagle head was trained on chat-templated text. Without chat templating, the model sees raw text instead of the chat format, and acceptance length drops from ~2.0 to ~0.6. This looks like a regression but is just a wrong test setup.
+The most important rule: **chat templating MUST be applied before benchmarking.** The canonical path is now the dataset wrapper:
+
+```
+cascade/scripts/benchmark_llama_speculative.py
+```
+
+This wrapper renders prompts with the HF tokenizer chat template using the same prompt-construction semantics as `kestrel train.py eval`, then invokes `llama-speculative-simple` with `--no-conversation` on the already-rendered prompt text via `-p`. It also disables GGUF-side BOS insertion by default (`--override-kv tokenizer.ggml.add_bos_token=bool:false`) so llama.cpp does not prepend a second BOS to a prompt that already starts with one. For future benchmarking, use the wrapper rather than hand-building prompt files or calling the binary directly.
+
+Do not use `-f` for parity benchmarks with rendered prompts. In llama.cpp's common arg parser, `-f/--file` strips one trailing newline from the loaded prompt. That corrupts prompts that intentionally end with `\n\n`, which changes the final prompt token for Llama 3 chat headers and breaks tensor-level parity.
+
+If you bypass the wrapper and call `llama-speculative-simple` directly, you must still ensure the prompt is chat-templated first. Raw user text is not a valid parity benchmark setup and can collapse acceptance length from ~2.0 to ~0.6.
 
 If you need to deviate from the documented commands for any reason, explain the deviation to the user BEFORE running. Do not silently add or remove flags.
+
+## Canonical benchmark driver
+
+For future dataset benchmarks in this repo, the canonical driver is:
+
+```
+python3 cascade/scripts/benchmark_llama_speculative.py
+```
+
+Its defaults are split into two groups:
+
+- Shared semantic defaults intentionally match `kestrel train.py eval`: `--spec-type eagle3`, `--eval-mode beam_prefix`, `--max-proposals 8`, `--max-depth 7`, `--max-new-tokens 128`, `--seed 42`, `--temp 0`, `--top-k 0`, and `--enable-thinking` unset by default.
+- llama.cpp-only runtime defaults are explicit local defaults: `--ctx-size 4096`, `--batch-size 4096`, `--ubatch-size 4096`, `--gpu-layers 999`, `--gpu-layers-draft 999`, `--flash-attn on`, `--eagle-adaptive-depth 0.05`, `--eagle-beam-width 8`, and `--eagle-per-beam-topk-candidates 128`.
+
+When running parity benchmarks against Kestrel serial eval, override the shared defaults as needed, especially:
+
+- `--eval-mode serial`
+- `--enable-thinking false`
+- `--eagle-adaptive-depth 0`
+
+The raw `llama-speculative-simple` commands below remain useful as implementation history and for one-off diagnostics, but the wrapper is the preferred benchmark entry point going forward.
 
 ## Test set
 
