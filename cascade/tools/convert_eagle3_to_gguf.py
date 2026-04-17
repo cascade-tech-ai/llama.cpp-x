@@ -183,8 +183,27 @@ def main() -> int:
     writer.add_float32("eagle3.rms_norm_eps", rms_eps)
     writer.add_bool("eagle3.norm_before_residual", norm_before_residual)
 
-    if getattr(config, "rope_theta", None) is not None:
-        writer.add_float32("eagle3.rope_theta", float(config.rope_theta))
+    # rope_theta and partial_rotary_factor may live on config directly (older
+    # transformers versions / Llama) or inside config.rope_parameters (newer
+    # HF configs, Qwen3, etc.). Check both.
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if not isinstance(rope_parameters, dict):
+        rope_parameters = {}
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = rope_parameters.get("rope_theta")
+    if rope_theta is not None:
+        writer.add_float32("eagle3.rope_theta", float(rope_theta))
+
+    partial_rotary = getattr(config, "partial_rotary_factor", None)
+    if partial_rotary is None:
+        partial_rotary = rope_parameters.get("partial_rotary_factor")
+    if partial_rotary is not None:
+        # HF convention: rotary is applied to the first partial_rotary_factor
+        # fraction of each head. Store that fraction; the consumer turns it
+        # into an integer n_rot at load time.
+        writer.add_float32("eagle3.partial_rotary_factor", float(partial_rotary))
+
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict):
         rope_type = rope_scaling.get("type")

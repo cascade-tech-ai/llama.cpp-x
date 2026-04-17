@@ -14,6 +14,7 @@ struct llama_eagle3_hparams {
     int32_t num_heads          = 0;
     int32_t num_kv_heads       = 0;
     int32_t head_dim           = 0;
+    int32_t n_rot              = 0; // rotary dims (= head_dim * partial_rotary_factor); 0 means full rope over head_dim
     int32_t hidden_concat      = 0;
     int32_t target_hidden_size = 0;
     int32_t draft_vocab_size   = 0;

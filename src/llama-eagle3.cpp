@@ -180,6 +180,7 @@ constexpr const char * EAGLE3_KEY_TARGET_HIDDEN_SIZE = "eagle3.target_hidden_siz
 constexpr const char * EAGLE3_KEY_DRAFT_VOCAB_SIZE    = "eagle3.draft_vocab_size";
 constexpr const char * EAGLE3_KEY_VOCAB_SIZE          = "eagle3.vocab_size";
 constexpr const char * EAGLE3_KEY_HEAD_DIM           = "eagle3.head_dim";
+constexpr const char * EAGLE3_KEY_PARTIAL_ROTARY_FACTOR = "eagle3.partial_rotary_factor";
 constexpr const char * EAGLE3_KEY_NORM_BEFORE_RESIDUAL = "eagle3.norm_before_residual";
 constexpr const char * EAGLE3_KEY_HIDDEN_LAYER_IDS    = "eagle3.hidden_state_layer_ids";
 constexpr const char * EAGLE3_KEY_D2T                 = "eagle3.d2t";
@@ -1292,14 +1293,14 @@ bool build_step_ops(
 
     t_q = ggml_rope_ext(
             ctx, t_q, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
             ctx, t_k, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -1490,14 +1491,14 @@ bool build_step_graph(
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
             ctx.get(), t_k, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -1678,14 +1679,14 @@ bool build_step_multi_graph(
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
             ctx.get(), t_k, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -1922,14 +1923,14 @@ bool build_step_batch_graph(
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
             ctx.get(), t_k, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -2291,7 +2292,7 @@ bool build_kv_only_graph_impl(
 
     // RoPE on K only
     t_k = ggml_rope_ext(ctx.get(), t_k, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -2369,12 +2370,12 @@ bool build_root_graph_impl(
 
     // RoPE on Q and K
     t_q = ggml_rope_ext(ctx.get(), t_q, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
     t_k = ggml_rope_ext(ctx.get(), t_k, t_pos, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -2575,12 +2576,12 @@ bool build_rollout_step_graph_impl(
 
     // -- RoPE -----------------------------------------------------------------
     t_q = ggml_rope_ext(ctx.get(), t_q, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
     t_k = ggml_rope_ext(ctx.get(), t_k, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -3076,12 +3077,12 @@ bool build_fused_depth_graph(
 
     // RoPE.
     t_q = ggml_rope_ext(ctx.get(), t_q, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
     t_k_proj = ggml_rope_ext(ctx.get(), t_k_proj, t_pos_b, rt.rope_factors,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -3467,12 +3468,12 @@ bool build_fused_mega_graph(
         t_v_proj = ggml_reshape_3d(ctx.get(), t_v_proj, hp.head_dim, hp.num_kv_heads, n_beams);
 
         t_q = ggml_rope_ext(ctx.get(), t_q, t_pos_d, rt.rope_factors,
-                hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+                hp.n_rot, rt.rope_type, rt.n_ctx_orig,
                 rt.rope_freq_base, rt.rope_freq_scale,
                 rt.yarn_ext_factor, rt.yarn_attn_factor,
                 rt.yarn_beta_fast, rt.yarn_beta_slow);
         t_k_proj = ggml_rope_ext(ctx.get(), t_k_proj, t_pos_d, rt.rope_factors,
-                hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+                hp.n_rot, rt.rope_type, rt.n_ctx_orig,
                 rt.rope_freq_base, rt.rope_freq_scale,
                 rt.yarn_ext_factor, rt.yarn_attn_factor,
                 rt.yarn_beta_fast, rt.yarn_beta_slow);
@@ -3889,6 +3890,25 @@ llama_eagle3_model * llama_eagle3_load(const std::string & path, std::string & e
                 throw std::runtime_error("hidden_size not divisible by num_heads");
             }
             hp.head_dim = hp.hidden_size / hp.num_heads;
+        }
+        // Partial RoPE: rotary is applied to the first partial_rotary_factor
+        // fraction of each head. Qwen3 eagle heads use 0.25 (64 of 256 dims).
+        // Llama heads omit the key, which we treat as full rope (factor = 1).
+        {
+            const float partial_rotary = get_kv_f32(
+                ctx_gguf.get(), EAGLE3_KEY_PARTIAL_ROTARY_FACTOR, false, 1.0f);
+            int32_t n_rot = (int32_t) std::lround((double) hp.head_dim * (double) partial_rotary);
+            if (n_rot <= 0) {
+                n_rot = hp.head_dim;
+            }
+            if (n_rot > hp.head_dim) {
+                n_rot = hp.head_dim;
+            }
+            // RoPE implementations assume an even number of rotated dims.
+            if (n_rot % 2 != 0) {
+                n_rot -= 1;
+            }
+            hp.n_rot = n_rot;
         }
         if (hp.hidden_concat <= 0) {
             throw std::runtime_error("hidden_concat must be >= 1");
@@ -5992,14 +6012,14 @@ bool llama_eagle3_step(
 
     t_q = ggml_rope_ext(
             ctx.get(), t_q, t_pos, rope_factors_host,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
 
     t_k = ggml_rope_ext(
             ctx.get(), t_k, t_pos, rope_factors_host,
-            hp.head_dim, rt.rope_type, rt.n_ctx_orig,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
             rt.rope_freq_base, rt.rope_freq_scale,
             rt.yarn_ext_factor, rt.yarn_attn_factor,
             rt.yarn_beta_fast, rt.yarn_beta_slow);
