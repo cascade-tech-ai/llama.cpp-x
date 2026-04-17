@@ -699,7 +699,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     bool enabled = false;
     common_speculative_tree last_tree;
     common_speculative_trace last_trace;
-    std::vector<llama_eagle3_state> last_tree_states;
     llama_eagle3_state last_root_state;
     bool has_last_root_state = false;
     std::vector<float> prefix_tail_hidden_concat;
@@ -963,7 +962,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         draft_tokens.clear();
         last_tree.clear();
         last_trace.clear();
-        last_tree_states.clear();
         has_last_root_state = false;
 
         if (!enabled) {
@@ -1310,9 +1308,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         if (params.eagle_serial) {
             llama_eagle3_state cur_state = root_state;
 
-            last_tree_states.clear();
-            std::map<llama_tokens, llama_eagle3_state> serial_prefix_states;
-
             llama_tokens chain;
             float greedy_cum_prob = 1.0f;
 
@@ -1367,9 +1362,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                             nullptr, hidden_size, token, nullptr, nullptr)) {
                     break;
                 }
-
-                // Store state for accept_tokens prefix tracking.
-                serial_prefix_states[chain] = cur_state;
             }
 
             if (chain.empty()) {
@@ -1385,19 +1377,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 last_tree.depths[i]  = (int32_t) i;
             }
             common_speculative_tree_build_metadata(last_tree);
-
-            // Store per-node states for accept_tokens.
-            last_tree_states.resize(chain.size());
-            {
-                llama_tokens prefix;
-                for (size_t i = 0; i < chain.size(); ++i) {
-                    prefix.push_back(chain[i]);
-                    auto it = serial_prefix_states.find(prefix);
-                    if (it != serial_prefix_states.end()) {
-                        last_tree_states[i] = it->second;
-                    }
-                }
-            }
 
             if (verbose) {
                 LOG_INF("eagle3 serial: drafted %zu tokens:", chain.size());
@@ -1459,7 +1438,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         };
 
         std::vector<proposal_path> all_nodes;
-        std::map<llama_tokens, llama_eagle3_state> prefix_states;
 
         // ---- GPU-fused rollout path ----
         bool fused_ok = false;
@@ -1527,11 +1505,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         common_speculative_trace_insert_path(
                                 last_trace.proposal_tree, path,
                                 std::exp(logprob), std::exp(logprob));
-
-                        // Use the pre-built state (with hidden + KV) from the result.
-                        if (prefix_states.find(path) == prefix_states.end()) {
-                            prefix_states[path] = std::move(fused_result.states[idx]);
-                        }
                     }
                 }
 
@@ -1799,7 +1772,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         cand.tokens,
                         std::exp(cand.logprob - beam_logprob_cur[expansions[(size_t) i].beam_idx]),
                         std::exp(cand.logprob));
-                prefix_states[cand.tokens] = cand.state;
                 all_nodes.push_back({cand.logprob, cand.tokens});
             }
         }
@@ -1911,8 +1883,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         std::vector<int32_t> roots;
         std::vector<std::vector<int32_t>> children;
 
-        last_tree_states.clear();
-
         for (const auto & entry : all_nodes) {
             const auto & seq = entry.tokens;
             int32_t parent = -1;
@@ -1940,7 +1910,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     last_tree.tokens.push_back(tok);
                     last_tree.parents.push_back(parent);
                     last_tree.depths.push_back((int32_t) depth);
-                    last_tree_states.emplace_back();
                     children.emplace_back();
 
                     if (parent < 0) {
@@ -1948,12 +1917,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     } else {
                         children[parent].push_back(node_idx);
                     }
-                }
-
-                llama_tokens prefix(seq.begin(), seq.begin() + (ptrdiff_t) depth + 1);
-                auto it_state = prefix_states.find(prefix);
-                if (it_state != prefix_states.end()) {
-                    last_tree_states[(size_t) node_idx] = it_state->second;
                 }
 
                 parent = node_idx;
@@ -2034,38 +1997,34 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return (size_t) last_tree.batch_start + idx;
         };
 
-        // Rebuild K/V at accepted positions via the kv-only fast path using
-        // teacher hiddens from the verification batch. This replaces the
-        // rollout-chained K/V the speculative draft wrote into those slots
-        // (which came from the draft head's own chained hidden outputs) with
-        // K/V derived from the teacher's AR hiddens at those same positions.
-        // Matches the AR semantics the EAGLE head was trained under.
+        // Advance prefix_state to cover the accepted tokens.
         //
-        // Set CASCADE_EAGLE_NO_AR_KV_REGEN=1 to fall back to the legacy
-        // rollout-state inheritance (for debugging regressions).
-        static const bool ar_kv_regen_enabled = [] {
-            const char * env = std::getenv("CASCADE_EAGLE_NO_AR_KV_REGEN");
-            return !(env && (std::string(env) == "1" || std::string(env) == "true"));
-        }();
-
-        bool used_ar_kv_regen = false;
-        if (ar_kv_regen_enabled && !accepted_nodes.empty()) {
-            // Gather tree rows for the accepted path (in depth order).
+        // If any were accepted, rebuild K/V at those positions via the kv-only
+        // fast path using teacher hiddens from the verification batch. This
+        // replaces the rollout-chained K/V the speculative draft wrote into
+        // those slots (which came from the draft head's own chained hidden
+        // outputs) with K/V derived from the teacher's AR hiddens at those
+        // same positions — matching the AR semantics the EAGLE head was
+        // trained under. With no accepts, the root step's state (teacher-based
+        // K/V at slot PL, plus 1 fallback token processed outside this path)
+        // is the correct seed for the next cycle.
+        if (accepted_nodes.empty()) {
+            set_prefix_frontier(last_root_state, 0);
+        } else {
+            // Gather tree rows for the accepted path in depth order.
             std::vector<int32_t> accepted_rows_vec;
             accepted_rows_vec.reserve(accepted_nodes.size());
-            bool rows_ok = true;
             for (int32_t node : accepted_nodes) {
                 const size_t r = row_for_node(node);
                 if (r >= n_tokens) {
-                    rows_ok = false;
-                    break;
+                    return; // malformed tree metadata; give up on this accept
                 }
                 accepted_rows_vec.push_back((int32_t) r);
             }
 
-            // Tokens to pair with those teacher hiddens: ids[1..N]. ids[0] was
+            // Tokens paired with those teacher hiddens: ids[1..N]. ids[0] was
             // the root-step input (already consumed); ids[N] is the fallback
-            // (target-sampled, not in draft tree). See EAGLE prefill convention:
+            // (target-sampled, not in draft tree). EAGLE prefill convention:
             // slot t stores K/V for (teacher_hidden[t], embed(token_at_t+1)).
             std::vector<llama_token> slot_tokens;
             slot_tokens.reserve(accepted_nodes.size());
@@ -2073,43 +2032,22 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 slot_tokens.push_back(ids[i]);
             }
 
-            if (rows_ok && accepted_rows_vec.size() == slot_tokens.size()) {
-                llama_eagle3_state regen_state;
-                if (llama_eagle3_ar_kv_regen(
-                            *model,
-                            rt,
-                            last_root_state,
-                            layer_tensors,
-                            accepted_rows_vec,
-                            slot_tokens,
-                            regen_state)) {
-                    // Deepest accepted row is the teacher-hidden source for the
-                    // NEXT cycle's root step (input to step_from_hidden_capture).
-                    const size_t deepest_row = (size_t) accepted_rows_vec.back();
-                    set_prefix_frontier(regen_state, deepest_row);
-                    prefix_prompt_len += ids.size();
-                    used_ar_kv_regen = true;
-                }
-            }
-        }
-
-        if (!used_ar_kv_regen) {
-            if (accepted_nodes.empty()) {
-                set_prefix_frontier(last_root_state, 0);
-            } else {
-                const int32_t deepest = accepted_nodes.back();
-                if ((size_t) deepest >= last_tree_states.size()) {
-                    return;
-                }
-                const size_t row_idx = row_for_node(deepest);
-                if (row_idx >= n_tokens) {
-                    return;
-                }
-                set_prefix_frontier(last_tree_states[(size_t) deepest], row_idx);
+            llama_eagle3_state regen_state;
+            if (!llama_eagle3_ar_kv_regen(
+                        *model, rt, last_root_state,
+                        layer_tensors, accepted_rows_vec, slot_tokens,
+                        regen_state)) {
+                LOG_WRN("eagle3 accept: kv_regen failed, skipping state update\n");
+                return;
             }
 
-            prefix_prompt_len += ids.size();
+            // Deepest accepted row is the teacher-hidden source for the NEXT
+            // cycle's root step (input to step_from_hidden_capture).
+            const size_t deepest_row = (size_t) accepted_rows_vec.back();
+            set_prefix_frontier(regen_state, deepest_row);
         }
+
+        prefix_prompt_len += ids.size();
     }
 
     bool get_tree(common_speculative_tree & out) const override {
