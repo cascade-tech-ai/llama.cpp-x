@@ -709,6 +709,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
     // Dump buffers (CASCADE_EAGLE_DUMP_DIR)
     bool dump_pending = false;
+    int32_t dump_target_cycle = 1; // 1-based; which cycle to capture. Controlled by CASCADE_EAGLE_DUMP_CYCLE.
+    int32_t draft_cycle = 0;       // 1-based; incremented at start of each draft() call.
     llama_tokens dump_prompt_tgt;
     llama_token dump_id_last = -1;
     std::vector<int32_t> dump_head_input_ids; // [n_steps]
@@ -890,8 +892,18 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             return;
         }
 
+        draft_cycle = 0;
+        dump_target_cycle = 1;
+        if (const char * env = std::getenv("CASCADE_EAGLE_DUMP_CYCLE")) {
+            const long long parsed = std::strtoll(env, nullptr, 10);
+            if (parsed >= 1) {
+                dump_target_cycle = (int32_t) parsed;
+            }
+        }
+
         if (!dump_dir.empty()) {
-            dump_pending = true;
+            // Only enable initial buffer setup when cycle 1 is the target.
+            dump_pending = (dump_target_cycle == 1);
             dump_prompt_tgt = prompt;
             dump_id_last = -1;
             dump_head_input_ids.clear();
@@ -962,6 +974,28 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         if (seq_id != active_seq_id) {
             reset_prefix_cache();
             active_seq_id = seq_id;
+        }
+
+        draft_cycle += 1;
+        if (!dump_dir.empty() && draft_cycle == dump_target_cycle && dump_target_cycle > 1) {
+            // Starting the target cycle: (re)enable dumping and refresh the
+            // recorded prompt_tgt snapshot so the dump reflects this cycle's
+            // context (which includes prior accepted tokens).
+            dump_pending = true;
+            dump_prompt_tgt = prompt_tgt;
+            dump_id_last = -1;
+            dump_head_input_ids.clear();
+            dump_teacher_hidden_by_step.clear();
+            dump_head_embd_by_step.clear();
+            dump_head_embd_norm_by_step.clear();
+            dump_head_hidden_proj_by_step.clear();
+            dump_head_hidden_norm_by_step.clear();
+            dump_head_cat_by_step.clear();
+            dump_head_q_by_step.clear();
+            dump_head_k_by_step.clear();
+            dump_head_v_by_step.clear();
+            dump_head_hidden_after_step.clear();
+            dump_root_logits_draft.clear();
         }
 
         if (params.eagle_max_depth < 1 || params.eagle_max_proposals < 1) {
@@ -1212,6 +1246,11 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/root_step");
                 }
 #endif
+                // When dumping mid-generation (target cycle > 1), the dbg path
+                // in step_from_hidden_capture goes through a slower, numerically
+                // different route that perturbs downstream state. Only pass dbg_root
+                // when we can tolerate that — i.e., cycle 1 captures.
+                const bool pass_dbg = dump_root && draft_cycle <= 1;
                 if (!llama_eagle3_step_from_hidden_capture(
                             *model,
                             rt,
@@ -1220,7 +1259,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                             prefix_tail_capture_idx,
                             id_last,
                             nullptr,
-                            dump_root ? &dbg_root : nullptr)) {
+                            pass_dbg ? &dbg_root : nullptr)) {
                     LOG_WRN("eagle3 draft: step_from_hidden_capture failed\n");
                     return;
                 }
@@ -1257,6 +1296,8 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             dump_root_logits_draft = std::move(root_logits);
 
             if (!write_dump(seq_id)) {
+                // Mark consumed so a failure does not retrigger capture every cycle.
+                dump_pending = false;
                 return;
             }
             dump_pending = false;
@@ -2121,13 +2162,15 @@ private:
 
         std::vector<int32_t> layer_ids_i32(layer_ids.begin(), layer_ids.end());
 
-        // Dump per-layer teacher hiddens (prompt_tgt only).
+        // Dump per-layer teacher hiddens (prompt_tgt only). These are only
+        // available during the initial prompt-prefill dump (cycle 1). For
+        // mid-generation dumps (CASCADE_EAGLE_DUMP_CYCLE>1) the capture
+        // buffer holds later batches, so skip the per-layer prompt dump.
         std::vector<const ggml_tensor *> layer_tensors;
         size_t n_layer_tokens = 0;
-        if (!fetch_hidden_tensors(layer_tensors, n_layer_tokens) || n_layer_tokens < n_prompt) {
-            LOG_ERR("%s: failed to fetch teacher hidden ptrs for dump\n", __func__);
-            return false;
-        }
+        const bool have_layer_tensors =
+                fetch_hidden_tensors(layer_tensors, n_layer_tokens) &&
+                n_layer_tokens >= n_prompt;
 
         if (!write_npy_i32(dir / "prompt_tgt.npy", prompt_i32.data(), {n_prompt})) {
             return false;
@@ -2139,13 +2182,15 @@ private:
             return false;
         }
 
-        for (size_t li = 0; li < layer_tensors.size(); ++li) {
-            const int32_t layer_id = layer_ids[li];
-            std::vector<float> layer_host((size_t) n_prompt * (size_t) target_hidden_size);
-            ggml_backend_tensor_get(layer_tensors[li], layer_host.data(), 0, layer_host.size() * sizeof(float));
-            const fs::path p = dir / ("teacher_hidden_layer_" + std::to_string(layer_id) + ".npy");
-            if (!write_npy_f32(p, layer_host.data(), {n_prompt, (size_t) target_hidden_size})) {
-                return false;
+        if (have_layer_tensors) {
+            for (size_t li = 0; li < layer_tensors.size(); ++li) {
+                const int32_t layer_id = layer_ids[li];
+                std::vector<float> layer_host((size_t) n_prompt * (size_t) target_hidden_size);
+                ggml_backend_tensor_get(layer_tensors[li], layer_host.data(), 0, layer_host.size() * sizeof(float));
+                const fs::path p = dir / ("teacher_hidden_layer_" + std::to_string(layer_id) + ".npy");
+                if (!write_npy_f32(p, layer_host.data(), {n_prompt, (size_t) target_hidden_size})) {
+                    return false;
+                }
             }
         }
 
