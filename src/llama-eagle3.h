@@ -544,3 +544,36 @@ bool llama_eagle3_prefill_chunked(
         int32_t total_tokens,
         int32_t chunk_size,
         llama_eagle3_state & final_state_out);
+
+// llama_eagle3_ar_kv_regen — extend an EAGLE state's K/V using the kv-only fast
+// path (norm + fc + K/V projections + RoPE on K + set_rows; no Q, no attention,
+// no FFN).
+//
+// Intended for use after speculative acceptance: the rollout writes K/V at the
+// accepted positions using draft-chained hiddens (training-time mismatch with
+// AR teacher hiddens). This function rewrites those slots using the teacher
+// hiddens captured at the accepted tree rows of the verification batch.
+//
+// Inputs:
+//   pre_cycle_state   - state whose K/V are correct up to pre_cycle_state.past_len
+//                       (typically the root_state after cycle N's root step;
+//                       past_len = PL+1, slots 0..PL populated with teacher-based K/V).
+//   hidden_capture    - per-layer capture tensors for the just-finished target
+//                       verification batch (each [target_hidden_size, batch_n]).
+//   accepted_rows     - batch row indices for the accepted-path tree nodes,
+//                       in depth order (length N). Each row's teacher hidden
+//                       equals the AR teacher hidden at position pre_cycle_state.past_len+i.
+//   tokens            - N tokens, where tokens[i] is the token at position
+//                       pre_cycle_state.past_len + i + 1 (i.e., the NEXT token
+//                       after the accepted-path token at depth i; this is
+//                       ids_limited[i+1] from the cycle's verification output).
+//   out_state         - receives an AR-style state with own K/V buffer;
+//                       past_len = pre_cycle_state.past_len + N.
+bool llama_eagle3_ar_kv_regen(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & pre_cycle_state,
+        const std::vector<const ggml_tensor *> & hidden_capture,
+        const std::vector<int32_t> & accepted_rows,
+        const std::vector<llama_token> & tokens,
+        llama_eagle3_state & out_state);

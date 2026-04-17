@@ -6873,3 +6873,185 @@ bool llama_eagle3_prefill_chunked(
     ggml_backend_synchronize(rt.backend_compute.get());
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// llama_eagle3_ar_kv_regen — rebuild K/V at post-accept positions using the
+// kv-only fast path, replacing rollout-chained K/V with teacher-based K/V.
+// ---------------------------------------------------------------------------
+bool llama_eagle3_ar_kv_regen(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & pre_cycle_state,
+        const std::vector<const ggml_tensor *> & hidden_capture,
+        const std::vector<int32_t> & accepted_rows,
+        const std::vector<llama_token> & tokens,
+        llama_eagle3_state & out_state) {
+    out_state = {};
+
+    const auto & hp = model.hparams;
+    const int32_t N = (int32_t) accepted_rows.size();
+    if (N <= 0 || (int32_t) tokens.size() != N) {
+        return false;
+    }
+    if (!rt.backend_compute || !rt.buft_compute || !rt.tok_embd) {
+        return false;
+    }
+    if (!pre_cycle_state.dev || pre_cycle_state.past_len <= 0 ||
+        !pre_cycle_state.dev->t_k || !pre_cycle_state.dev->t_v) {
+        return false;
+    }
+    if ((int32_t) hidden_capture.size() != hp.hidden_concat) {
+        return false;
+    }
+    for (int32_t il = 0; il < hp.hidden_concat; ++il) {
+        const ggml_tensor * src = hidden_capture[(size_t) il];
+        if (!src || src->type != GGML_TYPE_F32 || src->ne[0] != hp.target_hidden_size) {
+            return false;
+        }
+        for (int32_t j = 0; j < N; ++j) {
+            if (accepted_rows[(size_t) j] < 0 ||
+                (int64_t) accepted_rows[(size_t) j] >= src->ne[1]) {
+                return false;
+            }
+        }
+    }
+
+    const int32_t existing_len = pre_cycle_state.past_len;   // slots 0..existing_len-1 populated
+    const int32_t new_past_len = existing_len + N;           // slots 0..new_past_len-1 after regen
+
+    // Ensure cached prefill state exists and cache is large enough.
+    if (!rt.prefill_state) {
+        rt.prefill_state = std::make_shared<llama_eagle3_runtime::prefill_cached_state>();
+    }
+    auto & ps = *rt.prefill_state;
+
+    const int32_t old_capacity = ps.cache.capacity;
+    {
+        int32_t needed = new_past_len;
+        if (needed <= 256) needed = 256;
+        else if (needed <= 512) needed = 512;
+        else if (needed <= 1024) needed = 1024;
+        else needed = ((needed + 511) / 512) * 512;
+        if (!alloc_prefill_cache(model, rt, needed, ps.cache)) {
+            return false;
+        }
+    }
+    const bool cache_reallocated = (ps.cache.capacity != old_capacity);
+
+    // (Re)build kv-only graph if stale or sized too small.
+    if (cache_reallocated || ps.kv_graph.n_tokens < N || !ps.kv_graph.gf) {
+        if (!build_kv_only_graph_impl(model, rt, ps.cache, ps.cache.capacity, ps.kv_graph)) {
+            return false;
+        }
+        ps.warmed_up = false;
+    }
+
+    auto & kv = ps.kv_graph;
+    const int32_t graph_n = kv.n_tokens;
+
+    // Copy pre-cycle state's K/V prefix into ps.cache[0..existing_len-1].
+    if (!tensor_copy_3d_prefix_async(
+                rt.backend_compute.get(),
+                pre_cycle_state.dev->t_k, ps.cache.t_k,
+                hp.head_dim, hp.num_kv_heads, existing_len)) {
+        return false;
+    }
+    if (!tensor_copy_3d_prefix_async(
+                rt.backend_compute.get(),
+                pre_cycle_state.dev->t_v, ps.cache.t_v,
+                hp.head_dim, hp.num_kv_heads, existing_len)) {
+        return false;
+    }
+
+    // Gather teacher hiddens at accepted_rows into contiguous per-layer scratch,
+    // then upload to the graph's hidden inputs. Pad remaining graph slots with
+    // last-row data so the compute over padding is harmless.
+    const size_t row_bytes = (size_t) hp.target_hidden_size * sizeof(float);
+    std::vector<float> scratch((size_t) hp.target_hidden_size * (size_t) N);
+    for (int32_t il = 0; il < hp.hidden_concat; ++il) {
+        const ggml_tensor * src = hidden_capture[(size_t) il];
+        for (int32_t j = 0; j < N; ++j) {
+            const size_t row = (size_t) accepted_rows[(size_t) j];
+            ggml_backend_tensor_get(
+                src, scratch.data() + (size_t) j * (size_t) hp.target_hidden_size,
+                row * (size_t) src->nb[1],
+                row_bytes);
+        }
+        ggml_backend_tensor_set_async(
+            rt.backend_compute.get(), kv.t_hidden_layers[(size_t) il],
+            scratch.data(), 0, (size_t) N * row_bytes);
+    }
+
+    // Pad token ids with 0 beyond N.
+    {
+        rt.async_buf.tokens.assign((size_t) graph_n, (llama_token) 0);
+        for (int32_t j = 0; j < N; ++j) {
+            rt.async_buf.tokens[(size_t) j] = tokens[(size_t) j];
+        }
+        ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_tok,
+                rt.async_buf.tokens.data(), 0, (size_t) graph_n * sizeof(llama_token));
+    }
+
+    // Positions and slot indices: real for [0,N), pad others to a safe scratch
+    // slot (the last cache slot, unused at this point).
+    {
+        rt.async_buf.positions.assign((size_t) graph_n, ps.cache.capacity - 1);
+        for (int32_t j = 0; j < N; ++j) {
+            rt.async_buf.positions[(size_t) j] = existing_len + j;
+        }
+        ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_pos,
+                rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+        ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_k_idxs,
+                rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+        ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_v_idxs,
+                rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
+    }
+
+    if (ggml_backend_graph_compute_async(rt.backend_compute.get(), kv.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    // Materialize out_state with its own K/V buffer.
+    std::shared_ptr<llama_eagle3_state::device_state> out_dev;
+    const int32_t cur_cap = pre_cycle_state.dev->kv_capacity;
+    const int32_t desired_cap = choose_kv_capacity(new_past_len, /* reserve_kv = */ 0, cur_cap);
+    if (!alloc_state_device(model, rt, desired_cap, out_dev)) {
+        return false;
+    }
+
+    if (!tensor_copy_3d_prefix_async(
+                rt.backend_compute.get(), ps.cache.t_k, out_dev->t_k,
+                hp.head_dim, hp.num_kv_heads, new_past_len)) {
+        return false;
+    }
+    if (!tensor_copy_3d_prefix_async(
+                rt.backend_compute.get(), ps.cache.t_v, out_dev->t_v,
+                hp.head_dim, hp.num_kv_heads, new_past_len)) {
+        return false;
+    }
+
+    // Preserve the hidden output from the pre-cycle state (produced by the root
+    // step). Downstream users read it for root draft logits.
+    if (pre_cycle_state.dev->t_hidden && out_dev->t_hidden) {
+        if (!tensor_copy_bytes_async(
+                    rt.backend_compute.get(), rt.backend_compute.get(),
+                    pre_cycle_state.dev->t_hidden, 0,
+                    out_dev->t_hidden, 0,
+                    (size_t) hp.hidden_size * sizeof(float))) {
+            return false;
+        }
+    }
+
+    out_dev->past_len = new_past_len;
+    out_dev->rollout_kv_start = 0;
+
+    out_state.dev = std::move(out_dev);
+    out_state.past_len = new_past_len;
+    out_state.rollout_only = false;
+    out_state.hidden.clear();
+    out_state.k.clear();
+    out_state.v.clear();
+
+    ggml_backend_synchronize(rt.backend_compute.get());
+    return true;
+}
