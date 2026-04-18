@@ -6637,7 +6637,6 @@ bool llama_eagle3_prefill_chunked(
         int32_t total_tokens,
         int32_t chunk_size,
         llama_eagle3_state & final_state_out) {
-    GGML_UNUSED(chunk_size); // single-pass now; chunk_size ignored
     GGML_UNUSED(hidden_in_dim); // derived from model hparams now
     if (total_tokens <= 0) {
         final_state_out = {};
@@ -6651,6 +6650,15 @@ bool llama_eagle3_prefill_chunked(
     const auto & hp = model.hparams;
     const bool do_profile = std::getenv("CASCADE_EAGLE_PROFILE") != nullptr;
     const int32_t kv_only_count = total_tokens - 1;
+
+    // KV-only graph is sized to chunk_size tokens and dispatched in a loop.
+    // Building one graph for kv_only_count tokens would allocate a compute
+    // buffer that scales with (tokens × target_hidden_size × n_layers), which
+    // OOMs for wide models on long prompts (e.g. 27B, ~7k tokens ≈ 2.7 GB just
+    // for this graph). The per-chunk peak scales with chunk_size instead.
+    // We use a fixed width across calls so the graph isn't rebuilt when prompt
+    // length changes; short prompts pad the unused slots with dummy indices.
+    const int32_t kv_chunk_n = std::max(chunk_size, 1);
 
     int64_t t0 = do_profile ? ggml_time_us() : 0;
 
@@ -6675,11 +6683,14 @@ bool llama_eagle3_prefill_chunked(
     }
     const bool cache_reallocated = (ps.cache.capacity != old_capacity);
 
-    // (Re)build KV-only graph if it doesn't fit or if cache was reallocated
-    // (the graph bakes in cache tensor pointers, which become stale after realloc).
-    if (kv_only_count > 0 && (cache_reallocated || ps.kv_graph.n_tokens < kv_only_count)) {
-        if (!build_kv_only_graph_impl(model, rt, ps.cache, ps.cache.capacity, ps.kv_graph)) {
-            LLAMA_LOG_WARN("%s: build_kv_only_graph_impl failed\n", __func__);
+    // (Re)build KV-only graph if the chunk width changed or if the cache was
+    // reallocated (the graph bakes in cache tensor pointers, which become stale
+    // after realloc). Sizing the graph at kv_chunk_n (not cache.capacity) caps
+    // peak compute-buffer usage.
+    if (kv_only_count > 0 && (cache_reallocated || ps.kv_graph.n_tokens != kv_chunk_n || !ps.kv_graph.gf)) {
+        if (!build_kv_only_graph_impl(model, rt, ps.cache, kv_chunk_n, ps.kv_graph)) {
+            LLAMA_LOG_WARN("%s: build_kv_only_graph_impl failed (chunk_n=%d, cache_capacity=%d)\n",
+                           __func__, kv_chunk_n, ps.cache.capacity);
             return false;
         }
         ps.warmed_up = false; // need to re-warm after rebuild
@@ -6762,44 +6773,48 @@ bool llama_eagle3_prefill_chunked(
                 rt.async_buf.positions.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     };
 
-    // --- KV-only: single pass for all tokens except root ---------------------
-    // The KV graph is built for ps.cache.capacity tokens. We fill real data for
-    // [0, kv_only_count) and pad the rest with dummy indices pointing to the root
-    // position (which the root pass overwrites, so garbage there is harmless).
+    // --- KV-only: loop over chunks of at most kv_chunk_n tokens --------------
+    // The graph is built at kv_chunk_n width to keep per-dispatch compute buffer
+    // bounded. Each iteration binds a different slice of the input; the cache
+    // tensors baked into the graph receive writes at the positions we supply via
+    // t_k_idxs/t_v_idxs. The last chunk may be short — we pad any trailing graph
+    // slots with dummy indices pointing to kv_only_count (root position, which
+    // the root pass overwrites, so garbage there is harmless).
     int64_t t_kv = 0;
     if (kv_only_count > 0) {
         auto & kv = ps.kv_graph;
-        const int32_t graph_n = kv.n_tokens; // = ps.cache.capacity
+        const int32_t graph_n = kv.n_tokens; // = kv_chunk_n
 
-        // Bulk copy per-layer hidden captures for real tokens
-        if (!fill_hidden_bulk(kv.t_hidden_layers, 0, kv_only_count)) {
-            LLAMA_LOG_WARN("%s: fill_hidden_bulk(kv) failed (kv_only_count=%d, n_layers=%d, target_hidden=%d)\n",
-                           __func__, kv_only_count, hp.hidden_concat, hp.target_hidden_size);
-            for (int32_t il = 0; il < hp.hidden_concat; ++il) {
-                const ggml_tensor * src = hidden_capture[(size_t) il];
-                LLAMA_LOG_WARN("%s:   layer %d: src=%p type=%d ne=[%lld,%lld]\n",
-                               __func__, il, (const void*)src,
-                               src ? src->type : -1,
-                               src ? (long long)src->ne[0] : -1,
-                               src ? (long long)src->ne[1] : -1);
+        for (int32_t base = 0; base < kv_only_count; base += graph_n) {
+            const int32_t real_n = std::min(graph_n, kv_only_count - base);
+
+            // Per-layer hidden input: real rows [0..real_n). Trailing slots are
+            // left stale; they compute into dummy cache slots that get overwritten.
+            if (!fill_hidden_bulk(kv.t_hidden_layers, base, real_n)) {
+                LLAMA_LOG_WARN("%s: fill_hidden_bulk(kv) failed (base=%d, real_n=%d, kv_only_count=%d, n_layers=%d, target_hidden=%d)\n",
+                               __func__, base, real_n, kv_only_count, hp.hidden_concat, hp.target_hidden_size);
+                for (int32_t il = 0; il < hp.hidden_concat; ++il) {
+                    const ggml_tensor * src = hidden_capture[(size_t) il];
+                    LLAMA_LOG_WARN("%s:   layer %d: src=%p type=%d ne=[%lld,%lld]\n",
+                                   __func__, il, (const void*)src,
+                                   src ? src->type : -1,
+                                   src ? (long long)src->ne[0] : -1,
+                                   src ? (long long)src->ne[1] : -1);
+                }
+                return false;
             }
-            return false;
-        }
 
-        // Token ids: real for [0,kv_only_count), pad with token 0 for the rest
-        {
+            // Token ids: real for [0,real_n), pad with input_ids[0] for the rest.
             rt.async_buf.tokens.assign((size_t) graph_n, input_ids[0]);
-            std::memcpy(rt.async_buf.tokens.data(), input_ids, (size_t) kv_only_count * sizeof(llama_token));
+            std::memcpy(rt.async_buf.tokens.data(), input_ids + base, (size_t) real_n * sizeof(llama_token));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_tok,
                     rt.async_buf.tokens.data(), 0, (size_t) graph_n * sizeof(llama_token));
-        }
 
-        // Positions and KV indices: real for [0,kv_only_count), extra slots
-        // point to kv_only_count (root position, overwritten by root pass).
-        {
+            // Positions + k/v indices: real [base..base+real_n). Padding slots
+            // point to kv_only_count (root slot, overwritten by root pass).
             rt.async_buf.positions.assign((size_t) graph_n, kv_only_count);
-            for (int32_t i = 0; i < kv_only_count; ++i) {
-                rt.async_buf.positions[(size_t) i] = i;
+            for (int32_t i = 0; i < real_n; ++i) {
+                rt.async_buf.positions[(size_t) i] = base + i;
             }
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_pos,
                     rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
@@ -6807,12 +6822,14 @@ bool llama_eagle3_prefill_chunked(
                     rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
             ggml_backend_tensor_set_async(rt.backend_compute.get(), kv.t_v_idxs,
                     rt.async_buf.positions.data(), 0, (size_t) graph_n * sizeof(int32_t));
-        }
 
-        if (do_profile) { t_kv = ggml_time_us(); }
+            if (do_profile && base == 0) { t_kv = ggml_time_us(); }
 
-        if (ggml_backend_graph_compute_async(rt.backend_compute.get(), kv.gf) != GGML_STATUS_SUCCESS) {
-            return false;
+            if (ggml_backend_graph_compute_async(rt.backend_compute.get(), kv.gf) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_WARN("%s: kv-only graph_compute_async failed at base=%d, real_n=%d\n",
+                               __func__, base, real_n);
+                return false;
+            }
         }
     }
 

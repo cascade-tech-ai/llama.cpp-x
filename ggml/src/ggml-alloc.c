@@ -10,7 +10,7 @@
 #include <string.h>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MAX_FREE_BLOCKS 256
+#define MAX_FREE_BLOCKS 1024
 
 //#define GGML_ALLOCATOR_DEBUG
 

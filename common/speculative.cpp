@@ -697,6 +697,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     const std::string dump_dir;
     std::vector<float> hidden_concat_buf;
     bool enabled = false;
+    // Set by begin() iff prefill_to succeeds for the current prompt. Guards
+    // draft() against operating on an empty/partial prefix_state after a prefill
+    // failure (e.g. OOM while building the KV-only graph for a long prompt).
+    bool prompt_prefill_ok = false;
     common_speculative_tree last_tree;
     common_speculative_trace last_trace;
     llama_eagle3_state last_root_state;
@@ -783,7 +787,13 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 
     size_t prompt_prefill_chunk_limit() const {
-        return chunk_limit_from_env("CASCADE_EAGLE_PROMPT_PREFILL_CHUNK", 16);
+        // Sized for the fixed-KV prefill path (the default path): one graph is
+        // reused across chunks, so chunk size is a memory/throughput knob. The
+        // final value is clamped to n_ubatch in chunk_limit_from_env, so this
+        // is effectively just an upper bound above what n_ubatch permits. The
+        // legacy per-chunk-rebuild path is opt-in via CASCADE_EAGLE_OLD_PREFILL;
+        // callers relying on that may want to lower CASCADE_EAGLE_PROMPT_PREFILL_CHUNK.
+        return chunk_limit_from_env("CASCADE_EAGLE_PROMPT_PREFILL_CHUNK", 2048);
     }
 
     size_t generation_prefill_chunk_limit() const {
@@ -886,6 +896,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         }
 
         reset_prefix_cache();
+        prompt_prefill_ok = false;
 
         if (!enabled) {
             return;
@@ -929,13 +940,23 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zone, "eagle3/prompt_prefill");
         }
 #endif
-        prefill_to(prompt, seq_id);
+        const bool prefill_ok = prefill_to(prompt, seq_id);
 #if defined(GGML_USE_CUDA)
         if (profile_gpu) {
             pending_prompt_prefill_gpu_ms = ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zone, "eagle3/prompt_prefill");
         }
 #endif
         pending_prompt_prefill_us = ggml_time_us() - t_prefill_start;
+        if (!prefill_ok) {
+            // Loud error so this failure can never again masquerade as acc_len=0.
+            // Leave prefix_state cleared so draft() will short-circuit.
+            LOG_ERR("eagle3 begin: prefill_to failed for prompt of %zu tokens; "
+                    "disabling speculation for this prompt\n", prompt.size());
+            reset_prefix_cache();
+            prompt_prefill_ok = false;
+        } else {
+            prompt_prefill_ok = true;
+        }
         if (profile) {
 #if defined(GGML_USE_CUDA)
             if (profile_gpu) {
@@ -966,6 +987,14 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         if (!enabled) {
             LOG_WRN("eagle3 draft: not enabled\n");
+            return;
+        }
+
+        if (!prompt_prefill_ok) {
+            // prompt-time prefill failed in begin(); prefix_state is empty/partial
+            // and drafting from it would produce garbage (acc_len = 0). Fall back
+            // to no speculation for this prompt.
+            LOG_WRN("eagle3 draft: skipping (prompt prefill failed — see earlier ERR)\n");
             return;
         }
 
@@ -2632,6 +2661,30 @@ private:
         }
         prefix_tail_capture_idx = tail_idx;
         prefix_prompt_len = prompt_tgt.size();
+
+        // DEBUG: dump the eagle head's post-prefill hidden vector (norm + first 8 values).
+        if (std::getenv("CASCADE_EAGLE_DEBUG_POSTPREFILL")) {
+            fprintf(stderr, "POSTPREFILL: prompt=%zu path=%s prefix_state.past_len=%d "
+                    "has_dev=%d hidden.size=%zu\n",
+                    prompt_tgt.size(),
+                    use_fixed_kv_prefill ? "chunked" : (chunked_initial_prefill ? "legacy-per-chunk" : "incremental"),
+                    (int) prefix_state.past_len,
+                    (int) (prefix_state.dev ? 1 : 0),
+                    prefix_state.hidden.size());
+            std::vector<float> head_hidden;
+            if (llama_eagle3_state_get_hidden(*model, rt, prefix_state, head_hidden)) {
+                double sq = 0.0;
+                for (float v : head_hidden) sq += (double) v * (double) v;
+                const double norm = std::sqrt(sq);
+                fprintf(stderr, "POSTPREFILL: hidden_norm=%.4f first8=[", norm);
+                for (size_t k = 0; k < std::min<size_t>(8, head_hidden.size()); ++k) {
+                    fprintf(stderr, "%s%.4f", k > 0 ? "," : "", head_hidden[k]);
+                }
+                fprintf(stderr, "]\n");
+            } else {
+                fprintf(stderr, "POSTPREFILL: state_get_hidden FAILED\n");
+            }
+        }
         if (profile && n_prefill_passes > 0) {
 #if defined(GGML_USE_CUDA)
             if (profile_gpu) {
