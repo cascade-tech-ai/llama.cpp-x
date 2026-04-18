@@ -261,7 +261,62 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_qkv_mix;
     ggml_tensor * state_predelta = nullptr;
 
-    if (!recurrent_parent_index.empty() && n_seq_tokens > 1) {
+    // Detect pure-serial parent chain: parents == [-1, 0, 1, ..., n-1].
+    // In that case the per-token conv window coincides with the contiguous sliding
+    // window over [conv_states_prev; qkv_mixed], so we can use the batched ssm_conv
+    // kernel and still expose per-token conv states for accept-time commit.
+    bool is_pure_serial = !recurrent_parent_index.empty() && n_seq_tokens > 1 &&
+                          (int64_t) recurrent_parent_index.size() == n_seq_tokens &&
+                          recurrent_parent_index[0] == -1;
+    for (int64_t t = 1; t < n_seq_tokens && is_pure_serial; ++t) {
+        if (recurrent_parent_index[t] != (int32_t)(t - 1)) {
+            is_pure_serial = false;
+        }
+    }
+
+    if (is_pure_serial) {
+        // Batched serial conv: one concat + one ssm_conv, with per-token conv state
+        // snapshots exposed as contiguous views of conv_input's sliding windows.
+        const int64_t d_conv_minus_1 = conv_kernel_size - 1;
+
+        // conv_input: [d_conv-1 + n_seq_tokens, channels, n_seqs]
+        ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+        cb(conv_input, "conv_input_batched_serial", il);
+
+        // Per-token conv state cache: for token t (0..n-1), state is rows
+        // [t+1 .. t+d_conv-1] of conv_input along dim 0, i.e. the d_conv-1
+        // entries ending at column t+d_conv-1 (immediately after token t's input).
+        auto & conv_cache_vec = res->t_conv_state_cache[il];
+        conv_cache_vec.resize(n_seq_tokens, nullptr);
+        for (int64_t t = 0; t < n_seq_tokens; ++t) {
+            ggml_tensor * state_view = ggml_view_3d(ctx0, conv_input,
+                d_conv_minus_1, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                (t + 1) * ggml_element_size(conv_input));
+            ggml_tensor * state_cont = ggml_cont_3d(ctx0, state_view,
+                d_conv_minus_1, conv_channels, n_seqs);
+            ggml_set_output(state_cont);
+            ggml_build_forward_expand(gf, state_cont);
+            conv_cache_vec[t] = state_cont;
+        }
+
+        // Update persistent conv state with last token's state (will be overwritten
+        // by commit with accepted token's state).
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+            ggml_reshape_1d(ctx0, conv_cache_vec[n_seq_tokens - 1],
+                d_conv_minus_1 * conv_channels * n_seqs),
+            ggml_view_1d(ctx0, conv_states_all,
+                d_conv_minus_1 * conv_channels * n_seqs,
+                kv_head * d_conv_minus_1 * conv_channels * ggml_element_size(conv_states_all))));
+
+        ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state_predelta = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_batched_serial", il);
+
+        conv_qkv_mix = ggml_silu(ctx0, conv_output_proper);
+    } else if (!recurrent_parent_index.empty() && n_seq_tokens > 1) {
         // Per-token conv unrolling for tree/serial speculative decoding.
         // Each token loads its parent's conv state instead of using sequential order.
         // Tokens are sorted by depth (parents before children) so dependencies are safe.
