@@ -2265,9 +2265,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    // Allow forcing the MMVQ->MMQ crossover below the default of 8. For speculative
+    // decoding validation (seq=2..8 against large quantized weights), MMQ batched
+    // GEMM beats MMVQ looped over tokens. Set GGML_CUDA_MMVQ_MAX_BATCH=1 to force MMQ
+    // for all seq>=2, or any other value to tune.
+    static const int mmvq_max_batch = []() {
+        const char * s = getenv("GGML_CUDA_MMVQ_MAX_BATCH");
+        if (s == nullptr) return MMVQ_MAX_BATCH_SIZE;
+        int v = atoi(s);
+        return v < 0 ? MMVQ_MAX_BATCH_SIZE : v;
+    }();
+
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        && src1->ne[1] <= mmvq_max_batch;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
