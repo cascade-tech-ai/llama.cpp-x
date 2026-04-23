@@ -921,6 +921,230 @@ bool build_logits_graph(
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Serial rollout fast path: reuse graph across depths & target passes via a
+// persistent rollout-scratch K/V buffer. Current K/V lands at slot `t_kv_idx`
+// via ggml_set_rows, attention masks unused slots. Graph key = kv_capacity
+// only, so CUDA graph replay activates after warmup and stays hot.
+// -----------------------------------------------------------------------------
+
+bool ensure_rollout_scratch(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t needed_capacity) {
+    if (!rt.buft_compute || needed_capacity <= 0) {
+        return false;
+    }
+    if (rt.rollout_scratch_k && rt.rollout_scratch_v && rt.rollout_scratch_capacity >= needed_capacity) {
+        return true;
+    }
+
+    const auto & hp = model.hparams;
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 8);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, needed_capacity);
+    ggml_tensor * t_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, needed_capacity);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    if (!buf) {
+        return false;
+    }
+
+    // Release the old scratch (if any) and the graph that referenced it — the
+    // graph held ggml_tensor pointers into the old buffer that are now stale.
+    rt.serial_rollout_graph = {};
+    rt.serial_rollout_graph_kv_cap = -1;
+    rt.rollout_scratch_ctx        = std::move(ctx);
+    rt.rollout_scratch_buf        = std::move(buf);
+    rt.rollout_scratch_k          = t_k;
+    rt.rollout_scratch_v          = t_v;
+    rt.rollout_scratch_capacity   = needed_capacity;
+    return true;
+}
+
+bool build_serial_rollout_graph(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t kv_capacity,
+        int32_t hidden_in_dim,
+        llama_eagle3_serial_rollout_graph & graph) {
+    if (graph.ctx && graph.buf_compute && graph.gf &&
+        graph.kv_capacity == kv_capacity && graph.hidden_in_dim == hidden_in_dim) {
+        return true;
+    }
+    if (!rt.tok_embd || !rt.rollout_scratch_k || !rt.rollout_scratch_v ||
+        rt.rollout_scratch_capacity < kv_capacity) {
+        return false;
+    }
+
+    const auto & hp      = model.hparams;
+    const auto & tensors = get_runtime_tensors(model, rt);
+
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 2048);
+    if (!ctx) {
+        return false;
+    }
+
+    // Inputs (runtime values per call) ---------------------------------------
+    ggml_tensor * t_hidden_in = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden_in_dim, 1);
+    ggml_set_input(t_hidden_in);
+
+    ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_tok);
+
+    ggml_tensor * t_pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_pos);
+
+    ggml_tensor * t_kv_idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+    ggml_set_input(t_kv_idx);
+
+    ggml_tensor * t_v_idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+    ggml_set_input(t_v_idx);
+
+    // flash_attn expects F16 mask. Shape [kv_capacity, 1, 1, 1].
+    ggml_tensor * t_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, kv_capacity, 1, 1, 1);
+    ggml_set_input(t_mask);
+
+    // embedding + norms ------------------------------------------------------
+    ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
+    t_embd = ggml_cast(ctx.get(), t_embd, GGML_TYPE_F32);
+
+    ggml_tensor * t_hidden = t_hidden_in;
+    if (hidden_in_dim != hp.hidden_size) {
+        t_hidden = ggml_mul_mat(ctx.get(), tensors.fc_w, t_hidden_in);
+    }
+
+    ggml_tensor * t_hidden_norm = ggml_rms_norm(ctx.get(), t_hidden, hp.rms_norm_eps);
+    ggml_tensor * t_hidden_norm_w = ggml_cast(ctx.get(), tensors.hidden_norm_w, GGML_TYPE_F32);
+    t_hidden_norm = ggml_mul(ctx.get(), t_hidden_norm, t_hidden_norm_w);
+
+    ggml_tensor * t_embd_norm = ggml_rms_norm(ctx.get(), t_embd, hp.rms_norm_eps);
+    ggml_tensor * t_input_norm_w = ggml_cast(ctx.get(), tensors.input_norm_w, GGML_TYPE_F32);
+    t_embd_norm = ggml_mul(ctx.get(), t_embd_norm, t_input_norm_w);
+
+    ggml_tensor * t_cat = ggml_concat(ctx.get(), t_embd_norm, t_hidden_norm, 0);
+
+    // Q/K/V projections ------------------------------------------------------
+    ggml_tensor * t_q = ggml_mul_mat(ctx.get(), tensors.attn_q_w, t_cat);
+    if (tensors.attn_q_b) {
+        t_q = ggml_add(ctx.get(), t_q, ggml_cast(ctx.get(), tensors.attn_q_b, GGML_TYPE_F32));
+    }
+    ggml_tensor * t_k = ggml_mul_mat(ctx.get(), tensors.attn_k_w, t_cat);
+    if (tensors.attn_k_b) {
+        t_k = ggml_add(ctx.get(), t_k, ggml_cast(ctx.get(), tensors.attn_k_b, GGML_TYPE_F32));
+    }
+    ggml_tensor * t_v = ggml_mul_mat(ctx.get(), tensors.attn_v_w, t_cat);
+    if (tensors.attn_v_b) {
+        t_v = ggml_add(ctx.get(), t_v, ggml_cast(ctx.get(), tensors.attn_v_b, GGML_TYPE_F32));
+    }
+
+    t_q = ggml_reshape_3d(ctx.get(), t_q, hp.head_dim, hp.num_heads,    1);
+    t_k = ggml_reshape_3d(ctx.get(), t_k, hp.head_dim, hp.num_kv_heads, 1);
+    t_v = ggml_reshape_3d(ctx.get(), t_v, hp.head_dim, hp.num_kv_heads, 1);
+
+    t_q = ggml_rope_ext(ctx.get(), t_q, t_pos, rt.rope_factors,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
+            rt.rope_freq_base, rt.rope_freq_scale,
+            rt.yarn_ext_factor, rt.yarn_attn_factor,
+            rt.yarn_beta_fast, rt.yarn_beta_slow);
+    t_k = ggml_rope_ext(ctx.get(), t_k, t_pos, rt.rope_factors,
+            hp.n_rot, rt.rope_type, rt.n_ctx_orig,
+            rt.rope_freq_base, rt.rope_freq_scale,
+            rt.yarn_ext_factor, rt.yarn_attn_factor,
+            rt.yarn_beta_fast, rt.yarn_beta_slow);
+
+    // Scatter current K/V into the persistent rollout-scratch at slot kv_idx.
+    // ggml_set_rows returns a view of the destination with those rows updated,
+    // so subsequent reads (attention) see the scatter result.
+    const int32_t kv_row = hp.head_dim * hp.num_kv_heads;
+    ggml_tensor * t_k_flat = ggml_reshape_2d(ctx.get(), t_k, kv_row, 1);
+    ggml_tensor * t_v_flat = ggml_reshape_2d(ctx.get(), t_v, kv_row, 1);
+
+    ggml_tensor * scratch_k_2d = ggml_reshape_2d(ctx.get(), rt.rollout_scratch_k, kv_row, kv_capacity);
+    ggml_tensor * scratch_v_2d = ggml_reshape_2d(ctx.get(), rt.rollout_scratch_v, kv_row, kv_capacity);
+
+    ggml_tensor * t_k_write = ggml_set_rows(ctx.get(), scratch_k_2d, t_k_flat, t_kv_idx);
+    ggml_tensor * t_v_write = ggml_set_rows(ctx.get(), scratch_v_2d, t_v_flat, t_v_idx);
+
+    // Reshape back for attention: [head_dim, n_kv_heads, kv_capacity, 1]
+    ggml_tensor * t_k_all = ggml_reshape_4d(ctx.get(), t_k_write, hp.head_dim, hp.num_kv_heads, kv_capacity, 1);
+    ggml_tensor * t_v_all = ggml_reshape_4d(ctx.get(), t_v_write, hp.head_dim, hp.num_kv_heads, kv_capacity, 1);
+
+    // Attention over the whole padded scratch; mask disables unused slots.
+    ggml_tensor * t_attn_out = build_eagle_attn_output(
+            ctx.get(), hp, rt, t_q, t_k_all, t_v_all, t_mask,
+            "serial_rollout", rt.flash_attn_logged_step);
+
+    // O proj + residual + FFN ------------------------------------------------
+    ggml_tensor * t_attn = ggml_mul_mat(ctx.get(), tensors.attn_o_w, t_attn_out);
+    if (tensors.attn_o_b) {
+        t_attn = ggml_add(ctx.get(), t_attn, ggml_cast(ctx.get(), tensors.attn_o_b, GGML_TYPE_F32));
+    }
+
+    ggml_tensor * t_resid = hp.norm_before_residual ? t_hidden_norm : t_hidden;
+    ggml_tensor * t_ha = ggml_add(ctx.get(), t_attn, t_resid);
+
+    ggml_tensor * t_post = ggml_rms_norm(ctx.get(), t_ha, hp.rms_norm_eps);
+    ggml_tensor * t_post_norm_w = ggml_cast(ctx.get(), tensors.post_norm_w, GGML_TYPE_F32);
+    t_post = ggml_mul(ctx.get(), t_post, t_post_norm_w);
+
+    ggml_tensor * t_gate = ggml_mul_mat(ctx.get(), tensors.ffn_gate_w, t_post);
+    if (tensors.ffn_gate_b) {
+        t_gate = ggml_add(ctx.get(), t_gate, ggml_cast(ctx.get(), tensors.ffn_gate_b, GGML_TYPE_F32));
+    }
+    ggml_tensor * t_up = ggml_mul_mat(ctx.get(), tensors.ffn_up_w, t_post);
+    if (tensors.ffn_up_b) {
+        t_up = ggml_add(ctx.get(), t_up, ggml_cast(ctx.get(), tensors.ffn_up_b, GGML_TYPE_F32));
+    }
+    ggml_tensor * t_ffn = ggml_mul_mat(ctx.get(), tensors.ffn_down_w,
+            ggml_mul(ctx.get(), ggml_silu(ctx.get(), t_gate), t_up));
+    if (tensors.ffn_down_b) {
+        t_ffn = ggml_add(ctx.get(), t_ffn, ggml_cast(ctx.get(), tensors.ffn_down_b, GGML_TYPE_F32));
+    }
+
+    ggml_tensor * t_hidden_out = ggml_add(ctx.get(), t_ha, t_ffn);
+    t_hidden_out = ggml_cont(ctx.get(), t_hidden_out);
+
+    // Fused lm_head: compute logits from the post-step hidden so the caller
+    // only needs one D->H round-trip per depth instead of two (one for the
+    // hidden, one for the logits).
+    ggml_tensor * t_norm_out = ggml_rms_norm(ctx.get(), t_hidden_out, hp.rms_norm_eps);
+    ggml_tensor * t_norm_w  = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
+    t_norm_out = ggml_mul(ctx.get(), t_norm_out, t_norm_w);
+    ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm_out);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, t_hidden_out);
+    ggml_build_forward_expand(gf, t_logits);
+
+    ggml_backend_buffer_ptr buf_compute;
+    if (rt.buft_compute) {
+        buf_compute.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
+    }
+    if (!buf_compute) {
+        return false;
+    }
+
+    graph.ctx           = std::move(ctx);
+    graph.buf_compute   = std::move(buf_compute);
+    graph.gf            = gf;
+    graph.kv_capacity   = kv_capacity;
+    graph.hidden_in_dim = hidden_in_dim;
+    graph.t_hidden_in   = t_hidden_in;
+    graph.t_tok         = t_tok;
+    graph.t_pos         = t_pos;
+    graph.t_kv_idx      = t_kv_idx;
+    graph.t_v_idx       = t_v_idx;
+    graph.t_mask        = t_mask;
+    graph.t_hidden_out  = t_hidden_out;
+    graph.t_logits      = t_logits;
+    return true;
+}
+
 bool build_topk_graph(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
@@ -4188,6 +4412,153 @@ bool llama_eagle3_logits(
 
     logits_out.resize(hp.draft_vocab_size);
     std::memcpy(logits_out.data(), t_logits->data, hp.draft_vocab_size * sizeof(float));
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Serial rollout fast path entry points.
+// -----------------------------------------------------------------------------
+
+// Round up `n` to a multiple of `pad`.
+static int32_t pad_up_i32(int32_t n, int32_t pad) {
+    return ((n + pad - 1) / pad) * pad;
+}
+
+bool llama_eagle3_rollout_begin(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & from_state,
+        int32_t max_rollout_depth) {
+    if (!rt.backend_compute || !rt.buft_compute) {
+        return false;
+    }
+    if (!from_state.dev || !from_state.dev->t_k || !from_state.dev->t_v) {
+        return false;
+    }
+    if (max_rollout_depth < 0) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+
+    // Padded scratch capacity: enough for (past + root + all rollout slots),
+    // rounded up to the same 256-multiple llama's KV cache uses so the graph
+    // key stays stable across target passes.
+    const int32_t needed = from_state.past_len + max_rollout_depth + 1;
+    const int32_t capacity = std::max(256, pad_up_i32(needed, 256));
+
+    if (!ensure_rollout_scratch(model, rt, capacity)) {
+        return false;
+    }
+
+    if (rt.serial_rollout_graph_kv_cap != rt.rollout_scratch_capacity) {
+        rt.serial_rollout_graph = {};
+        const int32_t hidden_in_dim = hp.hidden_size;
+        if (!build_serial_rollout_graph(model, rt, rt.rollout_scratch_capacity, hidden_in_dim,
+                                        rt.serial_rollout_graph)) {
+            return false;
+        }
+        rt.serial_rollout_graph_kv_cap = rt.rollout_scratch_capacity;
+    }
+
+    // Seed the scratch K/V with the valid prefix from the persistent cache.
+    // Slots past `from_state.past_len` will be stomped by subsequent set_rows
+    // writes (for valid depths) or masked out (for slots beyond the deepest
+    // depth reached), so we don't need to clear them.
+    if (from_state.past_len > 0) {
+        if (!tensor_copy_3d_prefix_async(
+                    rt.backend_compute.get(),
+                    from_state.dev->t_k, rt.rollout_scratch_k,
+                    hp.head_dim, hp.num_kv_heads, from_state.past_len)) {
+            return false;
+        }
+        if (!tensor_copy_3d_prefix_async(
+                    rt.backend_compute.get(),
+                    from_state.dev->t_v, rt.rollout_scratch_v,
+                    hp.head_dim, hp.num_kv_heads, from_state.past_len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_eagle3_rollout_step(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t pos,
+        int32_t slot,
+        const float * hidden_in,
+        int32_t hidden_in_dim,
+        llama_token input_id,
+        std::vector<float> & hidden_out,
+        std::vector<float> & logits_out) {
+    if (!rt.backend_compute || !rt.buft_compute) {
+        return false;
+    }
+    if (!hidden_in || hidden_in_dim <= 0) {
+        return false;
+    }
+
+    const auto & hp = model.hparams;
+
+    if (rt.serial_rollout_graph_kv_cap < 0 || !rt.serial_rollout_graph.gf) {
+        return false;
+    }
+    if (slot < 0 || slot >= rt.serial_rollout_graph.kv_capacity) {
+        return false;
+    }
+    if (hidden_in_dim != rt.serial_rollout_graph.hidden_in_dim) {
+        return false;
+    }
+
+    auto & graph = rt.serial_rollout_graph;
+
+    // Upload inputs
+    rt.async_buf.hidden.assign(hidden_in, hidden_in + hidden_in_dim);
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in,
+            rt.async_buf.hidden.data(), 0, (size_t) hidden_in_dim * sizeof(float));
+
+    rt.async_buf.tok = input_id;
+    rt.async_buf.pos = pos;
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok,
+            &rt.async_buf.tok, 0, sizeof(rt.async_buf.tok));
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos,
+            &rt.async_buf.pos, 0, sizeof(rt.async_buf.pos));
+
+    const int64_t idx64 = slot;
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_kv_idx,
+            &idx64, 0, sizeof(int64_t));
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_v_idx,
+            &idx64, 0, sizeof(int64_t));
+
+    // Mask: F16 with 0 for valid past slots [0, slot] (inclusive of the just-
+    // written slot) and -INF for the dead zone [slot+1, kv_capacity).
+    const int32_t cap = graph.kv_capacity;
+    rt.async_buf.mask_data.resize((size_t) cap);
+    const uint16_t zero_f16    = ggml_fp32_to_fp16(0.0f);
+    const uint16_t neg_inf_f16 = ggml_fp32_to_fp16(-INFINITY);
+    for (int32_t i = 0; i <= slot; ++i) {
+        rt.async_buf.mask_data[(size_t) i] = zero_f16;
+    }
+    for (int32_t i = slot + 1; i < cap; ++i) {
+        rt.async_buf.mask_data[(size_t) i] = neg_inf_f16;
+    }
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_mask,
+            rt.async_buf.mask_data.data(), 0, (size_t) cap * sizeof(uint16_t));
+
+    const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    // Download outputs: one D->H round-trip for hidden+logits, then sync.
+    hidden_out.resize(hp.hidden_size);
+    logits_out.resize(hp.draft_vocab_size);
+    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_hidden_out,
+            hidden_out.data(), 0, (size_t) hp.hidden_size * sizeof(float));
+    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_logits,
+            logits_out.data(), 0, (size_t) hp.draft_vocab_size * sizeof(float));
+    ggml_backend_synchronize(rt.backend_compute.get());
     return true;
 }
 

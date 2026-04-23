@@ -1335,8 +1335,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
         // ---- Serial greedy rollout (no beam search) ----
         if (params.eagle_serial) {
-            llama_eagle3_state cur_state = root_state;
-
             llama_tokens chain;
             float greedy_cum_prob = 1.0f;
 
@@ -1347,108 +1345,132 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 #endif
 
-            for (int depth = 0; depth < max_depth; ++depth) {
-                // Get the hidden vector from the current state.
-                std::vector<float> cur_hidden;
-                {
-#if defined(GGML_USE_CUDA)
-                    ggml_backend_cuda_profiler_zone zh = {};
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
-                    }
-#endif
-                    if (!llama_eagle3_state_get_hidden(*model, rt, cur_state, cur_hidden)) {
-#if defined(GGML_USE_CUDA)
-                        if (profile_gpu) {
-                            ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
-                        }
-#endif
-                        break;
-                    }
-#if defined(GGML_USE_CUDA)
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
-                    }
-#endif
-                }
+            // Fast path: scratch-KV rollout with fused lm_head, constant graph
+            // shape (CUDA-graph replay friendly) and no per-depth writes to the
+            // persistent cache. Rollout K/V is throwaway and will be rebuilt
+            // from teacher hiddens at accept time by llama_eagle3_ar_kv_regen.
+            const bool use_rollout_scratch = (rt.backend_compute && rt.buft_compute &&
+                                               llama_eagle3_rollout_begin(*model, rt, root_state, max_depth));
 
-                // Compute logits and pick the argmax token.
-                std::vector<float> logits;
-                {
-#if defined(GGML_USE_CUDA)
-                    ggml_backend_cuda_profiler_zone zl = {};
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zl, "eagle3/rollout_logits");
-                    }
-#endif
-                    const bool ok = llama_eagle3_logits(*model, rt, cur_hidden.data(), logits);
-#if defined(GGML_USE_CUDA)
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zl, "eagle3/rollout_logits");
-                    }
-#endif
-                    if (!ok) {
-                        LOG_WRN("eagle3 serial: logits failed at depth %d\n", depth);
-                        break;
-                    }
-                }
-
-                const int32_t draft_vocab = model->hparams.draft_vocab_size;
+            // Shared decode helper: given logits, produce (draft_idx, base_id).
+            // Returns false if the sampled token is invalid (fall out of loop).
+            const int32_t draft_vocab = model->hparams.draft_vocab_size;
+            auto decode_logits = [&](const std::vector<float> & logits,
+                                     llama_token & out_token,
+                                     float & out_best) -> bool {
                 int32_t best_idx = 0;
-                float   best_val = logits[0];
+                float best_val = logits.empty() ? 0.0f : logits[0];
                 for (int32_t j = 1; j < draft_vocab && j < (int32_t) logits.size(); ++j) {
                     if (logits[(size_t) j] > best_val) {
                         best_val = logits[(size_t) j];
                         best_idx = j;
                     }
                 }
-
-                // Compute greedy token probability via softmax.
                 if (adaptive_depth_threshold > 0.0f) {
-                    float max_logit = best_val;
                     double sum_exp = 0.0;
                     for (int32_t j = 0; j < draft_vocab && j < (int32_t) logits.size(); ++j) {
-                        sum_exp += std::exp((double)(logits[(size_t) j] - max_logit));
+                        sum_exp += std::exp((double)(logits[(size_t) j] - best_val));
                     }
-                    float greedy_prob = (float)(1.0 / sum_exp);
+                    float greedy_prob = (float) (1.0 / sum_exp);
                     greedy_cum_prob *= greedy_prob;
-
                     if (greedy_cum_prob < adaptive_depth_threshold) {
+                        return false;
+                    }
+                }
+                const int32_t base_id = best_idx + model->d2t[(size_t) best_idx];
+                if (base_id < 0 || base_id >= model->hparams.vocab_size) {
+                    return false;
+                }
+                out_best = best_val;
+                out_token = (llama_token) base_id;
+                return true;
+            };
+
+            if (use_rollout_scratch) {
+                // Bootstrap: get the root's hidden and its logits so we can pick
+                // the first token. These two D->H round-trips happen once per
+                // cycle; subsequent depths get hidden + logits in a single fused
+                // rollout_step call.
+                std::vector<float> cur_hidden;
+                std::vector<float> bootstrap_logits;
+                bool bootstrap_ok =
+                    llama_eagle3_state_get_hidden(*model, rt, root_state, cur_hidden) &&
+                    llama_eagle3_logits(*model, rt, cur_hidden.data(), bootstrap_logits);
+
+                if (bootstrap_ok) {
+                    llama_token next_token = 0;
+                    float next_best = 0.0f;
+                    if (!decode_logits(bootstrap_logits, next_token, next_best)) {
+                        // adaptive-depth cutoff or invalid token before any step
+                        goto rollout_end;
+                    }
+                    chain.push_back(next_token);
+
+                    const int32_t base_past_len = root_state.past_len;
+                    for (int depth = 0; depth < max_depth; ++depth) {
+                        const int32_t pos  = base_past_len + depth;
+                        const int32_t slot = pos;
+
+                        std::vector<float> step_hidden;
+                        std::vector<float> step_logits;
+                        if (!llama_eagle3_rollout_step(*model, rt, pos, slot,
+                                    cur_hidden.data(), hidden_size, next_token,
+                                    step_hidden, step_logits)) {
+                            LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
+                            break;
+                        }
+
+                        if (depth + 1 >= max_depth) {
+                            break;  // last iteration; no need for another sample
+                        }
+
+                        cur_hidden = std::move(step_hidden);
+                        llama_token sampled = 0;
+                        float sampled_best = 0.0f;
+                        if (!decode_logits(step_logits, sampled, sampled_best)) {
+                            break;
+                        }
+                        next_token = sampled;
+                        chain.push_back(next_token);
+                    }
+                }
+            } else {
+                // Original slow path: graph rebuilt every call; kept as a
+                // fallback when the scratch allocation or begin fails.
+                llama_eagle3_state cur_state = root_state;
+
+                for (int depth = 0; depth < max_depth; ++depth) {
+                    std::vector<float> cur_hidden;
+                    if (!llama_eagle3_state_get_hidden(*model, rt, cur_state, cur_hidden)) {
+                        break;
+                    }
+
+                    std::vector<float> logits;
+                    if (!llama_eagle3_logits(*model, rt, cur_hidden.data(), logits)) {
+                        LOG_WRN("eagle3 serial: logits failed at depth %d\n", depth);
+                        break;
+                    }
+
+                    llama_token token = 0;
+                    float best_val = 0.0f;
+                    if (!decode_logits(logits, token, best_val)) {
+                        break;
+                    }
+                    chain.push_back(token);
+
+                    if (!llama_eagle3_step(*model, rt, cur_state,
+                                nullptr, hidden_size, token, nullptr, nullptr)) {
                         break;
                     }
                 }
-
-                const int32_t base_id = best_idx + model->d2t[(size_t) best_idx];
-                if (base_id < 0 || base_id >= model->hparams.vocab_size) {
-                    break;
-                }
-                const llama_token token = (llama_token) base_id;
-                chain.push_back(token);
-
-                // Step eagle head forward by one token.
-                {
-#if defined(GGML_USE_CUDA)
-                    ggml_backend_cuda_profiler_zone zs = {};
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zs, "eagle3/rollout_step");
-                    }
-#endif
-                    const bool ok = llama_eagle3_step(*model, rt, cur_state,
-                                nullptr, hidden_size, token, nullptr, nullptr);
-#if defined(GGML_USE_CUDA)
-                    if (profile_gpu) {
-                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zs, "eagle3/rollout_step");
-                    }
-#endif
-                    if (!ok) break;
-                }
             }
-
+rollout_end:
 #if defined(GGML_USE_CUDA)
             if (profile_gpu) {
                 ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &rollout_zone, "eagle3/rollout_serial");
             }
 #endif
+            (void) 0;
 
             if (chain.empty()) {
                 return;

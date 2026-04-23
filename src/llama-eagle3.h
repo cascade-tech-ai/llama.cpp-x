@@ -123,6 +123,31 @@ struct llama_eagle3_step_graph {
     ggml_tensor * t_logits     = nullptr;
 };
 
+// Serial-rollout single-token step graph. Unlike `llama_eagle3_step_graph`, this
+// variant does NOT consume a per-call `past_len` view; instead it references a
+// persistent rollout-scratch K/V buffer in the runtime (fixed shape = `kv_capacity`)
+// and writes the current K/V to slot `t_kv_idx` via ggml_set_rows. The graph key is
+// (kv_capacity, hidden_in_dim) — stable across target passes, so CUDA graph replay
+// activates once warmed up.
+struct llama_eagle3_serial_rollout_graph {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf_compute;
+    ggml_cgraph *           gf = nullptr;
+
+    int32_t                 kv_capacity   = 0;
+    int32_t                 hidden_in_dim = 0;
+
+    ggml_tensor * t_hidden_in  = nullptr; // [hidden_in_dim, 1]
+    ggml_tensor * t_tok        = nullptr; // [1]
+    ggml_tensor * t_pos        = nullptr; // [1]
+    ggml_tensor * t_kv_idx     = nullptr; // [1] I64 scatter index for K
+    ggml_tensor * t_v_idx      = nullptr; // [1] I64 scatter index for V
+    ggml_tensor * t_mask       = nullptr; // [kv_capacity, 1, 1, 1]
+
+    ggml_tensor * t_hidden_out = nullptr; // [hidden_size, 1]
+    ggml_tensor * t_logits     = nullptr; // [draft_vocab_size, 1]   (fused lm_head)
+};
+
 struct llama_eagle3_step_multi_graph {
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf_compute;
@@ -246,6 +271,17 @@ struct llama_eagle3_runtime {
     ggml_backend_buffer_ptr buf_weights_compute;
     llama_eagle3_tensors    tensors_compute;
 
+    // Rollout-scratch K/V buffer used by the serial-rollout fast path. Shape
+    // [head_dim, n_kv_heads, rollout_scratch_capacity], allocated in its own
+    // backend buffer so the graph can reference it as a stable input tensor
+    // across rollouts (no per-call copy of past K/V into the graph).
+    // Mutable because allocated lazily at first rollout_begin().
+    mutable ggml_context_ptr        rollout_scratch_ctx;
+    mutable ggml_backend_buffer_ptr rollout_scratch_buf;
+    mutable ggml_tensor *           rollout_scratch_k = nullptr;
+    mutable ggml_tensor *           rollout_scratch_v = nullptr;
+    mutable int32_t                 rollout_scratch_capacity = 0;
+
     // Reusable compute graphs for backend execution.
     mutable llama_eagle3_logits_graph logits_graph;
     mutable llama_eagle3_topk_graph topk_graph;
@@ -253,6 +289,8 @@ struct llama_eagle3_runtime {
     mutable llama_eagle3_select_batch_graph select_batch_graph;
     mutable uint64_t step_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_graph step_graph;
+    mutable int32_t  serial_rollout_graph_kv_cap = -1;
+    mutable llama_eagle3_serial_rollout_graph serial_rollout_graph;
     mutable uint64_t step_multi_graph_key = ~uint64_t(0);
     mutable llama_eagle3_step_multi_graph step_multi_graph;
     mutable uint64_t step_batch_graph_key = ~uint64_t(0);
@@ -356,6 +394,34 @@ bool llama_eagle3_logits(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         const float * hidden,
+        std::vector<float> & logits_out);
+
+// Serial-rollout fast path. Before the first call for a rollout, the caller
+// must invoke llama_eagle3_rollout_begin() to seed the rollout scratch K/V
+// from the rollout's starting state. Each call then performs one draft-step
+// forward (attn+ffn) using the scratch as the KV history, writes current K/V
+// into the scratch at `slot`, and returns the post-step hidden as well as the
+// lm_head logits for the *input* position (fused — saves a D->H round-trip).
+//
+// During the rollout, the caller does NOT modify persistent state: `slot` and
+// `pos` are tracked by the caller. At accept time, llama_eagle3_ar_kv_regen
+// rebuilds the persistent cache from teacher hiddens, so any K/V left in the
+// scratch is simply discarded.
+bool llama_eagle3_rollout_begin(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        const llama_eagle3_state & from_state,
+        int32_t max_rollout_depth);
+
+bool llama_eagle3_rollout_step(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t pos,
+        int32_t slot,
+        const float * hidden_in,
+        int32_t hidden_in_dim,
+        llama_token input_id,
+        std::vector<float> & hidden_out,
         std::vector<float> & logits_out);
 
 bool llama_eagle3_topk(
