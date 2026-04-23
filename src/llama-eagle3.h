@@ -413,15 +413,16 @@ bool llama_eagle3_rollout_begin(
         const llama_eagle3_state & from_state,
         int32_t max_rollout_depth);
 
+// Rollout step — reads teacher hidden from the graph's internal device-side
+// hidden buffer (seeded by llama_eagle3_rollout_begin for the first call and
+// refreshed via D2D copy from the previous call's hidden_out for subsequent
+// calls). Returns only the logits (D->H); hidden stays on device.
 bool llama_eagle3_rollout_step(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         int32_t pos,
         int32_t slot,
-        const float * hidden_in,
-        int32_t hidden_in_dim,
         llama_token input_id,
-        std::vector<float> & hidden_out,
         std::vector<float> & logits_out);
 
 bool llama_eagle3_topk(

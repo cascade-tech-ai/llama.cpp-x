@@ -1387,10 +1387,10 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             };
 
             if (use_rollout_scratch) {
-                // Bootstrap: get the root's hidden and its logits so we can pick
-                // the first token. These two D->H round-trips happen once per
-                // cycle; subsequent depths get hidden + logits in a single fused
-                // rollout_step call.
+                // Bootstrap: compute logits for the root position so we can
+                // pick the first token. This is the only place we need the
+                // root's hidden on the CPU; all subsequent depths keep hidden
+                // on device and only bring logits back.
                 std::vector<float> cur_hidden;
                 std::vector<float> bootstrap_logits;
                 bool bootstrap_ok =
@@ -1401,7 +1401,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     llama_token next_token = 0;
                     float next_best = 0.0f;
                     if (!decode_logits(bootstrap_logits, next_token, next_best)) {
-                        // adaptive-depth cutoff or invalid token before any step
                         goto rollout_end;
                     }
                     chain.push_back(next_token);
@@ -1411,11 +1410,9 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         const int32_t pos  = base_past_len + depth;
                         const int32_t slot = pos;
 
-                        std::vector<float> step_hidden;
                         std::vector<float> step_logits;
                         if (!llama_eagle3_rollout_step(*model, rt, pos, slot,
-                                    cur_hidden.data(), hidden_size, next_token,
-                                    step_hidden, step_logits)) {
+                                    next_token, step_logits)) {
                             LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
                             break;
                         }
@@ -1424,7 +1421,6 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                             break;  // last iteration; no need for another sample
                         }
 
-                        cur_hidden = std::move(step_hidden);
                         llama_token sampled = 0;
                         float sampled_best = 0.0f;
                         if (!decode_logits(step_logits, sampled, sampled_best)) {

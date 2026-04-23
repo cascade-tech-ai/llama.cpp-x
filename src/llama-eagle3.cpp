@@ -1117,9 +1117,17 @@ bool build_serial_rollout_graph(
     t_norm_out = ggml_mul(ctx.get(), t_norm_out, t_norm_w);
     ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm_out);
 
+    // In-graph write-back of the post-step hidden into the teacher-hidden
+    // input slot. Keeps hidden device-resident across rollout depths without
+    // an out-of-graph tensor_copy per step (those don't get captured by the
+    // CUDA graph and add CPU-submit overhead). All ops that consume the old
+    // value of t_hidden_in are scheduled before this cpy (ggml DAG ordering).
+    ggml_tensor * t_hidden_writeback = ggml_cpy(ctx.get(), t_hidden_out, t_hidden_in);
+
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_hidden_out);
     ggml_build_forward_expand(gf, t_logits);
+    ggml_build_forward_expand(gf, t_hidden_writeback);
 
     ggml_backend_buffer_ptr buf_compute;
     if (rt.buft_compute) {
@@ -4479,6 +4487,20 @@ bool llama_eagle3_rollout_begin(
             return false;
         }
     }
+
+    // Seed the graph's device-side teacher-hidden input with the root state's
+    // post-root-step hidden. Subsequent rollout_step calls refresh t_hidden_in
+    // from t_hidden_out via D2D copy, so we never D->H the hidden per-depth.
+    if (from_state.dev->t_hidden) {
+        if (!tensor_copy_bytes_async(
+                    rt.backend_compute.get(),
+                    rt.backend_compute.get(),
+                    from_state.dev->t_hidden, /* src_offset = */ 0,
+                    rt.serial_rollout_graph.t_hidden_in, /* dst_offset = */ 0,
+                    (size_t) hp.hidden_size * sizeof(float))) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -4487,15 +4509,9 @@ bool llama_eagle3_rollout_step(
         const llama_eagle3_runtime & rt,
         int32_t pos,
         int32_t slot,
-        const float * hidden_in,
-        int32_t hidden_in_dim,
         llama_token input_id,
-        std::vector<float> & hidden_out,
         std::vector<float> & logits_out) {
     if (!rt.backend_compute || !rt.buft_compute) {
-        return false;
-    }
-    if (!hidden_in || hidden_in_dim <= 0) {
         return false;
     }
 
@@ -4507,17 +4523,12 @@ bool llama_eagle3_rollout_step(
     if (slot < 0 || slot >= rt.serial_rollout_graph.kv_capacity) {
         return false;
     }
-    if (hidden_in_dim != rt.serial_rollout_graph.hidden_in_dim) {
-        return false;
-    }
 
     auto & graph = rt.serial_rollout_graph;
 
-    // Upload inputs
-    rt.async_buf.hidden.assign(hidden_in, hidden_in + hidden_in_dim);
-    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_hidden_in,
-            rt.async_buf.hidden.data(), 0, (size_t) hidden_in_dim * sizeof(float));
-
+    // Upload inputs — hidden is NOT uploaded per-call; it lives on device in
+    // graph.t_hidden_in, seeded by rollout_begin() and refreshed at the end of
+    // each step via a D2D copy of t_hidden_out -> t_hidden_in (queued below).
     rt.async_buf.tok = input_id;
     rt.async_buf.pos = pos;
     ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok,
@@ -4551,11 +4562,11 @@ bool llama_eagle3_rollout_step(
         return false;
     }
 
-    // Download outputs: one D->H round-trip for hidden+logits, then sync.
-    hidden_out.resize(hp.hidden_size);
+    // The graph itself cpy-writes t_hidden_out -> t_hidden_in as its final
+    // node, so the next rollout_step sees the updated teacher hidden on
+    // device without any host <-> device round trip. Only logits come back
+    // to host (for CPU-side argmax). Hidden stays device-resident.
     logits_out.resize(hp.draft_vocab_size);
-    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_hidden_out,
-            hidden_out.data(), 0, (size_t) hp.hidden_size * sizeof(float));
     ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_logits,
             logits_out.data(), 0, (size_t) hp.draft_vocab_size * sizeof(float));
     ggml_backend_synchronize(rt.backend_compute.get());
