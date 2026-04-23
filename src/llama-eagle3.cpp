@@ -931,17 +931,25 @@ bool build_logits_graph(
 bool ensure_rollout_scratch(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
-        int32_t needed_capacity) {
-    if (!rt.buft_compute || needed_capacity <= 0) {
+        int32_t needed_capacity,
+        int32_t needed_max_depth) {
+    if (!rt.buft_compute || needed_capacity <= 0 || needed_max_depth <= 0) {
         return false;
     }
-    if (rt.rollout_scratch_k && rt.rollout_scratch_v && rt.rollout_scratch_capacity >= needed_capacity) {
+    if (rt.rollout_scratch_k && rt.rollout_scratch_v &&
+        rt.rollout_d2t_table && rt.rollout_chain_tokens &&
+        rt.rollout_scratch_capacity  >= needed_capacity &&
+        rt.rollout_scratch_max_depth >= needed_max_depth) {
         return true;
     }
 
-    const auto & hp = model.hparams;
+    const auto & hp  = model.hparams;
+    const int32_t dvs = hp.draft_vocab_size;
+    if (dvs <= 0 || (int32_t) model.d2t.size() != dvs) {
+        return false;
+    }
 
-    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 8);
+    auto ctx = make_ctx_no_alloc(/* max_nodes = */ 16);
     if (!ctx) {
         return false;
     }
@@ -949,20 +957,44 @@ bool ensure_rollout_scratch(
     ggml_tensor * t_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, needed_capacity);
     ggml_tensor * t_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hp.head_dim, hp.num_kv_heads, needed_capacity);
 
+    // d2t offset table as [1, dvs+1] F32 — same layout as the existing
+    // fused_d2t_gpu path so we can reuse get_rows + cast-to-I32.  Entry
+    // dvs is the sentinel slot.
+    ggml_tensor * t_d2t   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, dvs + 1);
+
+    // chain_tokens as [1, max_depth+1] F32. (ggml_set_rows requires an F32
+    // source, so we keep the chain as float and cast to I32 where it meets
+    // the embedding-lookup path.)  Slot 0 holds the bootstrap token; depth
+    // d's argmax output lands in slot d+1.
+    ggml_tensor * t_chain = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, needed_max_depth + 1);
+
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
     if (!buf) {
         return false;
     }
 
-    // Release the old scratch (if any) and the graph that referenced it — the
-    // graph held ggml_tensor pointers into the old buffer that are now stale.
+    // Upload d2t table once. base_id(i) = i + d2t[i]. Stored as F32 to match
+    // ggml's existing get_rows+cast pattern.
+    std::vector<float> d2t_host((size_t) dvs + 1);
+    for (int32_t i = 0; i < dvs; ++i) {
+        d2t_host[(size_t) i] = (float) (i + model.d2t[(size_t) i]);
+    }
+    d2t_host[(size_t) dvs] = 0.0f; // sentinel
+    ggml_backend_tensor_set(t_d2t, d2t_host.data(), 0, (size_t) (dvs + 1) * sizeof(float));
+
+    // Old graph held pointers into the old buffer; invalidate so the next
+    // rollout_begin rebuilds it against the new buffer.
     rt.serial_rollout_graph = {};
     rt.serial_rollout_graph_kv_cap = -1;
+
     rt.rollout_scratch_ctx        = std::move(ctx);
     rt.rollout_scratch_buf        = std::move(buf);
     rt.rollout_scratch_k          = t_k;
     rt.rollout_scratch_v          = t_v;
+    rt.rollout_d2t_table          = t_d2t;
+    rt.rollout_chain_tokens       = t_chain;
     rt.rollout_scratch_capacity   = needed_capacity;
+    rt.rollout_scratch_max_depth  = needed_max_depth;
     return true;
 }
 
@@ -970,14 +1002,18 @@ bool build_serial_rollout_graph(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         int32_t kv_capacity,
+        int32_t max_depth,
         int32_t hidden_in_dim,
         llama_eagle3_serial_rollout_graph & graph) {
     if (graph.ctx && graph.buf_compute && graph.gf &&
-        graph.kv_capacity == kv_capacity && graph.hidden_in_dim == hidden_in_dim) {
+        graph.kv_capacity == kv_capacity && graph.max_depth == max_depth &&
+        graph.hidden_in_dim == hidden_in_dim) {
         return true;
     }
     if (!rt.tok_embd || !rt.rollout_scratch_k || !rt.rollout_scratch_v ||
-        rt.rollout_scratch_capacity < kv_capacity) {
+        !rt.rollout_d2t_table || !rt.rollout_chain_tokens ||
+        rt.rollout_scratch_capacity  < kv_capacity ||
+        rt.rollout_scratch_max_depth < max_depth) {
         return false;
     }
 
@@ -993,8 +1029,14 @@ bool build_serial_rollout_graph(
     ggml_tensor * t_hidden_in = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden_in_dim, 1);
     ggml_set_input(t_hidden_in);
 
-    ggml_tensor * t_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
-    ggml_set_input(t_tok);
+    // depth_idx and its +1 are passed as I32 scalars. We pass both rather
+    // than computing +1 inside the graph because ggml's I32 add isn't a hot
+    // path on CUDA and the CPU-side cost is ~1 µs/depth.
+    ggml_tensor * t_depth_idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_depth_idx);
+
+    ggml_tensor * t_depth_idx_next = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_set_input(t_depth_idx_next);
 
     ggml_tensor * t_pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
     ggml_set_input(t_pos);
@@ -1008,6 +1050,14 @@ bool build_serial_rollout_graph(
     // flash_attn expects F16 mask. Shape [kv_capacity, 1, 1, 1].
     ggml_tensor * t_mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, kv_capacity, 1, 1, 1);
     ggml_set_input(t_mask);
+
+    // Input token for this depth = chain_tokens[depth_idx]. chain_tokens is
+    // F32 (required by ggml_set_rows on the write side); we cast to I32 for
+    // the embedding-lookup input.
+    ggml_tensor * t_tok_f   = ggml_get_rows(ctx.get(), rt.rollout_chain_tokens, t_depth_idx); // [1,1] F32
+    ggml_tensor * t_tok_i   = ggml_cast(ctx.get(), t_tok_f, GGML_TYPE_I32);
+    t_tok_i = ggml_cont(ctx.get(), t_tok_i);
+    ggml_tensor * t_tok     = ggml_reshape_1d(ctx.get(), t_tok_i, 1);
 
     // embedding + norms ------------------------------------------------------
     ggml_tensor * t_embd = ggml_get_rows(ctx.get(), rt.tok_embd, t_tok);
@@ -1116,10 +1166,20 @@ bool build_serial_rollout_graph(
     ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm_out);
 
     // On-GPU sample (argmax over the draft vocab). Returned as a [1] I32
-    // tensor so the per-depth D->H payload is 4 bytes instead of 128 KB.
-    // ggml_argmax expects the values along dim 0, shape [vocab, N], which
-    // matches t_logits = [draft_vocab_size, 1].
+    // tensor — no D->H per depth; it's used only as an index to write the
+    // chain_tokens entry below.
     ggml_tensor * t_token_idx = ggml_argmax(ctx.get(), t_logits);
+
+    // GPU-side d2t translation: base_id(i) = i + d2t[i]. We stored the
+    // precomputed values as F32 in rt.rollout_d2t_table; get_rows gives a
+    // [1,1] F32 which is also what ggml_set_rows requires as its source.
+    ggml_tensor * t_base_id_f = ggml_get_rows(ctx.get(), rt.rollout_d2t_table, t_token_idx);  // [1,1] F32
+
+    // Write the base-vocab id into chain_tokens at slot (depth_idx + 1). The
+    // next depth's graph will read it from chain_tokens[depth_idx+1] through
+    // the t_tok_f get_rows above — stream ordering keeps write-then-read
+    // correct across consecutive invocations on the same stream.
+    ggml_tensor * t_chain_write = ggml_set_rows(ctx.get(), rt.rollout_chain_tokens, t_base_id_f, t_depth_idx_next);
 
     // In-graph write-back of the post-step hidden into the teacher-hidden
     // input slot. Keeps hidden device-resident across rollout depths without
@@ -1130,8 +1190,9 @@ bool build_serial_rollout_graph(
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_hidden_out);
-    ggml_build_forward_expand(gf, t_logits);          // kept for adaptive-depth path
+    ggml_build_forward_expand(gf, t_logits);          // kept for debug / adaptive-depth probing
     ggml_build_forward_expand(gf, t_token_idx);
+    ggml_build_forward_expand(gf, t_chain_write);
     ggml_build_forward_expand(gf, t_hidden_writeback);
 
     ggml_backend_buffer_ptr buf_compute;
@@ -1142,20 +1203,22 @@ bool build_serial_rollout_graph(
         return false;
     }
 
-    graph.ctx           = std::move(ctx);
-    graph.buf_compute   = std::move(buf_compute);
-    graph.gf            = gf;
-    graph.kv_capacity   = kv_capacity;
-    graph.hidden_in_dim = hidden_in_dim;
-    graph.t_hidden_in   = t_hidden_in;
-    graph.t_tok         = t_tok;
-    graph.t_pos         = t_pos;
-    graph.t_kv_idx      = t_kv_idx;
-    graph.t_v_idx       = t_v_idx;
-    graph.t_mask        = t_mask;
-    graph.t_hidden_out  = t_hidden_out;
-    graph.t_logits      = t_logits;
-    graph.t_token_idx   = t_token_idx;
+    graph.ctx             = std::move(ctx);
+    graph.buf_compute     = std::move(buf_compute);
+    graph.gf              = gf;
+    graph.kv_capacity     = kv_capacity;
+    graph.max_depth       = max_depth;
+    graph.hidden_in_dim   = hidden_in_dim;
+    graph.t_hidden_in     = t_hidden_in;
+    graph.t_depth_idx     = t_depth_idx;
+    graph.t_depth_idx_next= t_depth_idx_next;
+    graph.t_pos           = t_pos;
+    graph.t_kv_idx        = t_kv_idx;
+    graph.t_v_idx         = t_v_idx;
+    graph.t_mask          = t_mask;
+    graph.t_hidden_out    = t_hidden_out;
+    graph.t_logits        = t_logits;
+    graph.t_token_idx     = t_token_idx;
     return true;
 }
 
@@ -4442,14 +4505,15 @@ bool llama_eagle3_rollout_begin(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         const llama_eagle3_state & from_state,
-        int32_t max_rollout_depth) {
+        int32_t max_rollout_depth,
+        llama_token bootstrap_token) {
     if (!rt.backend_compute || !rt.buft_compute) {
         return false;
     }
     if (!from_state.dev || !from_state.dev->t_k || !from_state.dev->t_v) {
         return false;
     }
-    if (max_rollout_depth < 0) {
+    if (max_rollout_depth <= 0) {
         return false;
     }
 
@@ -4461,15 +4525,19 @@ bool llama_eagle3_rollout_begin(
     const int32_t needed = from_state.past_len + max_rollout_depth + 1;
     const int32_t capacity = std::max(256, pad_up_i32(needed, 256));
 
-    if (!ensure_rollout_scratch(model, rt, capacity)) {
+    if (!ensure_rollout_scratch(model, rt, capacity, max_rollout_depth)) {
         return false;
     }
 
-    if (rt.serial_rollout_graph_kv_cap != rt.rollout_scratch_capacity) {
+    if (rt.serial_rollout_graph_kv_cap != rt.rollout_scratch_capacity ||
+        rt.serial_rollout_graph.max_depth < max_rollout_depth) {
         rt.serial_rollout_graph = {};
         const int32_t hidden_in_dim = hp.hidden_size;
-        if (!build_serial_rollout_graph(model, rt, rt.rollout_scratch_capacity, hidden_in_dim,
-                                        rt.serial_rollout_graph)) {
+        if (!build_serial_rollout_graph(model, rt,
+                    rt.rollout_scratch_capacity,
+                    rt.rollout_scratch_max_depth,
+                    hidden_in_dim,
+                    rt.serial_rollout_graph)) {
             return false;
         }
         rt.serial_rollout_graph_kv_cap = rt.rollout_scratch_capacity;
@@ -4496,7 +4564,7 @@ bool llama_eagle3_rollout_begin(
 
     // Seed the graph's device-side teacher-hidden input with the root state's
     // post-root-step hidden. Subsequent rollout_step calls refresh t_hidden_in
-    // from t_hidden_out via D2D copy, so we never D->H the hidden per-depth.
+    // from t_hidden_out via in-graph cpy.
     if (from_state.dev->t_hidden) {
         if (!tensor_copy_bytes_async(
                     rt.backend_compute.get(),
@@ -4507,25 +4575,28 @@ bool llama_eagle3_rollout_begin(
             return false;
         }
     }
+
+    // Write the bootstrap token into chain_tokens[0] so depth 0's graph reads
+    // it as the embedding-lookup input. Subsequent depths read each other's
+    // output via the in-graph set_rows -> get_rows chain.  chain_tokens is
+    // F32 to satisfy ggml_set_rows, so we upload a single float.
+    static thread_local float bootstrap_f;
+    bootstrap_f = (float) bootstrap_token;
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), rt.rollout_chain_tokens,
+            &bootstrap_f, /* offset = */ 0, sizeof(float));
     return true;
 }
 
 bool llama_eagle3_rollout_step(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
+        int32_t depth_idx,
         int32_t pos,
-        int32_t slot,
-        llama_token input_id,
-        int32_t * draft_idx_out,
-        std::vector<float> * logits_out) {
+        int32_t slot) {
+    (void) model;
     if (!rt.backend_compute || !rt.buft_compute) {
         return false;
     }
-    if (draft_idx_out == nullptr) {
-        return false;
-    }
-
-    const auto & hp = model.hparams;
 
     if (rt.serial_rollout_graph_kv_cap < 0 || !rt.serial_rollout_graph.gf) {
         return false;
@@ -4533,16 +4604,22 @@ bool llama_eagle3_rollout_step(
     if (slot < 0 || slot >= rt.serial_rollout_graph.kv_capacity) {
         return false;
     }
+    if (depth_idx < 0 || depth_idx >= rt.serial_rollout_graph.max_depth) {
+        return false;
+    }
 
     auto & graph = rt.serial_rollout_graph;
 
-    // Upload inputs — hidden is NOT uploaded per-call; it lives on device in
-    // graph.t_hidden_in, seeded by rollout_begin() and refreshed at the end of
-    // each step via a D2D copy of t_hidden_out -> t_hidden_in (queued below).
-    rt.async_buf.tok = input_id;
+    // Upload per-call scalars. Token id comes from chain_tokens[depth_idx]
+    // on device; hidden lives in graph.t_hidden_in.
+    const int32_t depth      = depth_idx;
+    const int32_t depth_next = depth_idx + 1;
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_depth_idx,
+            &depth, 0, sizeof(int32_t));
+    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_depth_idx_next,
+            &depth_next, 0, sizeof(int32_t));
+
     rt.async_buf.pos = pos;
-    ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_tok,
-            &rt.async_buf.tok, 0, sizeof(rt.async_buf.tok));
     ggml_backend_tensor_set_async(rt.backend_compute.get(), graph.t_pos,
             &rt.async_buf.pos, 0, sizeof(rt.async_buf.pos));
 
@@ -4568,23 +4645,33 @@ bool llama_eagle3_rollout_step(
             rt.async_buf.mask_data.data(), 0, (size_t) cap * sizeof(uint16_t));
 
     const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
-    if (status != GGML_STATUS_SUCCESS) {
+    return status == GGML_STATUS_SUCCESS;
+}
+
+bool llama_eagle3_rollout_finalize(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_chain,
+        std::vector<int32_t> & chain_out) {
+    (void) model;
+    if (!rt.backend_compute || !rt.rollout_chain_tokens) {
+        return false;
+    }
+    if (n_chain <= 0 || n_chain > rt.rollout_scratch_max_depth + 1) {
         return false;
     }
 
-    // The graph itself cpy-writes t_hidden_out -> t_hidden_in as its final
-    // node, so the next rollout_step sees the updated teacher hidden on
-    // device without any host <-> device round trip. Only the GPU-side
-    // argmax (4 bytes) comes back; full logits download is opt-in for
-    // callers that need the full distribution.
-    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_token_idx,
-            draft_idx_out, 0, sizeof(int32_t));
-    if (logits_out) {
-        logits_out->resize(hp.draft_vocab_size);
-        ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_logits,
-                logits_out->data(), 0, (size_t) hp.draft_vocab_size * sizeof(float));
-    }
+    // chain_tokens is F32 on device; read it back and cast.
+    std::vector<float> chain_f((size_t) n_chain);
+    ggml_backend_tensor_get_async(rt.backend_compute.get(), rt.rollout_chain_tokens,
+            chain_f.data(), /* offset = */ 0,
+            (size_t) n_chain * sizeof(float));
     ggml_backend_synchronize(rt.backend_compute.get());
+
+    chain_out.resize((size_t) n_chain);
+    for (int32_t i = 0; i < n_chain; ++i) {
+        chain_out[(size_t) i] = (int32_t) chain_f[(size_t) i];
+    }
     return true;
 }
 

@@ -1345,15 +1345,7 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 #endif
 
-            // Fast path: scratch-KV rollout with fused lm_head, constant graph
-            // shape (CUDA-graph replay friendly) and no per-depth writes to the
-            // persistent cache. Rollout K/V is throwaway and will be rebuilt
-            // from teacher hiddens at accept time by llama_eagle3_ar_kv_regen.
-            const bool use_rollout_scratch = (rt.backend_compute && rt.buft_compute &&
-                                               llama_eagle3_rollout_begin(*model, rt, root_state, max_depth));
-
-            // Shared decode helper: given logits, produce (draft_idx, base_id).
-            // Returns false if the sampled token is invalid (fall out of loop).
+            // Shared decode helper used by the fallback slow path.
             const int32_t draft_vocab = model->hparams.draft_vocab_size;
             auto decode_logits = [&](const std::vector<float> & logits,
                                      llama_token & out_token,
@@ -1386,69 +1378,68 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 return true;
             };
 
+            // Fast path: scratch-KV rollout with chained device-side token
+            // feedback. One host sync at the end of the whole rollout — each
+            // depth queues its work and the next depth's input token is read
+            // from chain_tokens[d] on-device. Only safe when adaptive-depth
+            // isn't needed (that path needs per-depth softmax on CPU).
+            //
+            // Bootstrap: compute logits for the root position to pick the
+            // first token. Happens once per cycle.
+            std::vector<float> root_hidden;
+            std::vector<float> bootstrap_logits;
+            bool bootstrap_ok =
+                rt.backend_compute && rt.buft_compute &&
+                llama_eagle3_state_get_hidden(*model, rt, root_state, root_hidden) &&
+                llama_eagle3_logits(*model, rt, root_hidden.data(), bootstrap_logits);
+            llama_token bootstrap_token = 0;
+            float bootstrap_best = 0.0f;
+            bool bootstrap_decoded = false;
+            if (bootstrap_ok) {
+                bootstrap_decoded = decode_logits(bootstrap_logits, bootstrap_token, bootstrap_best);
+            }
+
+            const bool use_rollout_scratch = bootstrap_ok && bootstrap_decoded &&
+                (adaptive_depth_threshold <= 0.0f) &&
+                llama_eagle3_rollout_begin(*model, rt, root_state, max_depth, bootstrap_token);
+
             if (use_rollout_scratch) {
-                // Bootstrap: compute logits for the root position so we can
-                // pick the first token. This is the only place we need the
-                // root's hidden on the CPU; all subsequent depths keep hidden
-                // on device and only bring logits back.
-                std::vector<float> cur_hidden;
-                std::vector<float> bootstrap_logits;
-                bool bootstrap_ok =
-                    llama_eagle3_state_get_hidden(*model, rt, root_state, cur_hidden) &&
-                    llama_eagle3_logits(*model, rt, cur_hidden.data(), bootstrap_logits);
+                chain.push_back(bootstrap_token);
 
-                if (bootstrap_ok) {
-                    llama_token next_token = 0;
-                    float next_best = 0.0f;
-                    if (!decode_logits(bootstrap_logits, next_token, next_best)) {
-                        goto rollout_end;
+                const int32_t base_past_len = root_state.past_len;
+                bool ok = true;
+                for (int depth = 0; depth < max_depth - 1; ++depth) {
+                    const int32_t pos  = base_past_len + depth;
+                    const int32_t slot = pos;
+
+                    if (!llama_eagle3_rollout_step(*model, rt, depth, pos, slot)) {
+                        LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
+                        ok = false;
+                        break;
                     }
-                    chain.push_back(next_token);
+                }
 
-                    const int32_t base_past_len = root_state.past_len;
-                    const bool need_logits = (adaptive_depth_threshold > 0.0f);
-                    std::vector<float> step_logits;
-                    for (int depth = 0; depth < max_depth; ++depth) {
-                        const int32_t pos  = base_past_len + depth;
-                        const int32_t slot = pos;
-
-                        int32_t draft_idx = 0;
-                        if (!llama_eagle3_rollout_step(*model, rt, pos, slot,
-                                    next_token, &draft_idx,
-                                    need_logits ? &step_logits : nullptr)) {
-                            LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
-                            break;
-                        }
-
-                        if (depth + 1 >= max_depth) {
-                            break;  // last iteration; no need for another sample
-                        }
-
-                        llama_token sampled = 0;
-                        if (need_logits) {
-                            float sampled_best = 0.0f;
-                            if (!decode_logits(step_logits, sampled, sampled_best)) {
-                                break;
-                            }
-                        } else {
-                            // Fast path: GPU already picked the argmax. Just
-                            // translate draft-vocab idx -> base-vocab id.
-                            if (draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
-                                break;
-                            }
-                            const int32_t base_id = draft_idx + model->d2t[(size_t) draft_idx];
+                if (ok) {
+                    // One host sync drains every queued depth and reads the
+                    // chain from device. chain_tokens[0..max_depth-1] are the
+                    // base-vocab tokens; the last depth's output (slot
+                    // max_depth) was not computed since we stopped the loop
+                    // at max_depth-1.
+                    std::vector<int32_t> chain_raw;
+                    if (llama_eagle3_rollout_finalize(*model, rt, max_depth, chain_raw)) {
+                        for (int depth = 1; depth < (int) chain_raw.size(); ++depth) {
+                            const int32_t base_id = chain_raw[(size_t) depth];
                             if (base_id < 0 || base_id >= model->hparams.vocab_size) {
                                 break;
                             }
-                            sampled = (llama_token) base_id;
+                            chain.push_back((llama_token) base_id);
                         }
-                        next_token = sampled;
-                        chain.push_back(next_token);
                     }
                 }
             } else {
-                // Original slow path: graph rebuilt every call; kept as a
-                // fallback when the scratch allocation or begin fails.
+                // Slow path: fires when adaptive-depth requires per-step
+                // softmax or when rollout_begin failed. Runs the original
+                // graph-rebuilt-every-call draft step. Kept for correctness.
                 llama_eagle3_state cur_state = root_state;
 
                 for (int depth = 0; depth < max_depth; ++depth) {
@@ -1476,13 +1467,11 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     }
                 }
             }
-rollout_end:
 #if defined(GGML_USE_CUDA)
             if (profile_gpu) {
                 ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &rollout_zone, "eagle3/rollout_serial");
             }
 #endif
-            (void) 0;
 
             if (chain.empty()) {
                 return;

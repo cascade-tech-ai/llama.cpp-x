@@ -123,30 +123,33 @@ struct llama_eagle3_step_graph {
     ggml_tensor * t_logits     = nullptr;
 };
 
-// Serial-rollout single-token step graph. Unlike `llama_eagle3_step_graph`, this
-// variant does NOT consume a per-call `past_len` view; instead it references a
-// persistent rollout-scratch K/V buffer in the runtime (fixed shape = `kv_capacity`)
-// and writes the current K/V to slot `t_kv_idx` via ggml_set_rows. The graph key is
-// (kv_capacity, hidden_in_dim) — stable across target passes, so CUDA graph replay
-// activates once warmed up.
+// Serial-rollout single-token step graph. References persistent rollout-scratch
+// tensors (K/V history, d2t offset table, chain_tokens array) and writes its
+// current-step output back into those tensors. Graph shape is (kv_capacity,
+// max_depth, hidden_in_dim) — stable across target passes so CUDA graph replay
+// stays hot. Per-call inputs: depth_idx, pos, slot, mask. The graph reads the
+// input token for this depth from chain_tokens[depth_idx] (no host->device) and
+// writes the next-depth token to chain_tokens[depth_idx+1].
 struct llama_eagle3_serial_rollout_graph {
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf_compute;
     ggml_cgraph *           gf = nullptr;
 
     int32_t                 kv_capacity   = 0;
+    int32_t                 max_depth     = 0;
     int32_t                 hidden_in_dim = 0;
 
-    ggml_tensor * t_hidden_in  = nullptr; // [hidden_in_dim, 1]
-    ggml_tensor * t_tok        = nullptr; // [1]
-    ggml_tensor * t_pos        = nullptr; // [1]
-    ggml_tensor * t_kv_idx     = nullptr; // [1] I64 scatter index for K
-    ggml_tensor * t_v_idx      = nullptr; // [1] I64 scatter index for V
-    ggml_tensor * t_mask       = nullptr; // [kv_capacity, 1, 1, 1]
+    ggml_tensor * t_hidden_in      = nullptr; // [hidden_in_dim, 1]
+    ggml_tensor * t_depth_idx      = nullptr; // [1] I32 — read slot in chain_tokens
+    ggml_tensor * t_depth_idx_next = nullptr; // [1] I32 — write slot = depth_idx + 1
+    ggml_tensor * t_pos            = nullptr; // [1]
+    ggml_tensor * t_kv_idx         = nullptr; // [1] I64
+    ggml_tensor * t_v_idx          = nullptr; // [1] I64
+    ggml_tensor * t_mask           = nullptr; // [kv_capacity, 1, 1, 1]
 
     ggml_tensor * t_hidden_out = nullptr; // [hidden_size, 1]
-    ggml_tensor * t_logits     = nullptr; // [draft_vocab_size, 1]   (fused lm_head)
-    ggml_tensor * t_token_idx  = nullptr; // [1] I32 = argmax(logits) — on-GPU sample
+    ggml_tensor * t_logits     = nullptr; // [draft_vocab_size, 1] — exposed for adaptive-depth
+    ggml_tensor * t_token_idx  = nullptr; // [1] I32 = argmax(logits) — draft-vocab idx
 };
 
 struct llama_eagle3_step_multi_graph {
@@ -272,16 +275,20 @@ struct llama_eagle3_runtime {
     ggml_backend_buffer_ptr buf_weights_compute;
     llama_eagle3_tensors    tensors_compute;
 
-    // Rollout-scratch K/V buffer used by the serial-rollout fast path. Shape
-    // [head_dim, n_kv_heads, rollout_scratch_capacity], allocated in its own
-    // backend buffer so the graph can reference it as a stable input tensor
-    // across rollouts (no per-call copy of past K/V into the graph).
-    // Mutable because allocated lazily at first rollout_begin().
+    // Rollout-scratch buffers used by the serial-rollout fast path. Allocated
+    // once on first rollout_begin() and reused across rollouts.
+    //   rollout_scratch_k/v:     [head_dim, n_kv_heads, kv_capacity] F32
+    //   rollout_d2t_table:       [1, draft_vocab_size+1] F32 — base_id(i) = i + d2t[i]
+    //   rollout_chain_tokens:    [1, max_depth+1] I32 — draft chain, on device
+    // Mutable because allocated lazily.
     mutable ggml_context_ptr        rollout_scratch_ctx;
     mutable ggml_backend_buffer_ptr rollout_scratch_buf;
     mutable ggml_tensor *           rollout_scratch_k = nullptr;
     mutable ggml_tensor *           rollout_scratch_v = nullptr;
+    mutable ggml_tensor *           rollout_d2t_table = nullptr;
+    mutable ggml_tensor *           rollout_chain_tokens = nullptr;
     mutable int32_t                 rollout_scratch_capacity = 0;
+    mutable int32_t                 rollout_scratch_max_depth = 0;
 
     // Reusable compute graphs for backend execution.
     mutable llama_eagle3_logits_graph logits_graph;
@@ -397,38 +404,50 @@ bool llama_eagle3_logits(
         const float * hidden,
         std::vector<float> & logits_out);
 
-// Serial-rollout fast path. Before the first call for a rollout, the caller
-// must invoke llama_eagle3_rollout_begin() to seed the rollout scratch K/V
-// from the rollout's starting state. Each call then performs one draft-step
-// forward (attn+ffn) using the scratch as the KV history, writes current K/V
-// into the scratch at `slot`, and returns the post-step hidden as well as the
-// lm_head logits for the *input* position (fused — saves a D->H round-trip).
+// Serial-rollout fast path. Flow per rollout:
 //
-// During the rollout, the caller does NOT modify persistent state: `slot` and
-// `pos` are tracked by the caller. At accept time, llama_eagle3_ar_kv_regen
-// rebuilds the persistent cache from teacher hiddens, so any K/V left in the
-// scratch is simply discarded.
+//   1. llama_eagle3_rollout_begin(model, rt, root_state, max_depth,
+//                                 bootstrap_token)
+//        Seeds rollout_scratch_k/v from root's persistent cache, seeds the
+//        teacher-hidden buffer from root_state.dev->t_hidden, and writes
+//        bootstrap_token into chain_tokens[0].
+//
+//   2. for d in 0..max_depth-1:
+//          llama_eagle3_rollout_step(model, rt, d, pos=base+d, slot=base+d)
+//        Queues the graph; no sync. The graph reads chain_tokens[d] as the
+//        input token and writes the draft's next-token pick into
+//        chain_tokens[d+1]. Hidden and K/V are stitched across calls via
+//        in-graph cpy / set_rows.
+//
+//   3. llama_eagle3_rollout_finalize(model, rt, max_depth, chain_out)
+//        One host sync, one D->H of chain_tokens, and chain_out[i] is the
+//        base-vocab id for position i.
+//
+// During the rollout the caller does not touch persistent state; at accept
+// time llama_eagle3_ar_kv_regen rebuilds the post-cycle K/V from teacher
+// hiddens, so whatever the rollout wrote into the scratch is just discarded.
 bool llama_eagle3_rollout_begin(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         const llama_eagle3_state & from_state,
-        int32_t max_rollout_depth);
+        int32_t max_rollout_depth,
+        llama_token bootstrap_token);
 
-// Rollout step — reads teacher hidden from the graph's internal device-side
-// hidden buffer (seeded by llama_eagle3_rollout_begin for the first call and
-// refreshed via D2D copy from the previous call's hidden_out for subsequent
-// calls). argmax(logits) runs on-GPU and the result is returned in
-// draft_idx_out (4-byte D->H). `logits_out`, if non-null, also triggers a
-// D->H of the full logits vector (needed by callers that want softmax for
-// e.g. adaptive-depth thresholds).
+// Queue one rollout depth. No host sync — the caller drains at finalize time.
 bool llama_eagle3_rollout_step(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
+        int32_t depth_idx,
         int32_t pos,
-        int32_t slot,
-        llama_token input_id,
-        int32_t * draft_idx_out,
-        std::vector<float> * logits_out);
+        int32_t slot);
+
+// Drain the rollout queue, download chain_tokens, and write [0..n_chain) into
+// chain_out. `n_chain` is typically max_depth.
+bool llama_eagle3_rollout_finalize(
+        const llama_eagle3_model & model,
+        const llama_eagle3_runtime & rt,
+        int32_t n_chain,
+        std::vector<int32_t> & chain_out);
 
 bool llama_eagle3_topk(
         const llama_eagle3_model & model,
