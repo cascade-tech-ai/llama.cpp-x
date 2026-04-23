@@ -146,6 +146,7 @@ struct llama_eagle3_serial_rollout_graph {
 
     ggml_tensor * t_hidden_out = nullptr; // [hidden_size, 1]
     ggml_tensor * t_logits     = nullptr; // [draft_vocab_size, 1]   (fused lm_head)
+    ggml_tensor * t_token_idx  = nullptr; // [1] I32 = argmax(logits) — on-GPU sample
 };
 
 struct llama_eagle3_step_multi_graph {
@@ -416,14 +417,18 @@ bool llama_eagle3_rollout_begin(
 // Rollout step — reads teacher hidden from the graph's internal device-side
 // hidden buffer (seeded by llama_eagle3_rollout_begin for the first call and
 // refreshed via D2D copy from the previous call's hidden_out for subsequent
-// calls). Returns only the logits (D->H); hidden stays on device.
+// calls). argmax(logits) runs on-GPU and the result is returned in
+// draft_idx_out (4-byte D->H). `logits_out`, if non-null, also triggers a
+// D->H of the full logits vector (needed by callers that want softmax for
+// e.g. adaptive-depth thresholds).
 bool llama_eagle3_rollout_step(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         int32_t pos,
         int32_t slot,
         llama_token input_id,
-        std::vector<float> & logits_out);
+        int32_t * draft_idx_out,
+        std::vector<float> * logits_out);
 
 bool llama_eagle3_topk(
         const llama_eagle3_model & model,

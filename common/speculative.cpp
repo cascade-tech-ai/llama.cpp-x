@@ -1406,13 +1406,16 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                     chain.push_back(next_token);
 
                     const int32_t base_past_len = root_state.past_len;
+                    const bool need_logits = (adaptive_depth_threshold > 0.0f);
+                    std::vector<float> step_logits;
                     for (int depth = 0; depth < max_depth; ++depth) {
                         const int32_t pos  = base_past_len + depth;
                         const int32_t slot = pos;
 
-                        std::vector<float> step_logits;
+                        int32_t draft_idx = 0;
                         if (!llama_eagle3_rollout_step(*model, rt, pos, slot,
-                                    next_token, step_logits)) {
+                                    next_token, &draft_idx,
+                                    need_logits ? &step_logits : nullptr)) {
                             LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
                             break;
                         }
@@ -1422,9 +1425,22 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                         }
 
                         llama_token sampled = 0;
-                        float sampled_best = 0.0f;
-                        if (!decode_logits(step_logits, sampled, sampled_best)) {
-                            break;
+                        if (need_logits) {
+                            float sampled_best = 0.0f;
+                            if (!decode_logits(step_logits, sampled, sampled_best)) {
+                                break;
+                            }
+                        } else {
+                            // Fast path: GPU already picked the argmax. Just
+                            // translate draft-vocab idx -> base-vocab id.
+                            if (draft_idx < 0 || draft_idx >= model->hparams.draft_vocab_size) {
+                                break;
+                            }
+                            const int32_t base_id = draft_idx + model->d2t[(size_t) draft_idx];
+                            if (base_id < 0 || base_id >= model->hparams.vocab_size) {
+                                break;
+                            }
+                            sampled = (llama_token) base_id;
                         }
                         next_token = sampled;
                         chain.push_back(next_token);

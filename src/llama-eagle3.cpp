@@ -1109,13 +1109,17 @@ bool build_serial_rollout_graph(
     ggml_tensor * t_hidden_out = ggml_add(ctx.get(), t_ha, t_ffn);
     t_hidden_out = ggml_cont(ctx.get(), t_hidden_out);
 
-    // Fused lm_head: compute logits from the post-step hidden so the caller
-    // only needs one D->H round-trip per depth instead of two (one for the
-    // hidden, one for the logits).
+    // Fused lm_head: compute logits from the post-step hidden.
     ggml_tensor * t_norm_out = ggml_rms_norm(ctx.get(), t_hidden_out, hp.rms_norm_eps);
     ggml_tensor * t_norm_w  = ggml_cast(ctx.get(), tensors.norm_w, GGML_TYPE_F32);
     t_norm_out = ggml_mul(ctx.get(), t_norm_out, t_norm_w);
     ggml_tensor * t_logits = ggml_mul_mat(ctx.get(), tensors.lm_head_w, t_norm_out);
+
+    // On-GPU sample (argmax over the draft vocab). Returned as a [1] I32
+    // tensor so the per-depth D->H payload is 4 bytes instead of 128 KB.
+    // ggml_argmax expects the values along dim 0, shape [vocab, N], which
+    // matches t_logits = [draft_vocab_size, 1].
+    ggml_tensor * t_token_idx = ggml_argmax(ctx.get(), t_logits);
 
     // In-graph write-back of the post-step hidden into the teacher-hidden
     // input slot. Keeps hidden device-resident across rollout depths without
@@ -1126,7 +1130,8 @@ bool build_serial_rollout_graph(
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, t_hidden_out);
-    ggml_build_forward_expand(gf, t_logits);
+    ggml_build_forward_expand(gf, t_logits);          // kept for adaptive-depth path
+    ggml_build_forward_expand(gf, t_token_idx);
     ggml_build_forward_expand(gf, t_hidden_writeback);
 
     ggml_backend_buffer_ptr buf_compute;
@@ -1150,6 +1155,7 @@ bool build_serial_rollout_graph(
     graph.t_mask        = t_mask;
     graph.t_hidden_out  = t_hidden_out;
     graph.t_logits      = t_logits;
+    graph.t_token_idx   = t_token_idx;
     return true;
 }
 
@@ -4510,8 +4516,12 @@ bool llama_eagle3_rollout_step(
         int32_t pos,
         int32_t slot,
         llama_token input_id,
-        std::vector<float> & logits_out) {
+        int32_t * draft_idx_out,
+        std::vector<float> * logits_out) {
     if (!rt.backend_compute || !rt.buft_compute) {
+        return false;
+    }
+    if (draft_idx_out == nullptr) {
         return false;
     }
 
@@ -4564,11 +4574,16 @@ bool llama_eagle3_rollout_step(
 
     // The graph itself cpy-writes t_hidden_out -> t_hidden_in as its final
     // node, so the next rollout_step sees the updated teacher hidden on
-    // device without any host <-> device round trip. Only logits come back
-    // to host (for CPU-side argmax). Hidden stays device-resident.
-    logits_out.resize(hp.draft_vocab_size);
-    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_logits,
-            logits_out.data(), 0, (size_t) hp.draft_vocab_size * sizeof(float));
+    // device without any host <-> device round trip. Only the GPU-side
+    // argmax (4 bytes) comes back; full logits download is opt-in for
+    // callers that need the full distribution.
+    ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_token_idx,
+            draft_idx_out, 0, sizeof(int32_t));
+    if (logits_out) {
+        logits_out->resize(hp.draft_vocab_size);
+        ggml_backend_tensor_get_async(rt.backend_compute.get(), graph.t_logits,
+                logits_out->data(), 0, (size_t) hp.draft_vocab_size * sizeof(float));
+    }
     ggml_backend_synchronize(rt.backend_compute.get());
     return true;
 }
