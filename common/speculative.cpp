@@ -1340,18 +1340,57 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             llama_tokens chain;
             float greedy_cum_prob = 1.0f;
 
+#if defined(GGML_USE_CUDA)
+            ggml_backend_cuda_profiler_zone rollout_zone = {};
+            if (profile_gpu) {
+                ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &rollout_zone, "eagle3/rollout_serial");
+            }
+#endif
+
             for (int depth = 0; depth < max_depth; ++depth) {
                 // Get the hidden vector from the current state.
                 std::vector<float> cur_hidden;
-                if (!llama_eagle3_state_get_hidden(*model, rt, cur_state, cur_hidden)) {
-                    break;
+                {
+#if defined(GGML_USE_CUDA)
+                    ggml_backend_cuda_profiler_zone zh = {};
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
+                    }
+#endif
+                    if (!llama_eagle3_state_get_hidden(*model, rt, cur_state, cur_hidden)) {
+#if defined(GGML_USE_CUDA)
+                        if (profile_gpu) {
+                            ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
+                        }
+#endif
+                        break;
+                    }
+#if defined(GGML_USE_CUDA)
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zh, "eagle3/rollout_get_hidden");
+                    }
+#endif
                 }
 
                 // Compute logits and pick the argmax token.
                 std::vector<float> logits;
-                if (!llama_eagle3_logits(*model, rt, cur_hidden.data(), logits)) {
-                    LOG_WRN("eagle3 serial: logits failed at depth %d\n", depth);
-                    break;
+                {
+#if defined(GGML_USE_CUDA)
+                    ggml_backend_cuda_profiler_zone zl = {};
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zl, "eagle3/rollout_logits");
+                    }
+#endif
+                    const bool ok = llama_eagle3_logits(*model, rt, cur_hidden.data(), logits);
+#if defined(GGML_USE_CUDA)
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zl, "eagle3/rollout_logits");
+                    }
+#endif
+                    if (!ok) {
+                        LOG_WRN("eagle3 serial: logits failed at depth %d\n", depth);
+                        break;
+                    }
                 }
 
                 const int32_t draft_vocab = model->hparams.draft_vocab_size;
@@ -1387,11 +1426,29 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
                 chain.push_back(token);
 
                 // Step eagle head forward by one token.
-                if (!llama_eagle3_step(*model, rt, cur_state,
-                            nullptr, hidden_size, token, nullptr, nullptr)) {
-                    break;
+                {
+#if defined(GGML_USE_CUDA)
+                    ggml_backend_cuda_profiler_zone zs = {};
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_begin(rt.backend_compute.get(), &zs, "eagle3/rollout_step");
+                    }
+#endif
+                    const bool ok = llama_eagle3_step(*model, rt, cur_state,
+                                nullptr, hidden_size, token, nullptr, nullptr);
+#if defined(GGML_USE_CUDA)
+                    if (profile_gpu) {
+                        ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &zs, "eagle3/rollout_step");
+                    }
+#endif
+                    if (!ok) break;
                 }
             }
+
+#if defined(GGML_USE_CUDA)
+            if (profile_gpu) {
+                ggml_backend_cuda_profiler_zone_end(rt.backend_compute.get(), &rollout_zone, "eagle3/rollout_serial");
+            }
+#endif
 
             if (chain.empty()) {
                 return;

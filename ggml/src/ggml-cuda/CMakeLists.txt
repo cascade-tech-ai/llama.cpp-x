@@ -136,13 +136,14 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_NVTX)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_NVTX)
-        if (TARGET CUDA::nvToolsExt)
-            target_link_libraries(ggml-cuda PRIVATE CUDA::nvToolsExt)
-        elseif (DEFINED CUDA_nvToolsExt_LIBRARY AND EXISTS "${CUDA_nvToolsExt_LIBRARY}")
-            target_link_libraries(ggml-cuda PRIVATE "${CUDA_nvToolsExt_LIBRARY}")
-        else()
-            message(FATAL_ERROR "GGML_CUDA_NVTX=ON but nvToolsExt library was not found")
-        endif()
+        find_library(GGML_CUDA_NVTOOLSEXT_LIB nvToolsExt
+            HINTS ${CUDAToolkit_LIBRARY_DIR}
+            REQUIRED)
+        # Force linkage: NVTX3 is header-only (dispatch table + dlopen), so the
+        # linker's default --as-needed drops libnvToolsExt even when requested.
+        # Without it loaded at process start, nsys's NVTX injection cannot hook.
+        target_link_options(ggml-cuda PRIVATE
+            "LINKER:--no-as-needed" "${GGML_CUDA_NVTOOLSEXT_LIB}" "LINKER:--as-needed")
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)

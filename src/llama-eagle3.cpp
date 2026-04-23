@@ -5675,7 +5675,13 @@ bool llama_eagle3_step_multi_from_hidden_capture(
                 }
             }
 
-            const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
+            ggml_status status = GGML_STATUS_FAILED;
+            {
+#if defined(GGML_USE_CUDA)
+                ggml_cuda_profiler_scope zone_draft_fwd(rt.backend_compute.get(), "eagle3/draft_forward");
+#endif
+                status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
+            }
             if (status == GGML_STATUS_SUCCESS) {
                 const auto materialize_state = [&](llama_eagle3_state & out_state, int32_t n_done) -> bool {
                     if (n_done <= 0) {
