@@ -263,7 +263,7 @@ def main() -> int:
     parser.add_argument("--prob-threshold", type=float, default=1e-4, help="Recorded for parity metadata. llama.cpp does not expose the exact kestrel threshold control.")
     parser.add_argument("--seed", type=int, default=42, help="Shared default aligned with kestrel train.py eval.")
     parser.add_argument("--temp", type=float, default=0.0, help="Shared default aligned with kestrel train.py eval.")
-    parser.add_argument("--top-k", type=int, default=0, help="Shared default aligned with kestrel train.py eval.")
+    parser.add_argument("--top-k", type=int, default=1024, help="Top-k is a truncation threshold, not a filter. Default 1024 bounds sampler work; 0 would enumerate the full vocab (~150k on Qwen) at every step.")
     parser.add_argument("--enable-thinking", default=None, help="Pass true/false/empty through tokenizer.apply_chat_template like kestrel train.py eval.")
 
     # llama.cpp-only defaults.
