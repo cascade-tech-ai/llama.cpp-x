@@ -321,6 +321,13 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_recurrent_parent::can_reuse(const llm_graph_params & params) {
+    // graph topology depends on parent_index values (used at build time in model
+    // graph builders such as src/models/qwen35.cpp to wire per-token conv/state
+    // outputs to their parents), so the cached vector must match element-for-element.
+    return data == params.recurrent_parent_index;
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 

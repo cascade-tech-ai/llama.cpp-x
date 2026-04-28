@@ -510,6 +510,8 @@ public:
         }
     }
 
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * parent_index = nullptr;
 
     const std::vector<int32_t> data;
