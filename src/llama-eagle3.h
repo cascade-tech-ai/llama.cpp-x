@@ -280,6 +280,8 @@ struct llama_eagle3_runtime {
     //   rollout_scratch_k/v:     [head_dim, n_kv_heads, kv_capacity] F32
     //   rollout_d2t_table:       [1, draft_vocab_size+1] F32 — base_id(i) = i + d2t[i]
     //   rollout_chain_tokens:    [1, max_depth+1] I32 — draft chain, on device
+    //   rollout_chain_max_prob:  [1, max_depth+1] F32 — softmax(logits)[argmax]
+    //                            per depth, used only when adaptive depth is on
     // Mutable because allocated lazily.
     mutable ggml_context_ptr        rollout_scratch_ctx;
     mutable ggml_backend_buffer_ptr rollout_scratch_buf;
@@ -287,6 +289,7 @@ struct llama_eagle3_runtime {
     mutable ggml_tensor *           rollout_scratch_v = nullptr;
     mutable ggml_tensor *           rollout_d2t_table = nullptr;
     mutable ggml_tensor *           rollout_chain_tokens = nullptr;
+    mutable ggml_tensor *           rollout_chain_max_prob = nullptr;
     mutable int32_t                 rollout_scratch_capacity = 0;
     mutable int32_t                 rollout_scratch_max_depth = 0;
 
@@ -433,13 +436,18 @@ bool llama_eagle3_rollout_begin(
         int32_t max_rollout_depth,
         llama_token bootstrap_token);
 
-// Queue one rollout depth. No host sync — the caller drains at finalize time.
+// Queue one rollout depth. No host sync by default — the caller drains at
+// finalize time. If `out_max_prob` is non-null, the call does a small D2H
+// read + sync of softmax(logits)[argmax] for this depth, used by adaptive
+// depth to compute the running cumulative greedy probability and decide
+// whether to launch the next depth.
 bool llama_eagle3_rollout_step(
         const llama_eagle3_model & model,
         const llama_eagle3_runtime & rt,
         int32_t depth_idx,
         int32_t pos,
-        int32_t slot);
+        int32_t slot,
+        float * out_max_prob = nullptr);
 
 // Drain the rollout queue, download chain_tokens, and write [0..n_chain) into
 // chain_out. `n_chain` is typically max_depth.

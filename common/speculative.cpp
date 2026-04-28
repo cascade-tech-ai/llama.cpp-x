@@ -1400,33 +1400,49 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             }
 
             const bool use_rollout_scratch = bootstrap_ok && bootstrap_decoded &&
-                (adaptive_depth_threshold <= 0.0f) &&
                 llama_eagle3_rollout_begin(*model, rt, root_state, max_depth, bootstrap_token);
 
             if (use_rollout_scratch) {
                 chain.push_back(bootstrap_token);
 
                 const int32_t base_past_len = root_state.past_len;
-                bool ok = true;
+                const bool   adaptive       = adaptive_depth_threshold > 0.0f;
+                bool   ok                   = true;
+                int32_t n_chain_steps       = 0;  // number of steps actually queued
+
+                // greedy_cum_prob already includes the bootstrap token's prob
+                // (decode_logits multiplied it in when adaptive is on). When
+                // adaptive is off, bootstrap is added unconditionally.
                 for (int depth = 0; depth < max_depth - 1; ++depth) {
                     const int32_t pos  = base_past_len + depth;
                     const int32_t slot = pos;
 
-                    if (!llama_eagle3_rollout_step(*model, rt, depth, pos, slot)) {
+                    float depth_prob = 0.0f;
+                    float * prob_out = adaptive ? &depth_prob : nullptr;
+                    if (!llama_eagle3_rollout_step(*model, rt, depth, pos, slot, prob_out)) {
                         LOG_WRN("eagle3 serial: rollout_step failed at depth %d\n", depth);
                         ok = false;
                         break;
                     }
+                    n_chain_steps = depth + 1;
+
+                    if (adaptive) {
+                        greedy_cum_prob *= depth_prob;
+                        if (greedy_cum_prob < adaptive_depth_threshold) {
+                            // Don't queue further depths.
+                            break;
+                        }
+                    }
                 }
 
                 if (ok) {
-                    // One host sync drains every queued depth and reads the
-                    // chain from device. chain_tokens[0..max_depth-1] are the
-                    // base-vocab tokens; the last depth's output (slot
-                    // max_depth) was not computed since we stopped the loop
-                    // at max_depth-1.
+                    // chain_tokens[0..n_chain_steps] are valid: slot 0 is the
+                    // bootstrap (written by rollout_begin) and slots 1..N are
+                    // written by the N step calls above. With adaptive cutoff
+                    // we read fewer slots than max_depth.
+                    const int32_t n_to_read = n_chain_steps + 1;
                     std::vector<int32_t> chain_raw;
-                    if (llama_eagle3_rollout_finalize(*model, rt, max_depth, chain_raw)) {
+                    if (llama_eagle3_rollout_finalize(*model, rt, n_to_read, chain_raw)) {
                         for (int depth = 1; depth < (int) chain_raw.size(); ++depth) {
                             const int32_t base_id = chain_raw[(size_t) depth];
                             if (base_id < 0 || base_id >= model->hparams.vocab_size) {

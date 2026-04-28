@@ -937,7 +937,7 @@ bool ensure_rollout_scratch(
         return false;
     }
     if (rt.rollout_scratch_k && rt.rollout_scratch_v &&
-        rt.rollout_d2t_table && rt.rollout_chain_tokens &&
+        rt.rollout_d2t_table && rt.rollout_chain_tokens && rt.rollout_chain_max_prob &&
         rt.rollout_scratch_capacity  >= needed_capacity &&
         rt.rollout_scratch_max_depth >= needed_max_depth) {
         return true;
@@ -968,6 +968,12 @@ bool ensure_rollout_scratch(
     // d's argmax output lands in slot d+1.
     ggml_tensor * t_chain = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, needed_max_depth + 1);
 
+    // chain_max_prob mirrors chain_tokens: depth d's softmax(logits)[argmax]
+    // lands in slot d+1. Always populated by the rollout graph; only read
+    // out by adaptive-depth code paths via the optional out_max_prob arg
+    // on llama_eagle3_rollout_step.
+    ggml_tensor * t_chain_max_prob = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, needed_max_depth + 1);
+
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), rt.buft_compute));
     if (!buf) {
         return false;
@@ -993,6 +999,7 @@ bool ensure_rollout_scratch(
     rt.rollout_scratch_v          = t_v;
     rt.rollout_d2t_table          = t_d2t;
     rt.rollout_chain_tokens       = t_chain;
+    rt.rollout_chain_max_prob     = t_chain_max_prob;
     rt.rollout_scratch_capacity   = needed_capacity;
     rt.rollout_scratch_max_depth  = needed_max_depth;
     return true;
@@ -1011,7 +1018,7 @@ bool build_serial_rollout_graph(
         return true;
     }
     if (!rt.tok_embd || !rt.rollout_scratch_k || !rt.rollout_scratch_v ||
-        !rt.rollout_d2t_table || !rt.rollout_chain_tokens ||
+        !rt.rollout_d2t_table || !rt.rollout_chain_tokens || !rt.rollout_chain_max_prob ||
         rt.rollout_scratch_capacity  < kv_capacity ||
         rt.rollout_scratch_max_depth < max_depth) {
         return false;
@@ -1181,6 +1188,19 @@ bool build_serial_rollout_graph(
     // correct across consecutive invocations on the same stream.
     ggml_tensor * t_chain_write = ggml_set_rows(ctx.get(), rt.rollout_chain_tokens, t_base_id_f, t_depth_idx_next);
 
+    // Adaptive-depth probe: softmax(logits)[argmax] for this depth, scattered
+    // into chain_max_prob[depth_idx+1]. The graph always emits this; whether
+    // the host actually reads it back per depth is decided by the caller via
+    // the optional out_max_prob arg on llama_eagle3_rollout_step. Cost is one
+    // extra soft_max + 2 small get/set_rows on the lm_head output and is
+    // dominated by the lm_head matmul that already happens.
+    ggml_tensor * t_softmax  = ggml_soft_max(ctx.get(), t_logits);
+    // ggml_get_rows treats dim 0 as row size and indexes along dim 1, so
+    // reshape softmax from [draft_vocab, 1] to [1, draft_vocab].
+    ggml_tensor * t_softmax_t = ggml_reshape_2d(ctx.get(), t_softmax, 1, hp.draft_vocab_size);
+    ggml_tensor * t_max_prob = ggml_get_rows(ctx.get(), t_softmax_t, t_token_idx);   // [1, 1] F32
+    ggml_tensor * t_max_prob_write = ggml_set_rows(ctx.get(), rt.rollout_chain_max_prob, t_max_prob, t_depth_idx_next);
+
     // In-graph write-back of the post-step hidden into the teacher-hidden
     // input slot. Keeps hidden device-resident across rollout depths without
     // an out-of-graph tensor_copy per step (those don't get captured by the
@@ -1193,6 +1213,7 @@ bool build_serial_rollout_graph(
     ggml_build_forward_expand(gf, t_logits);          // kept for debug / adaptive-depth probing
     ggml_build_forward_expand(gf, t_token_idx);
     ggml_build_forward_expand(gf, t_chain_write);
+    ggml_build_forward_expand(gf, t_max_prob_write);
     ggml_build_forward_expand(gf, t_hidden_writeback);
 
     ggml_backend_buffer_ptr buf_compute;
@@ -4592,7 +4613,8 @@ bool llama_eagle3_rollout_step(
         const llama_eagle3_runtime & rt,
         int32_t depth_idx,
         int32_t pos,
-        int32_t slot) {
+        int32_t slot,
+        float * out_max_prob) {
     (void) model;
     if (!rt.backend_compute || !rt.buft_compute) {
         return false;
@@ -4645,7 +4667,23 @@ bool llama_eagle3_rollout_step(
             rt.async_buf.mask_data.data(), 0, (size_t) cap * sizeof(uint16_t));
 
     const ggml_status status = ggml_backend_graph_compute_async(rt.backend_compute.get(), graph.gf);
-    return status == GGML_STATUS_SUCCESS;
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    if (out_max_prob && rt.rollout_chain_max_prob) {
+        // Adaptive-depth probe: small D2H of one F32 plus a sync. ~50us per
+        // depth; the alternative (slow path with full graph rebuild + hidden
+        // sync per depth) is ~5ms.
+        float prob = 0.0f;
+        const size_t offset = (size_t) (depth_idx + 1) * sizeof(float);
+        ggml_backend_tensor_get_async(rt.backend_compute.get(), rt.rollout_chain_max_prob,
+                &prob, offset, sizeof(float));
+        ggml_backend_synchronize(rt.backend_compute.get());
+        *out_max_prob = prob;
+    }
+
+    return true;
 }
 
 bool llama_eagle3_rollout_finalize(
